@@ -47,11 +47,28 @@ const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 const INSTALLER_SCRIPT = path.join(PLUGIN_ROOT, "scripts", "install-openclaw-memoria.sh");
 const VERIFY_SCRIPT = path.join(PLUGIN_ROOT, "scripts", "verify_plugin_install.mjs");
 const CONNECT_SCRIPT = path.join(PLUGIN_ROOT, "scripts", "connect_openclaw_memoria.mjs");
+const IS_WINDOWS = process.platform === "win32";
 
-function resolveOpenClawBinFromProcess(): string {
+/**
+ * Returns the raw script path from process.argv[1], used when passing to external scripts.
+ */
+function getOpenClawScriptPath(): string {
   return typeof process.argv[1] === "string" && process.argv[1].trim()
     ? process.argv[1]
     : "openclaw";
+}
+
+/**
+ * Returns command and args for spawning openclaw.
+ * On Windows, .mjs files cannot be executed directly; must use node.
+ */
+function resolveOpenClawBinFromProcess(): { command: string; args: string[] } {
+  const scriptPath = getOpenClawScriptPath();
+
+  if (IS_WINDOWS && scriptPath.endsWith(".mjs")) {
+    return { command: "node", args: [scriptPath] };
+  }
+  return { command: scriptPath, args: [] };
 }
 
 function stripAnsi(value: string): string {
@@ -87,8 +104,8 @@ function resolveOpenClawConfigFile(): string {
     return explicitConfigPath.replace(/^~(?=$|\/|\\)/, process.env.HOME ?? "~");
   }
 
-  const openclawBin = resolveOpenClawBinFromProcess();
-  const fromCli = spawnSync(openclawBin, ["config", "file"], {
+  const { command, args } = resolveOpenClawBinFromProcess();
+  const fromCli = spawnSync(command, [...args, "config", "file"], {
     cwd: PLUGIN_ROOT,
     env: process.env,
     encoding: "utf8",
@@ -1643,7 +1660,7 @@ const plugin = {
             "--source-dir",
             PLUGIN_ROOT,
             "--openclaw-bin",
-            resolveOpenClawBinFromProcess(),
+            getOpenClawScriptPath(),
             "--skip-plugin-install",
           ];
           if (opts.memoriaBin) {
@@ -1671,7 +1688,7 @@ const plugin = {
           const args = [
             VERIFY_SCRIPT,
             "--openclaw-bin",
-            resolveOpenClawBinFromProcess(),
+            getOpenClawScriptPath(),
             "--config-file",
             resolveOpenClawConfigFile(),
           ];
@@ -1933,11 +1950,11 @@ const plugin = {
             embeddingDim: normalized.embeddingDim,
           });
 
-          const openclawBin = resolveOpenClawBinFromProcess();
+          const { command: openclawCmd, args: openclawBaseArgs } = resolveOpenClawBinFromProcess();
           const openclawEnv = { OPENCLAW_CONFIG_PATH: resolvedConfigFile };
 
           if (normalized.validateConfig) {
-            runLocalCommand(openclawBin, ["config", "validate"], { env: openclawEnv });
+            runLocalCommand(openclawCmd, [...openclawBaseArgs, "config", "validate"], { env: openclawEnv });
           }
 
           if (normalized.healthCheck) {
@@ -1968,11 +1985,11 @@ const plugin = {
               }
             } else {
               assertMemoriaExecutableAvailable(effectiveMemoriaExecutable, normalized.mode);
-              const healthArgs = ["memoria", "health"];
+              const healthArgs = [...openclawBaseArgs, "memoria", "health"];
               if (normalized.userId) {
                 healthArgs.push("--user-id", normalized.userId);
               }
-              runLocalCommand(openclawBin, healthArgs, { env: openclawEnv });
+              runLocalCommand(openclawCmd, healthArgs, { env: openclawEnv });
             }
           }
 
