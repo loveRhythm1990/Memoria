@@ -4125,7 +4125,7 @@ async fn test_admin_trigger_governance() {
 
 #[tokio::test]
 async fn test_health_endpoints() {
-    let (base, client, _server) = spawn_server().await;
+    let (base, client, server) = spawn_server().await;
     let user = uid();
 
     // Store some memories
@@ -4139,6 +4139,15 @@ async fn test_health_endpoints() {
             .unwrap();
     }
 
+    // Legacy or directly-written rows may contain NULL despite the column default.
+    // Aggregate endpoints must preserve that unknown value instead of failing to decode it.
+    let pool = server.user_db_pool(&user).await;
+    sqlx::query("UPDATE mem_memories SET initial_confidence = NULL WHERE user_id = ?")
+        .bind(&user)
+        .execute(&pool)
+        .await
+        .unwrap();
+
     // GET /v1/health/analyze
     let r = client
         .get(format!("{base}/v1/health/analyze"))
@@ -4149,6 +4158,7 @@ async fn test_health_endpoints() {
     assert_eq!(r.status(), 200);
     let body: Value = r.json().await.unwrap();
     assert!(body["semantic"]["total"].as_i64().unwrap() >= 3);
+    assert!(body["semantic"]["avg_confidence"].is_null());
     println!("✅ health analyze: {body}");
 
     // GET /v1/health/storage
@@ -4163,6 +4173,18 @@ async fn test_health_endpoints() {
     assert!(body["total"].as_i64().unwrap() >= 3);
     assert!(body["active"].as_i64().unwrap() >= 3);
     println!("✅ health storage: {body}");
+
+    // Profile statistics use a separate aggregate query and must follow the
+    // same all-NULL confidence semantics.
+    let r = client
+        .get(format!("{base}/v1/profiles/me"))
+        .header("X-User-Id", &user)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["stats"]["avg_confidence"].as_f64(), Some(0.0));
 
     // GET /v1/health/capacity
     let r = client

@@ -670,9 +670,9 @@ impl MetricsSummaryManager {
         let coverage_sql = format!(
             r#"SELECT
                    COUNT(*) AS total_users,
-                   SUM(CASE WHEN s.user_id IS NULL THEN 1 ELSE 0 END) AS missing_users,
-                    SUM(CASE WHEN s.user_id IS NOT NULL AND s.has_pending = 1 THEN 1 ELSE 0 END) AS dirty_users,
-                    SUM(CASE WHEN s.user_id IS NOT NULL AND s.has_pending = 0 THEN 1 ELSE 0 END) AS ready_users
+                   COUNT(CASE WHEN s.user_id IS NULL THEN 1 END) AS missing_users,
+                   COUNT(CASE WHEN s.user_id IS NOT NULL AND s.has_pending = 1 THEN 1 END) AS dirty_users,
+                   COUNT(CASE WHEN s.user_id IS NOT NULL AND s.has_pending = 0 THEN 1 END) AS ready_users
                 FROM mem_user_registry r
                 LEFT JOIN ({DEDUPED_STATE_SUBQUERY}) s ON s.user_id = r.user_id
                 WHERE r.status = 'active'"#
@@ -684,7 +684,7 @@ impl MetricsSummaryManager {
 
         // Scalar families from rollups
         let scalar_rows = sqlx::query(
-            r#"SELECT r.family, COALESCE(SUM(r.value), 0) AS total
+            r#"SELECT r.family, CAST(COALESCE(SUM(r.value), 0) AS SIGNED) AS total
                FROM mem_metrics_user_rollups r
                INNER JOIN mem_user_registry u ON u.user_id = r.user_id
                WHERE u.status = 'active' AND r.bucket = '__total__'
@@ -709,7 +709,7 @@ impl MetricsSummaryManager {
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
-                r#"SELECT r.family, r.bucket, COALESCE(SUM(r.value), 0) AS total
+                r#"SELECT r.family, r.bucket, CAST(COALESCE(SUM(r.value), 0) AS SIGNED) AS total
                    FROM mem_metrics_user_rollups r
                    INNER JOIN mem_user_registry u ON u.user_id = r.user_id
                    WHERE u.status = 'active' AND r.family IN ({placeholders})
@@ -1540,10 +1540,14 @@ fn db_err(e: impl std::fmt::Display) -> MemoriaError {
 }
 
 fn optional_i64(row: &sqlx::mysql::MySqlRow, column: &str) -> i64 {
-    row.try_get::<Option<i64>, _>(column)
-        .ok()
-        .flatten()
-        .unwrap_or(0)
+    match row.try_get::<Option<i64>, _>(column) {
+        Ok(Some(value)) => value,
+        Ok(None) => 0,
+        Err(error) => {
+            warn!(column, error = %error, "failed to decode metrics aggregate");
+            0
+        }
+    }
 }
 
 fn clamp_metric_age(age_secs: Option<i64>) -> Option<i64> {
