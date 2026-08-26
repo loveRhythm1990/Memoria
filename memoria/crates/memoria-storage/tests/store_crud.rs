@@ -566,6 +566,42 @@ async fn test_null_optional_fields() {
     println!("✅ null_optional_fields: all NULLs round-trip correctly");
 }
 
+#[tokio::test]
+async fn test_session_id_recovers_after_null_insert_on_same_connection() {
+    let (store, uid) = setup().await;
+    // Force all three INSERTs through one physical connection. MatrixOne
+    // matrixorigin/matrixone#26874 retained a prepared parameter's NULL state
+    // on statement reuse.
+    let store = store
+        .spawn_background_store(1)
+        .await
+        .expect("single-connection store");
+
+    let before_id = format!("session-before-{uid}");
+    let null_id = format!("session-null-{uid}");
+    let after_id = format!("session-after-{uid}");
+
+    let mut before = make_memory(&before_id, "session before null", &uid);
+    before.session_id = Some("sess-before".to_string());
+    store.insert(&before).await.expect("insert before NULL");
+
+    let mut unscoped = make_memory(&null_id, "unscoped memory", &uid);
+    unscoped.session_id = None;
+    store.insert(&unscoped).await.expect("insert NULL session");
+
+    let mut after = make_memory(&after_id, "session after null", &uid);
+    after.session_id = Some("sess-after".to_string());
+    store.insert(&after).await.expect("insert after NULL");
+
+    let before = store.get(&before_id).await.expect("get before").unwrap();
+    let unscoped = store.get(&null_id).await.expect("get unscoped").unwrap();
+    let after = store.get(&after_id).await.expect("get after").unwrap();
+
+    assert_eq!(before.session_id.as_deref(), Some("sess-before"));
+    assert!(unscoped.session_id.is_none());
+    assert_eq!(after.session_id.as_deref(), Some("sess-after"));
+}
+
 // ── insert_entity_links batch optimization tests ─────────────────────────────
 
 #[tokio::test]

@@ -5198,32 +5198,67 @@ impl SqlMemoryStore {
             .filter(|v| !v.is_empty()) // Some([]) → None → SQL NULL
             .map(vec_to_mo);
 
-        sqlx::query(&format!(
+        // MatrixOne 4.2 can retain a prepared parameter's NULL state across
+        // executions (matrixorigin/matrixone#26874). Keep nullable values out
+        // of bind parameters:
+        // each cached SQL shape then binds a value or contains a literal NULL,
+        // but never transitions the same parameter from NULL back to a value.
+        let author_param = memory.author_id.is_some().then_some("?").unwrap_or("NULL");
+        let subject_param = memory
+            .subject_id
+            .is_some()
+            .then_some("?")
+            .unwrap_or("NULL");
+        let embedding_param = embedding.is_some().then_some("?").unwrap_or("NULL");
+        let session_param = memory
+            .session_id
+            .is_some()
+            .then_some("?")
+            .unwrap_or("NULL");
+        let superseded_param = memory
+            .superseded_by
+            .is_some()
+            .then_some("?")
+            .unwrap_or("NULL");
+        let sql = format!(
             r#"INSERT INTO {table}
                (memory_id, user_id, author_id, subject_id, memory_type, content, embedding,
                 session_id, source_event_ids, extra_metadata, is_active, superseded_by,
                 trust_tier, initial_confidence, observed_at, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)"#
-        ))
-        .bind(&memory.memory_id)
-        .bind(&memory.user_id)
-        .bind(memory.author_id.as_deref())
-        .bind(memory.subject_id.as_deref())
-        .bind(memory.memory_type.to_string())
-        .bind(&memory.content)
-        .bind(embedding)
-        .bind(nullable_str(&memory.session_id))
-        .bind(source_event_ids)
-        .bind(extra_metadata)
-        .bind(nullable_str(&memory.superseded_by))
-        .bind(memory.trust_tier.to_string())
-        .bind(memory.initial_confidence as f32)
-        .bind(observed_at)
-        .bind(created_at)
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
+               VALUES (?, ?, {author_param}, {subject_param}, ?, ?, {embedding_param},
+                       {session_param}, ?, ?, 1, {superseded_param}, ?, ?, ?, ?, ?)"#
+        );
+        let mut query = sqlx::query(&sql)
+            .bind(&memory.memory_id)
+            .bind(&memory.user_id);
+        if let Some(author_id) = memory.author_id.as_deref() {
+            query = query.bind(author_id);
+        }
+        if let Some(subject_id) = memory.subject_id.as_deref() {
+            query = query.bind(subject_id);
+        }
+        query = query
+            .bind(memory.memory_type.to_string())
+            .bind(&memory.content);
+        if let Some(embedding) = embedding {
+            query = query.bind(embedding);
+        }
+        if let Some(session_id) = memory.session_id.as_deref() {
+            query = query.bind(session_id);
+        }
+        query = query.bind(source_event_ids).bind(extra_metadata);
+        if let Some(superseded_by) = memory.superseded_by.as_deref() {
+            query = query.bind(superseded_by);
+        }
+        query
+            .bind(memory.trust_tier.to_string())
+            .bind(memory.initial_confidence as f32)
+            .bind(observed_at)
+            .bind(created_at)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
         Ok(())
     }
 
@@ -5241,7 +5276,17 @@ impl SqlMemoryStore {
         for chunk in memories.chunks(50) {
             let placeholders = chunk
                 .iter()
-                .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)")
+                .map(|m| {
+                    let nullable = |present| if present { "?" } else { "NULL" };
+                    format!(
+                        "(?, ?, {}, {}, ?, ?, {}, {}, ?, ?, 1, {}, ?, ?, ?, ?, ?)",
+                        nullable(m.author_id.is_some()),
+                        nullable(m.subject_id.is_some()),
+                        nullable(m.embedding.as_ref().is_some_and(|v| !v.is_empty())),
+                        nullable(m.session_id.is_some()),
+                        nullable(m.superseded_by.is_some())
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
@@ -5268,18 +5313,27 @@ impl SqlMemoryStore {
                     .as_deref()
                     .filter(|v| !v.is_empty())
                     .map(vec_to_mo);
+                q = q.bind(m.memory_id.clone()).bind(m.user_id.clone());
+                if let Some(author_id) = &m.author_id {
+                    q = q.bind(author_id.clone());
+                }
+                if let Some(subject_id) = &m.subject_id {
+                    q = q.bind(subject_id.clone());
+                }
                 q = q
-                    .bind(m.memory_id.clone())
-                    .bind(m.user_id.clone())
-                    .bind(m.author_id.clone())
-                    .bind(m.subject_id.clone())
                     .bind(m.memory_type.to_string())
-                    .bind(m.content.clone())
-                    .bind(embedding)
-                    .bind(nullable_str(&m.session_id).map(str::to_string))
-                    .bind(source_event_ids)
-                    .bind(extra_metadata)
-                    .bind(nullable_str(&m.superseded_by).map(str::to_string))
+                    .bind(m.content.clone());
+                if let Some(embedding) = embedding {
+                    q = q.bind(embedding);
+                }
+                if let Some(session_id) = &m.session_id {
+                    q = q.bind(session_id.clone());
+                }
+                q = q.bind(source_event_ids).bind(extra_metadata);
+                if let Some(superseded_by) = &m.superseded_by {
+                    q = q.bind(superseded_by.clone());
+                }
+                q = q
                     .bind(m.trust_tier.to_string())
                     .bind(m.initial_confidence as f32)
                     .bind(observed_at)
