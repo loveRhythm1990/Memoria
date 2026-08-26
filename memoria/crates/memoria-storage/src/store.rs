@@ -5204,11 +5204,13 @@ impl SqlMemoryStore {
         // each cached SQL shape then binds a value or contains a literal NULL,
         // but never transitions the same parameter from NULL back to a value.
         let nullable = |present| if present { "?" } else { "NULL" };
+        let session_id = nullable_str(&memory.session_id);
+        let superseded_by = nullable_str(&memory.superseded_by);
         let author_param = nullable(memory.author_id.is_some());
         let subject_param = nullable(memory.subject_id.is_some());
         let embedding_param = nullable(embedding.is_some());
-        let session_param = nullable(memory.session_id.is_some());
-        let superseded_param = nullable(memory.superseded_by.is_some());
+        let session_param = nullable(session_id.is_some());
+        let superseded_param = nullable(superseded_by.is_some());
         let sql = format!(
             r#"INSERT INTO {table}
                (memory_id, user_id, author_id, subject_id, memory_type, content, embedding,
@@ -5232,11 +5234,11 @@ impl SqlMemoryStore {
         if let Some(embedding) = embedding {
             query = query.bind(embedding);
         }
-        if let Some(session_id) = memory.session_id.as_deref() {
+        if let Some(session_id) = session_id {
             query = query.bind(session_id);
         }
         query = query.bind(source_event_ids).bind(extra_metadata);
-        if let Some(superseded_by) = memory.superseded_by.as_deref() {
+        if let Some(superseded_by) = superseded_by {
             query = query.bind(superseded_by);
         }
         query
@@ -5272,8 +5274,8 @@ impl SqlMemoryStore {
                         nullable(m.author_id.is_some()),
                         nullable(m.subject_id.is_some()),
                         nullable(m.embedding.as_ref().is_some_and(|v| !v.is_empty())),
-                        nullable(m.session_id.is_some()),
-                        nullable(m.superseded_by.is_some())
+                        nullable(nullable_str(&m.session_id).is_some()),
+                        nullable(nullable_str(&m.superseded_by).is_some())
                     )
                 })
                 .collect::<Vec<_>>()
@@ -5315,12 +5317,12 @@ impl SqlMemoryStore {
                 if let Some(embedding) = embedding {
                     q = q.bind(embedding);
                 }
-                if let Some(session_id) = &m.session_id {
-                    q = q.bind(session_id.clone());
+                if let Some(session_id) = nullable_str(&m.session_id) {
+                    q = q.bind(session_id.to_string());
                 }
                 q = q.bind(source_event_ids).bind(extra_metadata);
-                if let Some(superseded_by) = &m.superseded_by {
-                    q = q.bind(superseded_by.clone());
+                if let Some(superseded_by) = nullable_str(&m.superseded_by) {
+                    q = q.bind(superseded_by.to_string());
                 }
                 q = q
                     .bind(m.trust_tier.to_string())

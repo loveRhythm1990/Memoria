@@ -567,6 +567,29 @@ async fn test_null_optional_fields() {
 }
 
 #[tokio::test]
+async fn test_insert_normalizes_empty_nullable_strings() {
+    let (store, uid) = setup().await;
+    let id = format!("empty-nullable-{uid}");
+    let mut memory = make_memory(&id, "empty nullable strings", &uid);
+    memory.session_id = Some(String::new());
+    memory.superseded_by = Some(String::new());
+
+    store
+        .insert(&memory)
+        .await
+        .expect("insert empty nullable strings");
+
+    let stored: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT session_id, superseded_by FROM mem_memories WHERE memory_id = ?",
+    )
+    .bind(&id)
+    .fetch_one(store.pool())
+    .await
+    .expect("read raw nullable strings");
+    assert_eq!(stored, (None, None), "empty strings must be stored as NULL");
+}
+
+#[tokio::test]
 async fn test_session_id_recovers_after_null_insert_on_same_connection() {
     let (store, uid) = setup().await;
     // Force all three INSERTs through one physical connection. MatrixOne
@@ -600,6 +623,29 @@ async fn test_session_id_recovers_after_null_insert_on_same_connection() {
     assert_eq!(before.session_id.as_deref(), Some("sess-before"));
     assert!(unscoped.session_id.is_none());
     assert_eq!(after.session_id.as_deref(), Some("sess-after"));
+}
+
+#[tokio::test]
+async fn test_batch_insert_normalizes_empty_nullable_strings() {
+    let (store, uid) = setup().await;
+    let id = format!("batch-empty-nullable-{uid}");
+    let mut memory = make_memory(&id, "batch empty nullable strings", &uid);
+    memory.session_id = Some(String::new());
+    memory.superseded_by = Some(String::new());
+
+    store
+        .batch_insert_into("mem_memories", &[&memory])
+        .await
+        .expect("batch insert empty nullable strings");
+
+    let stored: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT session_id, superseded_by FROM mem_memories WHERE memory_id = ?",
+    )
+    .bind(&id)
+    .fetch_one(store.pool())
+    .await
+    .expect("read raw batch nullable strings");
+    assert_eq!(stored, (None, None), "empty strings must be stored as NULL");
 }
 
 // ── insert_entity_links batch optimization tests ─────────────────────────────
