@@ -592,10 +592,10 @@ async fn test_feedback_db_verification() {
     let stats_row: (i64, i64, i64, i64, i64) = sqlx::query_as(&format!(
         "SELECT \
            COUNT(*) as total, \
-           SUM(CASE WHEN signal = 'useful' THEN 1 ELSE 0 END) as useful, \
-           SUM(CASE WHEN signal = 'irrelevant' THEN 1 ELSE 0 END) as irrelevant, \
-           SUM(CASE WHEN signal = 'outdated' THEN 1 ELSE 0 END) as outdated, \
-           SUM(CASE WHEN signal = 'wrong' THEN 1 ELSE 0 END) as wrong \
+           COUNT(CASE WHEN signal = 'useful' THEN 1 END) as useful, \
+           COUNT(CASE WHEN signal = 'irrelevant' THEN 1 END) as irrelevant, \
+           COUNT(CASE WHEN signal = 'outdated' THEN 1 END) as outdated, \
+           COUNT(CASE WHEN signal = 'wrong' THEN 1 END) as wrong \
          FROM {feedback_table} WHERE user_id = ?"
     ))
     .bind(&uid)

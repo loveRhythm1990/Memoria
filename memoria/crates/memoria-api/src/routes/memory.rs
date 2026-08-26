@@ -737,7 +737,7 @@ pub async fn get_profile(
     let stats_rows = if let Some(sid) = subject_id {
         let q = format!(
             "SELECT memory_type, COUNT(*) as cnt, \
-             ROUND(AVG(initial_confidence), 2) as avg_conf, \
+             CAST(ROUND(AVG(initial_confidence), 2) AS DOUBLE) as avg_conf, \
              MIN(observed_at) as oldest, MAX(observed_at) as newest \
              FROM {table} WHERE user_id = ? AND subject_id = ? AND is_active = 1 GROUP BY memory_type"
         );
@@ -745,7 +745,7 @@ pub async fn get_profile(
     } else {
         let q = format!(
             "SELECT memory_type, COUNT(*) as cnt, \
-             ROUND(AVG(initial_confidence), 2) as avg_conf, \
+             CAST(ROUND(AVG(initial_confidence), 2) AS DOUBLE) as avg_conf, \
              MIN(observed_at) as oldest, MAX(observed_at) as newest \
              FROM {table} WHERE user_id = ? AND is_active = 1 GROUP BY memory_type"
         );
@@ -764,7 +764,17 @@ pub async fn get_profile(
             let cnt: i64 = r.try_get("cnt").unwrap_or(0);
             by_type.insert(mt, serde_json::json!(cnt));
             total += cnt;
-            if let Ok(c) = r.try_get::<f64, _>("avg_conf") { conf_sum += c * cnt as f64; conf_n += cnt; }
+            match r.try_get::<Option<f64>, _>("avg_conf") {
+                Ok(Some(c)) => {
+                    conf_sum += c * cnt as f64;
+                    conf_n += cnt;
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "failed to decode profile average confidence"
+                ),
+            }
             if let Ok(Some(d)) = r.try_get::<Option<chrono::NaiveDateTime>, _>("oldest") {
                 let s = d.to_string();
                 if oldest.as_ref().is_none_or(|o| s < *o) { oldest = Some(s); }

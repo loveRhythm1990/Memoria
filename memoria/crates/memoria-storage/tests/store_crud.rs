@@ -566,6 +566,88 @@ async fn test_null_optional_fields() {
     println!("✅ null_optional_fields: all NULLs round-trip correctly");
 }
 
+#[tokio::test]
+async fn test_insert_normalizes_empty_nullable_strings() {
+    let (store, uid) = setup().await;
+    let id = format!("empty-nullable-{uid}");
+    let mut memory = make_memory(&id, "empty nullable strings", &uid);
+    memory.session_id = Some(String::new());
+    memory.superseded_by = Some(String::new());
+
+    store
+        .insert(&memory)
+        .await
+        .expect("insert empty nullable strings");
+
+    let stored: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT session_id, superseded_by FROM mem_memories WHERE memory_id = ?",
+    )
+    .bind(&id)
+    .fetch_one(store.pool())
+    .await
+    .expect("read raw nullable strings");
+    assert_eq!(stored, (None, None), "empty strings must be stored as NULL");
+}
+
+#[tokio::test]
+async fn test_session_id_recovers_after_null_insert_on_same_connection() {
+    let (store, uid) = setup().await;
+    // Force all three INSERTs through one physical connection. MatrixOne
+    // matrixorigin/matrixone#26874 retained a prepared parameter's NULL state
+    // on statement reuse.
+    let store = store
+        .spawn_background_store(1)
+        .await
+        .expect("single-connection store");
+
+    let before_id = format!("session-before-{uid}");
+    let null_id = format!("session-null-{uid}");
+    let after_id = format!("session-after-{uid}");
+
+    let mut before = make_memory(&before_id, "session before null", &uid);
+    before.session_id = Some("sess-before".to_string());
+    store.insert(&before).await.expect("insert before NULL");
+
+    let mut unscoped = make_memory(&null_id, "unscoped memory", &uid);
+    unscoped.session_id = None;
+    store.insert(&unscoped).await.expect("insert NULL session");
+
+    let mut after = make_memory(&after_id, "session after null", &uid);
+    after.session_id = Some("sess-after".to_string());
+    store.insert(&after).await.expect("insert after NULL");
+
+    let before = store.get(&before_id).await.expect("get before").unwrap();
+    let unscoped = store.get(&null_id).await.expect("get unscoped").unwrap();
+    let after = store.get(&after_id).await.expect("get after").unwrap();
+
+    assert_eq!(before.session_id.as_deref(), Some("sess-before"));
+    assert!(unscoped.session_id.is_none());
+    assert_eq!(after.session_id.as_deref(), Some("sess-after"));
+}
+
+#[tokio::test]
+async fn test_batch_insert_normalizes_empty_nullable_strings() {
+    let (store, uid) = setup().await;
+    let id = format!("batch-empty-nullable-{uid}");
+    let mut memory = make_memory(&id, "batch empty nullable strings", &uid);
+    memory.session_id = Some(String::new());
+    memory.superseded_by = Some(String::new());
+
+    store
+        .batch_insert_into("mem_memories", &[&memory])
+        .await
+        .expect("batch insert empty nullable strings");
+
+    let stored: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT session_id, superseded_by FROM mem_memories WHERE memory_id = ?",
+    )
+    .bind(&id)
+    .fetch_one(store.pool())
+    .await
+    .expect("read raw batch nullable strings");
+    assert_eq!(stored, (None, None), "empty strings must be stored as NULL");
+}
+
 // ── insert_entity_links batch optimization tests ─────────────────────────────
 
 #[tokio::test]

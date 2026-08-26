@@ -4386,10 +4386,10 @@ impl SqlMemoryStore {
         let row: (i64, i64, i64, i64, i64) = sqlx::query_as(&format!(
             "SELECT \
                COUNT(*) as total, \
-               COALESCE(SUM(CASE WHEN signal = 'useful' THEN 1 ELSE 0 END), 0) as useful, \
-               COALESCE(SUM(CASE WHEN signal = 'irrelevant' THEN 1 ELSE 0 END), 0) as irrelevant, \
-               COALESCE(SUM(CASE WHEN signal = 'outdated' THEN 1 ELSE 0 END), 0) as outdated, \
-               COALESCE(SUM(CASE WHEN signal = 'wrong' THEN 1 ELSE 0 END), 0) as wrong \
+               COUNT(CASE WHEN signal = 'useful' THEN 1 END) as useful, \
+               COUNT(CASE WHEN signal = 'irrelevant' THEN 1 END) as irrelevant, \
+               COUNT(CASE WHEN signal = 'outdated' THEN 1 END) as outdated, \
+               COUNT(CASE WHEN signal = 'wrong' THEN 1 END) as wrong \
              FROM {feedback_table} WHERE user_id = ?"
         ))
         .bind(user_id)
@@ -4647,9 +4647,9 @@ impl SqlMemoryStore {
     ) -> Result<bool, MemoriaError> {
         let mut conn = self.conn().await?;
         let memories_table = self.t("mem_memories");
-        let row: (i64, Option<i64>) = sqlx::query_as(&format!(
+        let row: (i64, i64) = sqlx::query_as(&format!(
             "SELECT COUNT(*) as total_changes, \
-             SUM(CASE WHEN superseded_by IS NOT NULL AND superseded_by != '' THEN 1 ELSE 0 END) as supersedes \
+             COUNT(CASE WHEN superseded_by IS NOT NULL AND superseded_by != '' THEN 1 END) as supersedes \
              FROM {memories_table} \
              WHERE user_id = ? AND updated_at >= DATE_SUB(NOW(), INTERVAL ? HOUR)"
         ))
@@ -4662,7 +4662,7 @@ impl SqlMemoryStore {
         if total == 0 {
             return Ok(false);
         }
-        Ok(supersedes.unwrap_or(0) as f64 / total as f64 > 0.3)
+        Ok(supersedes as f64 / total as f64 > 0.3)
     }
 
     /// Hygiene diagnostics: orphan counts and stale data that governance can clean.
@@ -4807,10 +4807,11 @@ impl SqlMemoryStore {
     pub async fn health_analyze(&self, user_id: &str) -> Result<serde_json::Value, MemoriaError> {
         let mut conn = self.conn().await?;
         let memories_table = self.t("mem_memories");
-        let rows: Vec<(String, i64, f64, i64, f64)> = sqlx::query_as(&format!(
-            "SELECT memory_type, COUNT(*) as total, AVG(initial_confidence) as avg_conf, \
+        let rows: Vec<(String, i64, Option<f64>, i64, f64)> = sqlx::query_as(&format!(
+            "SELECT memory_type, COUNT(*) as total, \
+             CAST(AVG(initial_confidence) AS DOUBLE) as avg_conf, \
              COUNT(CASE WHEN superseded_by IS NOT NULL AND superseded_by != '' THEN 1 END) as superseded, \
-             AVG(TIMESTAMPDIFF(HOUR, observed_at, NOW())) as avg_stale_h \
+             CAST(AVG(TIMESTAMPDIFF(HOUR, observed_at, NOW())) AS DOUBLE) as avg_stale_h \
              FROM {memories_table} WHERE user_id = ? GROUP BY memory_type"
         ))
         .bind(user_id)
@@ -4847,8 +4848,8 @@ impl SqlMemoryStore {
         let memories_table = self.t("mem_memories");
         let row: (i64, i64, f64) = sqlx::query_as(&format!(
             "SELECT COUNT(*) as total, \
-             SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) as active, \
-             AVG(LENGTH(content)) as avg_content_size \
+             COUNT(CASE WHEN is_active = 1 THEN 1 END) as active, \
+             CAST(COALESCE(AVG(LENGTH(content)), 0) AS DOUBLE) as avg_content_size \
              FROM {memories_table} WHERE user_id = ?"
         ))
         .bind(user_id)
@@ -5197,32 +5198,58 @@ impl SqlMemoryStore {
             .filter(|v| !v.is_empty()) // Some([]) → None → SQL NULL
             .map(vec_to_mo);
 
-        sqlx::query(&format!(
+        // MatrixOne 4.2 can retain a prepared parameter's NULL state across
+        // executions (matrixorigin/matrixone#26874). Keep nullable values out
+        // of bind parameters:
+        // each cached SQL shape then binds a value or contains a literal NULL,
+        // but never transitions the same parameter from NULL back to a value.
+        let nullable = |present| if present { "?" } else { "NULL" };
+        let session_id = nullable_str(&memory.session_id);
+        let superseded_by = nullable_str(&memory.superseded_by);
+        let author_param = nullable(memory.author_id.is_some());
+        let subject_param = nullable(memory.subject_id.is_some());
+        let embedding_param = nullable(embedding.is_some());
+        let session_param = nullable(session_id.is_some());
+        let superseded_param = nullable(superseded_by.is_some());
+        let sql = format!(
             r#"INSERT INTO {table}
                (memory_id, user_id, author_id, subject_id, memory_type, content, embedding,
                 session_id, source_event_ids, extra_metadata, is_active, superseded_by,
                 trust_tier, initial_confidence, observed_at, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)"#
-        ))
-        .bind(&memory.memory_id)
-        .bind(&memory.user_id)
-        .bind(memory.author_id.as_deref())
-        .bind(memory.subject_id.as_deref())
-        .bind(memory.memory_type.to_string())
-        .bind(&memory.content)
-        .bind(embedding)
-        .bind(nullable_str(&memory.session_id))
-        .bind(source_event_ids)
-        .bind(extra_metadata)
-        .bind(nullable_str(&memory.superseded_by))
-        .bind(memory.trust_tier.to_string())
-        .bind(memory.initial_confidence as f32)
-        .bind(observed_at)
-        .bind(created_at)
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
+               VALUES (?, ?, {author_param}, {subject_param}, ?, ?, {embedding_param},
+                       {session_param}, ?, ?, 1, {superseded_param}, ?, ?, ?, ?, ?)"#
+        );
+        let mut query = sqlx::query(&sql)
+            .bind(&memory.memory_id)
+            .bind(&memory.user_id);
+        if let Some(author_id) = memory.author_id.as_deref() {
+            query = query.bind(author_id);
+        }
+        if let Some(subject_id) = memory.subject_id.as_deref() {
+            query = query.bind(subject_id);
+        }
+        query = query
+            .bind(memory.memory_type.to_string())
+            .bind(&memory.content);
+        if let Some(embedding) = embedding {
+            query = query.bind(embedding);
+        }
+        if let Some(session_id) = session_id {
+            query = query.bind(session_id);
+        }
+        query = query.bind(source_event_ids).bind(extra_metadata);
+        if let Some(superseded_by) = superseded_by {
+            query = query.bind(superseded_by);
+        }
+        query
+            .bind(memory.trust_tier.to_string())
+            .bind(memory.initial_confidence as f32)
+            .bind(observed_at)
+            .bind(created_at)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
         Ok(())
     }
 
@@ -5240,7 +5267,17 @@ impl SqlMemoryStore {
         for chunk in memories.chunks(50) {
             let placeholders = chunk
                 .iter()
-                .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)")
+                .map(|m| {
+                    let nullable = |present| if present { "?" } else { "NULL" };
+                    format!(
+                        "(?, ?, {}, {}, ?, ?, {}, {}, ?, ?, 1, {}, ?, ?, ?, ?, ?)",
+                        nullable(m.author_id.is_some()),
+                        nullable(m.subject_id.is_some()),
+                        nullable(m.embedding.as_ref().is_some_and(|v| !v.is_empty())),
+                        nullable(nullable_str(&m.session_id).is_some()),
+                        nullable(nullable_str(&m.superseded_by).is_some())
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
@@ -5267,18 +5304,27 @@ impl SqlMemoryStore {
                     .as_deref()
                     .filter(|v| !v.is_empty())
                     .map(vec_to_mo);
+                q = q.bind(m.memory_id.clone()).bind(m.user_id.clone());
+                if let Some(author_id) = &m.author_id {
+                    q = q.bind(author_id.clone());
+                }
+                if let Some(subject_id) = &m.subject_id {
+                    q = q.bind(subject_id.clone());
+                }
                 q = q
-                    .bind(m.memory_id.clone())
-                    .bind(m.user_id.clone())
-                    .bind(m.author_id.clone())
-                    .bind(m.subject_id.clone())
                     .bind(m.memory_type.to_string())
-                    .bind(m.content.clone())
-                    .bind(embedding)
-                    .bind(nullable_str(&m.session_id).map(str::to_string))
-                    .bind(source_event_ids)
-                    .bind(extra_metadata)
-                    .bind(nullable_str(&m.superseded_by).map(str::to_string))
+                    .bind(m.content.clone());
+                if let Some(embedding) = embedding {
+                    q = q.bind(embedding);
+                }
+                if let Some(session_id) = nullable_str(&m.session_id) {
+                    q = q.bind(session_id.to_string());
+                }
+                q = q.bind(source_event_ids).bind(extra_metadata);
+                if let Some(superseded_by) = nullable_str(&m.superseded_by) {
+                    q = q.bind(superseded_by.to_string());
+                }
+                q = q
                     .bind(m.trust_tier.to_string())
                     .bind(m.initial_confidence as f32)
                     .bind(observed_at)

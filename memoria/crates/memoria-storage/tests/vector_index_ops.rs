@@ -638,13 +638,13 @@ async fn test_health_hygiene_does_not_misreport_entity_nodes() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// detect_pollution — empty result set (SUM returns NULL)
+// detect_pollution — empty result set (conditional COUNT returns zero)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
 async fn test_detect_pollution_empty_user() {
     let store = setup().await;
-    // Brand new user with zero memories — SUM(CASE...) returns NULL
+    // Brand new user with zero memories — conditional COUNT returns zero.
     let uid = uuid::Uuid::new_v4().to_string();
     let result = store.detect_pollution(&uid, 24).await.unwrap();
     assert!(!result, "empty user should not be flagged as polluted");
