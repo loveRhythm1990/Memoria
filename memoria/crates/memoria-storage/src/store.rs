@@ -5203,23 +5203,12 @@ impl SqlMemoryStore {
         // of bind parameters:
         // each cached SQL shape then binds a value or contains a literal NULL,
         // but never transitions the same parameter from NULL back to a value.
-        let author_param = memory.author_id.is_some().then_some("?").unwrap_or("NULL");
-        let subject_param = memory
-            .subject_id
-            .is_some()
-            .then_some("?")
-            .unwrap_or("NULL");
-        let embedding_param = embedding.is_some().then_some("?").unwrap_or("NULL");
-        let session_param = memory
-            .session_id
-            .is_some()
-            .then_some("?")
-            .unwrap_or("NULL");
-        let superseded_param = memory
-            .superseded_by
-            .is_some()
-            .then_some("?")
-            .unwrap_or("NULL");
+        let nullable = |present| if present { "?" } else { "NULL" };
+        let author_param = nullable(memory.author_id.is_some());
+        let subject_param = nullable(memory.subject_id.is_some());
+        let embedding_param = nullable(embedding.is_some());
+        let session_param = nullable(memory.session_id.is_some());
+        let superseded_param = nullable(memory.superseded_by.is_some());
         let sql = format!(
             r#"INSERT INTO {table}
                (memory_id, user_id, author_id, subject_id, memory_type, content, embedding,
