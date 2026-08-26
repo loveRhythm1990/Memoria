@@ -59,7 +59,7 @@ jobs:
         image: matrixorigin/matrixone:latest
         ports:
           - 6001:6001
-        options: --memory=2g
+        options: --memory=4g
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85.0
