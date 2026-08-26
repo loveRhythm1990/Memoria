@@ -46,10 +46,22 @@ struct Response {
 
 enum RpcMethod {
     Initialize,
+    Ping,
     ToolsList,
     ToolsCall,
     NotificationsInitialized,
     Unknown(String),
+}
+
+fn parse_rpc_method(method: &str) -> RpcMethod {
+    match method {
+        "initialize" => RpcMethod::Initialize,
+        "ping" => RpcMethod::Ping,
+        "tools/list" => RpcMethod::ToolsList,
+        "tools/call" => RpcMethod::ToolsCall,
+        "notifications/initialized" => RpcMethod::NotificationsInitialized,
+        _ => RpcMethod::Unknown(method.to_string()),
+    }
 }
 
 const GIT_TOOL_NAMES: &[&str] = &[
@@ -291,19 +303,14 @@ async fn dispatch(
     user_id: &str,
 ) -> Result<Value, McpRpcError> {
     let p = params.unwrap_or(Value::Null);
-    let method = match method {
-        "initialize" => RpcMethod::Initialize,
-        "tools/list" => RpcMethod::ToolsList,
-        "tools/call" => RpcMethod::ToolsCall,
-        "notifications/initialized" => RpcMethod::NotificationsInitialized,
-        _ => RpcMethod::Unknown(method.to_string()),
-    };
+    let method = parse_rpc_method(method);
     match method {
         RpcMethod::Initialize => Ok(json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "memoria-mcp-rs", "version": "0.1.0"}
         })),
+        RpcMethod::Ping => Ok(json!({})),
         RpcMethod::ToolsList => {
             let mut all_tools = tools::list().as_array().unwrap().clone();
             all_tools.extend(git_tools::list().as_array().unwrap().clone());
@@ -350,19 +357,14 @@ async fn dispatch_embedded_owned(
     user_id: String,
 ) -> Result<Value, McpRpcError> {
     let p = params.unwrap_or(Value::Null);
-    let method = match method.as_str() {
-        "initialize" => RpcMethod::Initialize,
-        "tools/list" => RpcMethod::ToolsList,
-        "tools/call" => RpcMethod::ToolsCall,
-        "notifications/initialized" => RpcMethod::NotificationsInitialized,
-        _ => RpcMethod::Unknown(method),
-    };
+    let method = parse_rpc_method(&method);
     match method {
         RpcMethod::Initialize => Ok(json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "memoria-mcp-rs", "version": "0.1.0"}
         })),
+        RpcMethod::Ping => Ok(json!({})),
         RpcMethod::ToolsList => {
             let mut all_tools = tools::list().as_array().unwrap().clone();
             all_tools.extend(git_tools::list().as_array().unwrap().clone());
@@ -398,7 +400,31 @@ async fn dispatch_embedded_owned(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_git_tool, GIT_TOOL_NAMES};
+    use super::{
+        dispatch, is_git_tool, parse_rpc_method, Mode, RemoteClient, RpcMethod, GIT_TOOL_NAMES,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn ping_is_a_known_rpc_method() {
+        assert!(matches!(parse_rpc_method("ping"), RpcMethod::Ping));
+    }
+
+    #[tokio::test]
+    async fn ping_returns_an_empty_result_without_calling_the_backend() {
+        let mode = Mode::Remote(RemoteClient::new(
+            "http://127.0.0.1:1",
+            None,
+            "test-user".to_string(),
+            None,
+        ));
+
+        let result = dispatch("ping", None, &mode, "test-user")
+            .await
+            .expect("ping should succeed");
+
+        assert_eq!(result, json!({}));
+    }
 
     #[test]
     fn git_dispatch_list_includes_memory_apply() {

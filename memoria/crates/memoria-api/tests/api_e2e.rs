@@ -9413,6 +9413,45 @@ async fn test_mcp_initialize() {
 }
 
 #[tokio::test]
+async fn test_mcp_ping() {
+    let (base, client, _server) = spawn_server().await;
+    let uid = uid();
+
+    let resp = mcp_post_with_headers(
+        &client,
+        &base,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}),
+        &[("X-User-Id", uid.as_str())],
+    )
+    .await;
+
+    assert_eq!(resp, json!({"jsonrpc": "2.0", "id": 2, "result": {}}));
+    println!("✅ POST /mcp ping");
+}
+
+#[tokio::test]
+async fn test_mcp_ping_notification_returns_no_content() {
+    let (base, client, _server) = spawn_server().await;
+    let uid = uid();
+
+    let response = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("X-User-Id", uid)
+        .body(r#"{"jsonrpc":"2.0","method":"ping"}"#)
+        .send()
+        .await
+        .expect("POST /mcp ping notification");
+
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert!(response
+        .text()
+        .await
+        .expect("read ping notification response")
+        .is_empty());
+}
+
+#[tokio::test]
 async fn test_mcp_tools_list() {
     let (base, client, _server) = spawn_server().await;
     let uid = uid();

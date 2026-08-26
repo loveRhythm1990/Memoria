@@ -156,7 +156,8 @@ pub async fn mcp_handler(
     auth: AuthUser,
     body: String,
 ) -> impl IntoResponse {
-    // Start timing here — auth already succeeded, this is real billable traffic.
+    // Start timing after auth. Billable MCP requests are recorded below; transport
+    // liveness checks short-circuit before entering the usage-accounting pipeline.
     let t = std::time::Instant::now();
 
     // Helper: record a validation-failure entry and return early.
@@ -231,6 +232,17 @@ pub async fn mcp_handler(
             );
         }
     };
+
+    // `ping` is a transport-level liveness check and can be sent frequently by MCP
+    // clients. Keep authentication and rate limiting, but do not count it as product
+    // usage or persist it in the API call log.
+    if method == "ping" {
+        if req.get("id").is_none() {
+            return StatusCode::NO_CONTENT.into_response();
+        }
+        let id = req["id"].clone();
+        return Json(json!({"jsonrpc": "2.0", "id": id, "result": {}})).into_response();
+    }
 
     let params = req.get("params").cloned();
     let track_path = tracking_path(&method, params.as_ref());
