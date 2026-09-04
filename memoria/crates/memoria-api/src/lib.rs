@@ -339,6 +339,7 @@ pub fn build_router(state: AppState) -> Router {
         // Sessions
         .route("/v1/tasks/:task_id", get(routes::sessions::get_task_status))
         // API key management
+        .route("/auth/whoami", get(routes::auth::whoami))
         .route("/auth/keys", post(routes::auth::create_key))
         .route("/auth/keys", get(routes::auth::list_keys))
         .route("/auth/keys/:id", get(routes::auth::get_key))

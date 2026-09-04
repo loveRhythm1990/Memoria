@@ -9,7 +9,14 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
-use crate::{auth::AuthUser, routes::memory::api_err, state::AppState};
+use crate::{
+    auth::{
+        parse_scopes, AuthUser, DEFAULT_API_KEY_SCOPES, SCOPE_IDENTITY_READ, SCOPE_KEYS_MANAGE,
+        SCOPE_MEMORY_READ, SCOPE_MEMORY_WRITE,
+    },
+    routes::memory::api_err,
+    state::AppState,
+};
 
 fn auth_pool(state: &AppState) -> Result<&sqlx::MySqlPool, (StatusCode, String)> {
     state
@@ -34,6 +41,47 @@ fn generate_key() -> (String, String, String) {
     (raw, hash, prefix)
 }
 
+fn normalize_scopes(requested: Option<Vec<String>>) -> Result<Vec<String>, (StatusCode, String)> {
+    let requested = requested.unwrap_or_else(|| parse_scopes(DEFAULT_API_KEY_SCOPES));
+    let supported = [
+        SCOPE_IDENTITY_READ,
+        SCOPE_MEMORY_READ,
+        SCOPE_MEMORY_WRITE,
+        SCOPE_KEYS_MANAGE,
+    ];
+    if let Some(scope) = requested
+        .iter()
+        .map(|scope| scope.trim())
+        .find(|scope| !supported.contains(scope))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Unsupported API key scope: {scope}"),
+        ));
+    }
+
+    let scopes: Vec<String> = supported
+        .iter()
+        .filter(|scope| requested.iter().any(|item| item.trim() == **scope))
+        .map(|scope| (*scope).to_string())
+        .collect();
+    if !scopes.iter().any(|scope| scope == SCOPE_IDENTITY_READ) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("API key scope {SCOPE_IDENTITY_READ} is required"),
+        ));
+    }
+    if scopes.iter().any(|scope| scope == SCOPE_MEMORY_WRITE)
+        && !scopes.iter().any(|scope| scope == SCOPE_MEMORY_READ)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("API key scope {SCOPE_MEMORY_WRITE} requires {SCOPE_MEMORY_READ}"),
+        ));
+    }
+    Ok(scopes)
+}
+
 // ── Request / Response ────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -42,6 +90,7 @@ pub struct CreateKeyRequest {
     pub name: String,
     pub expires_at: Option<String>,
     pub group_id: Option<String>,
+    pub scopes: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -51,11 +100,32 @@ pub struct KeyResponse {
     pub group_id: Option<String>,
     pub name: String,
     pub key_prefix: String,
+    pub scopes: Vec<String>,
     pub created_at: String,
     pub expires_at: Option<String>,
     pub last_used_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_key: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct WhoAmIScope {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub id: String,
+}
+
+#[derive(Serialize)]
+pub struct WhoAmIResponse {
+    pub user_id: String,
+    pub key_id: Option<String>,
+    pub key_prefix: Option<String>,
+    pub scope: WhoAmIScope,
+    pub granted_scopes: Vec<String>,
+    pub api_version: &'static str,
+    pub capabilities: [&'static str; 2],
+    pub is_active: bool,
+    pub is_master: bool,
 }
 
 async fn ensure_group_membership(
@@ -85,6 +155,26 @@ async fn ensure_group_membership(
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
+/// GET /auth/whoami — resolve the authenticated principal and granted scopes.
+pub async fn whoami(auth: AuthUser) -> Result<Json<WhoAmIResponse>, (StatusCode, String)> {
+    auth.require_scope(SCOPE_IDENTITY_READ)?;
+    let (kind, id) = match auth.group_id.clone() {
+        Some(group_id) => ("group", group_id),
+        None => ("personal", auth.user_id.clone()),
+    };
+    Ok(Json(WhoAmIResponse {
+        user_id: auth.user_id,
+        key_id: auth.key_id,
+        key_prefix: auth.key_prefix,
+        scope: WhoAmIScope { kind, id },
+        granted_scopes: auth.scopes,
+        api_version: "1",
+        capabilities: ["api_key_scopes", "memory_filters_v1"],
+        is_active: true,
+        is_master: auth.is_master,
+    }))
+}
+
 /// POST /auth/keys — create API key
 ///
 /// Access: master key can create any key. Group owners can create keys
@@ -94,7 +184,10 @@ pub async fn create_key(
     auth: AuthUser,
     Json(req): Json<CreateKeyRequest>,
 ) -> Result<(StatusCode, Json<KeyResponse>), (StatusCode, String)> {
+    auth.require_scope(SCOPE_KEYS_MANAGE)?;
     let pool = auth_pool(&state)?;
+    let scopes = normalize_scopes(req.scopes.clone())?;
+    let scopes_csv = scopes.join(",");
 
     match req.group_id.as_deref() {
         Some(group_id) => {
@@ -131,11 +224,11 @@ pub async fn create_key(
     let now = chrono::Utc::now().naive_utc();
 
     sqlx::query(
-        "INSERT INTO mem_api_keys (key_id, user_id, group_id, name, key_hash, key_prefix, is_active, created_at, expires_at) \
-         VALUES (?,?,?,?,?,?,1,?,?)"
+        "INSERT INTO mem_api_keys (key_id, user_id, group_id, name, key_hash, key_prefix, scopes, is_active, created_at, expires_at) \
+         VALUES (?,?,?,?,?,?,?,1,?,?)"
     )
     .bind(&key_id).bind(&req.user_id).bind(req.group_id.as_deref()).bind(&req.name)
-    .bind(&key_hash).bind(&key_prefix).bind(now)
+    .bind(&key_hash).bind(&key_prefix).bind(&scopes_csv).bind(now)
     .bind(req.expires_at.as_deref())
     .execute(pool).await.map_err(api_err)?;
 
@@ -147,6 +240,7 @@ pub async fn create_key(
             group_id: req.group_id,
             name: req.name,
             key_prefix,
+            scopes,
             created_at: now.to_string(),
             expires_at: req.expires_at,
             last_used_at: None,
@@ -158,12 +252,14 @@ pub async fn create_key(
 /// GET /auth/keys — list keys for current user
 pub async fn list_keys(
     State(state): State<AppState>,
-    AuthUser { user_id, .. }: AuthUser,
+    auth: AuthUser,
 ) -> Result<Json<Vec<KeyResponse>>, (StatusCode, String)> {
+    auth.require_scope(SCOPE_KEYS_MANAGE)?;
+    let user_id = auth.user_id;
     let pool = auth_pool(&state)?;
 
     let rows = sqlx::query(
-        "SELECT key_id, user_id, group_id, name, key_prefix, created_at, expires_at, last_used_at \
+        "SELECT key_id, user_id, group_id, name, key_prefix, scopes, created_at, expires_at, last_used_at \
          FROM mem_api_keys WHERE user_id = ? AND is_active = 1 ORDER BY created_at DESC",
     )
     .bind(&user_id)
@@ -179,6 +275,10 @@ pub async fn list_keys(
             group_id: r.try_get("group_id").ok(),
             name: r.try_get("name").unwrap_or_default(),
             key_prefix: r.try_get("key_prefix").unwrap_or_default(),
+            scopes: parse_scopes(
+                &r.try_get::<String, _>("scopes")
+                    .unwrap_or_else(|_| DEFAULT_API_KEY_SCOPES.to_string()),
+            ),
             created_at: r
                 .try_get::<chrono::NaiveDateTime, _>("created_at")
                 .map(|d| d.to_string())
@@ -203,15 +303,16 @@ pub async fn list_keys(
 /// GET /auth/keys/:id — get a single API key by ID
 pub async fn get_key(
     State(state): State<AppState>,
-    AuthUser {
-        user_id, is_master, ..
-    }: AuthUser,
+    auth: AuthUser,
     Path(key_id): Path<String>,
 ) -> Result<Json<KeyResponse>, (StatusCode, String)> {
+    auth.require_scope(SCOPE_KEYS_MANAGE)?;
+    let user_id = auth.user_id;
+    let is_master = auth.is_master;
     let pool = auth_pool(&state)?;
 
     let row = sqlx::query(
-        "SELECT key_id, user_id, group_id, name, key_prefix, created_at, expires_at, last_used_at \
+        "SELECT key_id, user_id, group_id, name, key_prefix, scopes, created_at, expires_at, last_used_at \
          FROM mem_api_keys WHERE key_id = ? AND is_active = 1",
     )
     .bind(&key_id)
@@ -230,6 +331,10 @@ pub async fn get_key(
         group_id: r.try_get("group_id").ok(),
         name: r.try_get("name").unwrap_or_default(),
         key_prefix: r.try_get("key_prefix").unwrap_or_default(),
+        scopes: parse_scopes(
+            &r.try_get::<String, _>("scopes")
+                .unwrap_or_else(|_| DEFAULT_API_KEY_SCOPES.to_string()),
+        ),
         created_at: r
             .try_get::<chrono::NaiveDateTime, _>("created_at")
             .map(|d| d.to_string())
@@ -251,15 +356,16 @@ pub async fn get_key(
 /// PUT /auth/keys/:id/rotate — revoke old key, issue new one
 pub async fn rotate_key(
     State(state): State<AppState>,
-    AuthUser {
-        user_id, is_master, ..
-    }: AuthUser,
+    auth: AuthUser,
     Path(key_id): Path<String>,
 ) -> Result<(StatusCode, Json<KeyResponse>), (StatusCode, String)> {
+    auth.require_scope(SCOPE_KEYS_MANAGE)?;
+    let user_id = auth.user_id;
+    let is_master = auth.is_master;
     let pool = auth_pool(&state)?;
 
     let old = sqlx::query(
-        "SELECT user_id, group_id, name, expires_at, key_hash FROM mem_api_keys WHERE key_id = ? AND is_active = 1",
+        "SELECT user_id, group_id, name, scopes, expires_at, key_hash FROM mem_api_keys WHERE key_id = ? AND is_active = 1",
     )
     .bind(&key_id)
     .fetch_optional(pool)
@@ -275,6 +381,10 @@ pub async fn rotate_key(
     let name: String = old.try_get("name").map_err(api_err)?;
     let group_id: Option<String> = old.try_get("group_id").ok();
     let expires_at: Option<chrono::NaiveDateTime> = old.try_get("expires_at").ok().flatten();
+    let scopes_csv: String = old
+        .try_get("scopes")
+        .unwrap_or_else(|_| DEFAULT_API_KEY_SCOPES.to_string());
+    let scopes = parse_scopes(&scopes_csv);
 
     // Invalidate cache before DB update
     if let Ok(key_hash) = old.try_get::<String, _>("key_hash") {
@@ -294,11 +404,11 @@ pub async fn rotate_key(
     let now = chrono::Utc::now().naive_utc();
 
     sqlx::query(
-        "INSERT INTO mem_api_keys (key_id, user_id, group_id, name, key_hash, key_prefix, is_active, created_at, expires_at) \
-         VALUES (?,?,?,?,?,?,1,?,?)"
+        "INSERT INTO mem_api_keys (key_id, user_id, group_id, name, key_hash, key_prefix, scopes, is_active, created_at, expires_at) \
+         VALUES (?,?,?,?,?,?,?,1,?,?)"
     )
     .bind(&new_id).bind(&old_user).bind(group_id.as_deref()).bind(&name)
-    .bind(&key_hash).bind(&key_prefix).bind(now)
+    .bind(&key_hash).bind(&key_prefix).bind(&scopes_csv).bind(now)
     .bind(expires_at)
     .execute(pool).await.map_err(api_err)?;
 
@@ -310,6 +420,7 @@ pub async fn rotate_key(
             group_id,
             name,
             key_prefix,
+            scopes,
             created_at: now.to_string(),
             expires_at: expires_at.map(|d| d.to_string()),
             last_used_at: None,
@@ -324,11 +435,12 @@ pub async fn rotate_key(
 /// group owner can revoke any key scoped to their group.
 pub async fn revoke_key(
     State(state): State<AppState>,
-    AuthUser {
-        user_id, is_master, ..
-    }: AuthUser,
+    auth: AuthUser,
     Path(key_id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    auth.require_scope(SCOPE_KEYS_MANAGE)?;
+    let user_id = auth.user_id;
+    let is_master = auth.is_master;
     let pool = auth_pool(&state)?;
 
     let row = sqlx::query("SELECT user_id, group_id, key_hash FROM mem_api_keys WHERE key_id = ?")
@@ -373,4 +485,42 @@ pub async fn revoke_key(
         .map_err(api_err)?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scopes_are_canonicalized_and_deduplicated() {
+        let scopes = normalize_scopes(Some(vec![
+            SCOPE_MEMORY_READ.to_string(),
+            SCOPE_IDENTITY_READ.to_string(),
+            SCOPE_MEMORY_READ.to_string(),
+        ]))
+        .unwrap();
+        assert_eq!(
+            scopes,
+            vec![
+                SCOPE_IDENTITY_READ.to_string(),
+                SCOPE_MEMORY_READ.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn write_scope_requires_read_scope() {
+        let err = normalize_scopes(Some(vec![
+            SCOPE_IDENTITY_READ.to_string(),
+            SCOPE_MEMORY_WRITE.to_string(),
+        ]))
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn identity_scope_is_required() {
+        let err = normalize_scopes(Some(vec![SCOPE_MEMORY_READ.to_string()])).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
 }

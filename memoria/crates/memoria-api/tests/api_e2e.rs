@@ -1898,6 +1898,102 @@ async fn test_api_key_crud() {
 }
 
 #[tokio::test]
+async fn test_scoped_api_key_whoami_and_memory_authorization() {
+    let mk = "test-master-key-scopes";
+    let (base, client, _server) = spawn_server_with_master_key(mk).await;
+    let auth = format!("Bearer {mk}");
+    let user_id = uid();
+
+    let r = client
+        .post(format!("{base}/auth/keys"))
+        .header("Authorization", &auth)
+        .json(&json!({
+            "user_id": user_id,
+            "name": "astra-read-only",
+            "scopes": ["identity:read", "memory:read"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let key_body: Value = r.json().await.unwrap();
+    let raw_key = key_body["raw_key"].as_str().unwrap();
+    assert_eq!(key_body["scopes"], json!(["identity:read", "memory:read"]));
+
+    let bearer = format!("Bearer {raw_key}");
+    let r = client
+        .get(format!("{base}/auth/whoami"))
+        .header("Authorization", &bearer)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let whoami: Value = r.json().await.unwrap();
+    assert_eq!(whoami["user_id"], user_id);
+    assert_eq!(whoami["scope"]["type"], "personal");
+    assert_eq!(whoami["scope"]["id"], user_id);
+    assert_eq!(
+        whoami["granted_scopes"],
+        json!(["identity:read", "memory:read"])
+    );
+    assert_eq!(
+        whoami["capabilities"],
+        json!(["api_key_scopes", "memory_filters_v1"])
+    );
+
+    let r = client
+        .get(format!("{base}/v1/memories"))
+        .header("Authorization", &bearer)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "read-only key must be able to read");
+
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("Authorization", &bearer)
+        .json(&json!({"content": "must not be stored"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "read-only key must not be able to write");
+    assert!(r.text().await.unwrap().contains("memory:write"));
+
+    let r = client
+        .get(format!("{base}/auth/keys"))
+        .header("Authorization", &bearer)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        403,
+        "integration keys must not be able to mint or manage credentials"
+    );
+    assert!(r.text().await.unwrap().contains("keys:manage"));
+
+    let r = client
+        .post(format!("{base}/mcp"))
+        .header("Authorization", &bearer)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "memory_store", "arguments": {"content": "blocked"}}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["error"]["code"], -32003);
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("memory:write"));
+}
+
+#[tokio::test]
 async fn test_api_key_cannot_get_other_users_memory() {
     let mk = "test-master-key-memory-read";
     let (base, client, _server) = spawn_server_with_master_key(mk).await;

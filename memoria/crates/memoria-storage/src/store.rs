@@ -2172,6 +2172,7 @@ impl SqlMemoryStore {
                 name         VARCHAR(100) NOT NULL,
                 key_hash     VARCHAR(64)  NOT NULL,
                 key_prefix   VARCHAR(12)  NOT NULL,
+                scopes       VARCHAR(512) NOT NULL DEFAULT 'identity:read,memory:read,memory:write,keys:manage',
                 is_active    TINYINT(1)   NOT NULL DEFAULT 1,
                 created_at   DATETIME(6)  NOT NULL,
                 expires_at   DATETIME(6)  DEFAULT NULL,
@@ -2207,6 +2208,26 @@ impl SqlMemoryStore {
                 "ALTER TABLE mem_api_keys ADD KEY idx_group_active (group_id, is_active)",
             );
             let _ = alter_idx.execute(&mut *conn).await;
+        }
+
+        let key_scopes_col_exists: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = DATABASE() AND table_name = 'mem_api_keys' AND column_name = 'scopes' \
+             LIMIT 1",
+        )
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        if key_scopes_col_exists.is_none() {
+            let alter = sqlx::query(
+                "ALTER TABLE mem_api_keys ADD COLUMN scopes VARCHAR(512) NOT NULL \
+                 DEFAULT 'identity:read,memory:read,memory:write,keys:manage' AFTER key_prefix",
+            );
+            if let Err(e) = alter.execute(&mut *conn).await {
+                if !is_duplicate_column(&e) {
+                    return Err(db_err(e));
+                }
+            }
         }
 
         sqlx::query(

@@ -22,7 +22,7 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde_json::json;
 
 use crate::{
-    auth::{AuthUser, RpcMeta},
+    auth::{AuthUser, RpcMeta, SCOPE_MEMORY_READ, SCOPE_MEMORY_WRITE},
     state::AppState,
 };
 
@@ -132,6 +132,14 @@ fn mcp_tool_dirty_mask(tool: &str) -> Option<crate::metrics_summary::DirtyMask> 
         "memory_branch" | "memory_branch_delete" => Some(DirtyMask::BRANCH),
         "memory_checkout" | "memory_merge" | "memory_pick" => Some(DirtyMask::FULL),
         _ => None,
+    }
+}
+
+fn mcp_tool_required_scope(tool: &str) -> &'static str {
+    if mcp_tool_dirty_mask(tool).is_some() {
+        SCOPE_MEMORY_WRITE
+    } else {
+        SCOPE_MEMORY_READ
     }
 }
 
@@ -276,6 +284,10 @@ pub async fn mcp_handler(
             }
         }
     };
+    let missing_scope = tracked_tool
+        .as_deref()
+        .map(mcp_tool_required_scope)
+        .filter(|required| !auth.has_scope(required));
 
     // ── Group main-write guard (computed once, shared by both code paths) ─────
     // Resolved here — before the Notification early-return — so that
@@ -344,6 +356,18 @@ pub async fn mcp_handler(
     // JSON-RPC 2.0: a Notification is a *valid* Request without an "id" member.
     // The server MUST NOT reply to Notifications.
     if req.get("id").is_none() {
+        if missing_scope.is_some() {
+            report_stats(&track_path, false);
+            state.call_log_batcher.record_rpc(
+                user_id,
+                "POST".to_string(),
+                track_path,
+                204,
+                t.elapsed().as_millis() as u32,
+                RpcMeta::err(-32003),
+            );
+            return StatusCode::NO_CONTENT.into_response();
+        }
         // Write guard: per JSON-RPC 2.0 the server MUST NOT reply to Notifications,
         // so we silently drop blocked writes without dispatching.
         if blocked_tool.is_some() {
@@ -390,6 +414,27 @@ pub async fn mcp_handler(
     }
 
     let id = req["id"].clone();
+
+    if let Some(required_scope) = missing_scope {
+        let err_body = Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32003,
+                "message": format!("API key missing required scope: {required_scope}")
+            }
+        }));
+        report_stats(&track_path, false);
+        state.call_log_batcher.record_rpc(
+            user_id,
+            "POST".to_string(),
+            track_path,
+            200,
+            t.elapsed().as_millis() as u32,
+            RpcMeta::err(-32003),
+        );
+        return err_body.into_response();
+    }
 
     // Use the pre-computed write-guard decision (see above).
     if let Some(tool) = &blocked_tool {
@@ -473,7 +518,8 @@ pub async fn mcp_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::{mcp_tool_dirty_mask, tracking_path};
+    use super::{mcp_tool_dirty_mask, mcp_tool_required_scope, tracking_path};
+    use crate::auth::{SCOPE_MEMORY_READ, SCOPE_MEMORY_WRITE};
     use serde_json::json;
 
     // ── tools/call — happy path ───────────────────────────────────────────────
@@ -509,6 +555,16 @@ mod tests {
         assert!(mcp_tool_dirty_mask("memory_merge").is_some());
         assert!(mcp_tool_dirty_mask("memory_search").is_none());
         assert!(mcp_tool_dirty_mask("memory_branches").is_none());
+    }
+
+    #[test]
+    fn memory_tools_require_matching_scopes() {
+        assert_eq!(mcp_tool_required_scope("memory_search"), SCOPE_MEMORY_READ);
+        assert_eq!(mcp_tool_required_scope("memory_store"), SCOPE_MEMORY_WRITE);
+        assert_eq!(
+            mcp_tool_required_scope("memory_checkout"),
+            SCOPE_MEMORY_WRITE
+        );
     }
 
     // ── tools/call — missing / malformed name ─────────────────────────────────
