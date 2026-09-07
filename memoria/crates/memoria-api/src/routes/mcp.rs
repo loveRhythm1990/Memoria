@@ -135,11 +135,41 @@ fn mcp_tool_dirty_mask(tool: &str) -> Option<crate::metrics_summary::DirtyMask> 
     }
 }
 
-fn mcp_tool_required_scope(tool: &str) -> &'static str {
-    if mcp_tool_dirty_mask(tool).is_some() {
-        SCOPE_MEMORY_WRITE
-    } else {
-        SCOPE_MEMORY_READ
+/// Authorization is independent of metrics invalidation. Include callable tools
+/// that are not advertised by tools/list, and fail closed for unclassified names.
+fn mcp_tool_required_scope(tool: &str) -> Option<&'static str> {
+    match tool {
+        "memory_retrieve"
+        | "memory_search"
+        | "memory_profile"
+        | "memory_list"
+        | "memory_capabilities"
+        | "memory_get_retrieval_params"
+        | "memory_snapshots"
+        | "memory_branches"
+        | "memory_diff" => Some(SCOPE_MEMORY_READ),
+        "memory_store"
+        | "memory_correct"
+        | "memory_purge"
+        | "memory_observe"
+        | "memory_governance"
+        | "memory_rebuild_index"
+        | "memory_consolidate"
+        | "memory_reflect"
+        | "memory_extract_entities"
+        | "memory_link_entities"
+        | "memory_feedback"
+        | "memory_tune_params"
+        | "memory_snapshot"
+        | "memory_snapshot_delete"
+        | "memory_rollback"
+        | "memory_branch"
+        | "memory_checkout"
+        | "memory_merge"
+        | "memory_pick"
+        | "memory_branch_delete"
+        | "memory_apply" => Some(SCOPE_MEMORY_WRITE),
+        _ => None,
     }
 }
 
@@ -284,10 +314,23 @@ pub async fn mcp_handler(
             }
         }
     };
-    let missing_scope = tracked_tool
-        .as_deref()
-        .map(mcp_tool_required_scope)
-        .filter(|required| !auth.has_scope(required));
+    // Use the exact dispatch name, never a sanitized/truncated metrics label.
+    let authorization_error = if method == "tools/call" {
+        let name = params
+            .as_ref()
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("");
+        match mcp_tool_required_scope(name) {
+            Some(scope) if !auth.has_scope(scope) => {
+                Some(format!("API key missing required scope: {scope}"))
+            }
+            Some(_) => None,
+            None => Some("MCP tool is not authorized: unclassified tool".to_string()),
+        }
+    } else {
+        None
+    };
 
     // ── Group main-write guard (computed once, shared by both code paths) ─────
     // Resolved here — before the Notification early-return — so that
@@ -356,7 +399,7 @@ pub async fn mcp_handler(
     // JSON-RPC 2.0: a Notification is a *valid* Request without an "id" member.
     // The server MUST NOT reply to Notifications.
     if req.get("id").is_none() {
-        if missing_scope.is_some() {
+        if authorization_error.is_some() {
             report_stats(&track_path, false);
             state.call_log_batcher.record_rpc(
                 user_id,
@@ -415,13 +458,13 @@ pub async fn mcp_handler(
 
     let id = req["id"].clone();
 
-    if let Some(required_scope) = missing_scope {
+    if let Some(message) = authorization_error {
         let err_body = Json(json!({
             "jsonrpc": "2.0",
             "id": id,
             "error": {
                 "code": -32003,
-                "message": format!("API key missing required scope: {required_scope}")
+                "message": message
             }
         }));
         report_stats(&track_path, false);
@@ -559,12 +602,37 @@ mod tests {
 
     #[test]
     fn memory_tools_require_matching_scopes() {
-        assert_eq!(mcp_tool_required_scope("memory_search"), SCOPE_MEMORY_READ);
-        assert_eq!(mcp_tool_required_scope("memory_store"), SCOPE_MEMORY_WRITE);
+        assert_eq!(
+            mcp_tool_required_scope("memory_search"),
+            Some(SCOPE_MEMORY_READ)
+        );
+        assert_eq!(
+            mcp_tool_required_scope("memory_store"),
+            Some(SCOPE_MEMORY_WRITE)
+        );
         assert_eq!(
             mcp_tool_required_scope("memory_checkout"),
-            SCOPE_MEMORY_WRITE
+            Some(SCOPE_MEMORY_WRITE)
         );
+        for name in ["memory_apply", "memory_rebuild_index", "memory_tune_params"] {
+            assert_eq!(mcp_tool_required_scope(name), Some(SCOPE_MEMORY_WRITE));
+        }
+        for name in ["", "memory_future_tool", "memory_search/", " memory_search"] {
+            assert_eq!(mcp_tool_required_scope(name), None);
+        }
+    }
+
+    #[test]
+    fn all_advertised_tools_have_explicit_authorization() {
+        let mut tools = memoria_mcp::tools::list().as_array().unwrap().clone();
+        tools.extend(memoria_mcp::git_tools::list().as_array().unwrap().clone());
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            assert!(
+                mcp_tool_required_scope(name).is_some(),
+                "unclassified advertised tool: {name}"
+            );
+        }
     }
 
     // ── tools/call — missing / malformed name ─────────────────────────────────

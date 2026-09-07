@@ -1994,6 +1994,201 @@ async fn test_scoped_api_key_whoami_and_memory_authorization() {
 }
 
 #[tokio::test]
+async fn test_scoped_mcp_write_authorization_is_independent_of_metrics() {
+    let master = "mcp-scope-regression-master";
+    let (base, client, server) = spawn_server_with_master_key(master).await;
+    let user = uid();
+    let mut keys = Vec::new();
+    for scopes in [
+        json!(["identity:read", "memory:read"]),
+        json!(["identity:read", "memory:read", "memory:write"]),
+        json!(["identity:read"]),
+    ] {
+        let response = client
+            .post(format!("{base}/auth/keys"))
+            .bearer_auth(master)
+            .json(&json!({"user_id": user, "name": "mcp-scope-regression", "scopes": scopes}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        let body: Value = response.json().await.unwrap();
+        keys.push(body["raw_key"].as_str().unwrap().to_owned());
+    }
+    let read_key = &keys[0];
+    let write_key = &keys[1];
+    let identity_key = &keys[2];
+
+    // Seed enough real feedback that an accidentally dispatched tune call would
+    // persist a change, including when the caller uses a notification (no id).
+    let response = client
+        .post(format!("{base}/v1/memories"))
+        .bearer_auth(write_key)
+        .json(&json!({"content": "MCP authorization regression fixture"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    let memory: Value = response.json().await.unwrap();
+    let store = server.user_store(&user).await;
+    for _ in 0..10 {
+        store
+            .record_feedback(&user, memory["memory_id"].as_str().unwrap(), "useful", None)
+            .await
+            .unwrap();
+    }
+    let before = store
+        .get_user_retrieval_params(&user)
+        .await
+        .unwrap()
+        .feedback_weight;
+
+    for (name, arguments) in [
+        (
+            "memory_apply",
+            json!({"source": "review-branch", "removes": [memory["memory_id"]]}),
+        ),
+        ("memory_rebuild_index", json!({"table": "mem_memories"})),
+        ("memory_tune_params", json!({})),
+    ] {
+        for notification in [false, true] {
+            let mut request = json!({"jsonrpc": "2.0", "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}});
+            if !notification {
+                request["id"] = json!(1);
+            }
+            let response = client
+                .post(format!("{base}/mcp"))
+                .bearer_auth(read_key)
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            if notification {
+                assert_eq!(response.status(), 204, "{name}");
+                assert!(response.bytes().await.unwrap().is_empty());
+            } else {
+                assert_eq!(response.status(), 200, "{name}");
+                let body: Value = response.json().await.unwrap();
+                assert_eq!(body["error"]["code"], -32003, "{name}: {body}");
+                assert!(body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("memory:write"));
+            }
+        }
+    }
+    assert_eq!(
+        store
+            .get_user_retrieval_params(&user)
+            .await
+            .unwrap()
+            .feedback_weight,
+        before,
+        "denied requests and notifications must not tune persisted parameters"
+    );
+
+    // Positive controls: scope checks allow writes into dispatch. Avoid an
+    // expensive index rebuild and branch mutation by using handler validation.
+    for (name, arguments, expected) in [
+        (
+            "memory_apply",
+            json!({"source": "main"}),
+            "Cannot apply from main",
+        ),
+        (
+            "memory_rebuild_index",
+            json!({"table": "invalid-table"}),
+            "Invalid table",
+        ),
+        ("memory_tune_params", json!({}), "Parameters tuned"),
+    ] {
+        let response = client
+            .post(format!("{base}/mcp"))
+            .bearer_auth(write_key)
+            .json(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert!(body.get("error").is_none(), "{name}: {body}");
+        assert!(
+            body["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(expected),
+            "{body}"
+        );
+    }
+    assert!(
+        store
+            .get_user_retrieval_params(&user)
+            .await
+            .unwrap()
+            .feedback_weight
+            > before,
+        "the same write-authorized tune call must change persisted parameters"
+    );
+
+    for (key, allowed) in [(read_key, true), (write_key, true), (identity_key, false)] {
+        let response = client
+            .post(format!("{base}/mcp"))
+            .bearer_auth(key)
+            .json(&json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "memory_get_retrieval_params", "arguments": {}}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.unwrap();
+        if allowed {
+            assert!(body.get("error").is_none(), "{body}");
+            assert!(body["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("feedback_weight"));
+        } else {
+            assert_eq!(body["error"]["code"], -32003, "{body}");
+            assert!(body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("memory:read"));
+        }
+    }
+
+    // Full-access credentials must not bypass classification, and metrics-name
+    // sanitization must not turn malformed names into authorized read tools.
+    for key in [read_key.as_str(), master] {
+        for name in [
+            Value::Null,
+            json!(42),
+            json!(""),
+            json!("memory_future_tool"),
+            json!("memory_search/"),
+            json!(" memory_search"),
+        ] {
+            let response = client
+                .post(format!("{base}/mcp"))
+                .bearer_auth(key)
+                .json(&json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                    "params": {"name": name, "arguments": {}}}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(body["error"]["code"], -32003, "{name}: {body}");
+            assert!(body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unclassified tool"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_scoped_keys_deny_groups_and_whoami_observes_uncached_revocation() {
     let (base, client, server) = spawn_server_with_master_key("review-master").await;
     let user = uid();
