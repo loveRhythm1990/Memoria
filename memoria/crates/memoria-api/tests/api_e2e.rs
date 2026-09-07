@@ -1994,6 +1994,76 @@ async fn test_scoped_api_key_whoami_and_memory_authorization() {
 }
 
 #[tokio::test]
+async fn test_scoped_keys_deny_groups_and_whoami_observes_uncached_revocation() {
+    let (base, client, server) = spawn_server_with_master_key("review-master").await;
+    let user = uid();
+    for scopes in [
+        json!(["identity:read"]),
+        json!(["identity:read", "memory:read"]),
+        json!(["identity:read", "memory:read", "memory:write"]),
+    ] {
+        let response = client
+            .post(format!("{base}/auth/keys"))
+            .bearer_auth("review-master")
+            .json(&json!({"user_id":user, "name":"review-scoped-key", "scopes":scopes}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        let key: Value = response.json().await.unwrap();
+        let raw = key["raw_key"].as_str().unwrap();
+        for (method, path) in [
+            (reqwest::Method::GET, "/v1/groups"),
+            (reqwest::Method::POST, "/v1/groups"),
+            (
+                reqwest::Method::POST,
+                "/v1/groups/owned-group/members/other-user",
+            ),
+            (reqwest::Method::DELETE, "/v1/groups/owned-group"),
+        ] {
+            let response = client.request(method, format!("{base}{path}")).bearer_auth(raw)
+                .json(&json!({"group_name":"must-not-be-created", "seed":{"db_name":"personal", "mode":"active_only"}}))
+                .send().await.unwrap();
+            assert_eq!(
+                response.status(),
+                403,
+                "scope check must precede group lookup/mutation: {path}"
+            );
+        }
+        assert_eq!(
+            client
+                .get(format!("{base}/auth/whoami"))
+                .bearer_auth(raw)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        // Simulate revocation through a different replica: do not invalidate
+        // this server's warm principal cache.
+        sqlx::query(&format!(
+            "UPDATE {} SET is_active = 0 WHERE key_id = ?",
+            server.shared_table("mem_api_keys")
+        ))
+        .bind(key["key_id"].as_str().unwrap())
+        .execute(&server.shared_pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            client
+                .get(format!("{base}/auth/whoami"))
+                .bearer_auth(raw)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_api_key_cannot_get_other_users_memory() {
     let mk = "test-master-key-memory-read";
     let (base, client, _server) = spawn_server_with_master_key(mk).await;

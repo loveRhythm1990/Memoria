@@ -37,6 +37,18 @@ pub fn parse_scopes(value: &str) -> Vec<String> {
 }
 
 fn required_scope_for_request(method: &axum::http::Method, path: &str) -> Option<&'static str> {
+    let under = |prefix: &str| path == prefix || path.starts_with(&format!("{prefix}/"));
+    if (path == "/auth/whoami" && method == axum::http::Method::GET)
+        || (path == "/mcp" && method == axum::http::Method::POST)
+    {
+        // MCP additionally authorizes each tool in its handler.
+        return Some(SCOPE_IDENTITY_READ);
+    }
+    if under("/auth/keys") || under("/v1/groups") {
+        // Group administration can copy personal memories, grant access to
+        // other accounts and delete databases. Memory scopes never grant it.
+        return Some(SCOPE_KEYS_MANAGE);
+    }
     let memory_path = [
         "/v1/memories",
         "/v1/profiles",
@@ -54,6 +66,7 @@ fn required_scope_for_request(method: &axum::http::Method, path: &str) -> Option
         "/v1/sessions",
         "/v1/pipeline",
         "/v1/tool-usage",
+        "/v1/health",
     ]
     .iter()
     .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")));
@@ -62,6 +75,7 @@ fn required_scope_for_request(method: &axum::http::Method, path: &str) -> Option
         return None;
     }
     if method == axum::http::Method::GET
+        || method == axum::http::Method::HEAD
         || (method == axum::http::Method::POST
             && matches!(
                 path,
@@ -1062,17 +1076,10 @@ impl FromRequestParts<AppState> for AuthUser {
                 // fall through
             }
             // 2) API key — user_id resolved from DB, never master
-            else if let Some(principal) = validate_api_key(token, state).await {
-                if let Some(required_scope) =
-                    required_scope_for_request(&parts.method, parts.uri.path())
-                {
-                    if !principal.scopes.iter().any(|scope| scope == required_scope) {
-                        return Err((
-                            StatusCode::FORBIDDEN,
-                            format!("API key missing required scope: {required_scope}"),
-                        ));
-                    }
-                }
+            else if let Some(principal) =
+                validate_api_key(token, state, parts.uri.path() == "/auth/whoami").await
+            {
+                authorize_api_key_route(&parts.method, parts.uri.path(), &principal.scopes)?;
                 let uid = principal.user_id.clone();
                 let group_id = principal.group_id.clone();
                 if let Some(tool) = tool_name {
@@ -1154,7 +1161,11 @@ impl FromRequestParts<AppState> for AuthUser {
 /// Uses a dedicated auth connection pool so that auth validation is never
 /// blocked by slow business queries on the main pool.
 /// `last_used_at` is updated via batched writes (see [`LastUsedBatcher`]).
-async fn validate_api_key(token: &str, state: &AppState) -> Option<CachedApiKeyPrincipal> {
+async fn validate_api_key(
+    token: &str,
+    state: &AppState,
+    fresh: bool,
+) -> Option<CachedApiKeyPrincipal> {
     state.service.sql_store.as_ref()?;
     let key_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
 
@@ -1169,7 +1180,12 @@ async fn validate_api_key(token: &str, state: &AppState) -> Option<CachedApiKeyP
     // because (a) cache TTL is 5 min, and (b) remove_member / delete_group invalidate
     // the cache for revoked keys.  The DB-level check on cache miss is the
     // authoritative membership gate.
-    if let Some(principal) = state.api_key_cache.get(&key_hash) {
+    // Login/refresh must observe revocations made through any API replica.
+    // Bypass cache reads entirely: another in-flight request may repopulate
+    // an old grant between invalidation and lookup.
+    if fresh {
+        state.api_key_cache.invalidate(&key_hash);
+    } else if let Some(principal) = state.api_key_cache.get(&key_hash) {
         // Still enqueue last_used_at update (batched, no DB pressure)
         state.last_used_batcher.mark_used(key_hash);
         return Some(principal);
@@ -1239,6 +1255,25 @@ async fn validate_api_key(token: &str, state: &AppState) -> Option<CachedApiKeyP
 
     Some(principal)
 }
+/// Unknown authenticated routes are master-only until explicitly classified.
+fn authorize_api_key_route(
+    method: &axum::http::Method,
+    path: &str,
+    scopes: &[String],
+) -> Result<(), (StatusCode, String)> {
+    let required = required_scope_for_request(method, path).ok_or((
+        StatusCode::FORBIDDEN,
+        "API key access is not enabled for this route".to_string(),
+    ))?;
+    if scopes.iter().any(|scope| scope == required) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            format!("API key missing required scope: {required}"),
+        ))
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1263,8 +1298,55 @@ mod tests {
         );
         assert_eq!(
             required_scope_for_request(&axum::http::Method::GET, "/auth/whoami"),
-            None
+            Some(SCOPE_IDENTITY_READ)
         );
+    }
+
+    #[test]
+    fn restricted_keys_cannot_administer_groups_or_use_unclassified_routes() {
+        use axum::http::Method;
+        for scopes in [
+            "identity:read",
+            "identity:read,memory:read",
+            "identity:read,memory:read,memory:write",
+        ] {
+            let scopes = parse_scopes(scopes);
+            for (method, path) in [
+                (Method::GET, "/v1/groups"),
+                (Method::POST, "/v1/groups"),
+                (Method::POST, "/v1/groups/group/members/another-user"),
+                (Method::DELETE, "/v1/groups/group"),
+                (Method::DELETE, "/v1/groups/group/members/another-user"),
+                (Method::GET, "/unclassified-sensitive-route"),
+                (Method::POST, "/admin/users"),
+            ] {
+                assert_eq!(
+                    authorize_api_key_route(&method, path, &scopes)
+                        .unwrap_err()
+                        .0,
+                    StatusCode::FORBIDDEN
+                );
+            }
+            assert!(authorize_api_key_route(&Method::GET, "/auth/whoami", &scopes).is_ok());
+        }
+        assert!(authorize_api_key_route(
+            &Method::POST,
+            "/v1/groups",
+            &parse_scopes(DEFAULT_API_KEY_SCOPES)
+        )
+        .is_ok());
+        assert!(authorize_api_key_route(
+            &Method::GET,
+            "/unclassified-sensitive-route",
+            &parse_scopes(DEFAULT_API_KEY_SCOPES)
+        )
+        .is_err());
+        assert!(authorize_api_key_route(
+            &Method::GET,
+            "/v1/health/analyze",
+            &parse_scopes("identity:read")
+        )
+        .is_err());
     }
 
     #[test]
