@@ -865,6 +865,7 @@ fn mo_to_vec(s: &str) -> Result<Vec<f32>, MemoriaError> {
 #[derive(Clone)]
 pub struct SqlMemoryStore {
     pool: MySqlPool,
+    branch_alter_capability: Arc<crate::branch_capability::BranchAlterCapability>,
     embedding_dim: usize,
     instance_id: String,
     database_url: Option<String>,
@@ -960,6 +961,9 @@ impl SqlMemoryStore {
     pub fn new(pool: MySqlPool, embedding_dim: usize, instance_id: String) -> Self {
         Self {
             pool,
+            branch_alter_capability: Arc::new(
+                crate::branch_capability::BranchAlterCapability::default(),
+            ),
             embedding_dim,
             instance_id,
             database_url: None,
@@ -1050,10 +1054,14 @@ impl SqlMemoryStore {
     }
 
     pub fn set_db_name(&mut self, name: String) {
+        self.branch_alter_capability =
+            Arc::new(crate::branch_capability::BranchAlterCapability::default());
         self.db_name = Some(name);
     }
 
     pub fn set_database_url(&mut self, url: String) {
+        self.branch_alter_capability =
+            Arc::new(crate::branch_capability::BranchAlterCapability::default());
         self.database_url = Some(url);
     }
 
@@ -1519,6 +1527,11 @@ impl SqlMemoryStore {
     }
 
     async fn apply_user_compat_migrations(&self, pool: &MySqlPool) -> Result<(), MemoriaError> {
+        // This legacy migration may ALTER both the parent and its branches.
+        // Check before any such DDL, not after an older engine materializes them.
+        if self.has_registered_branches().await? {
+            self.ensure_native_branch_alter_capability().await?;
+        }
         let schema_name = self.current_schema_name().await?;
         let schema_name = schema_name.as_ref();
         let memories_stats_table = self.t("mem_memories_stats");
@@ -1910,6 +1923,9 @@ impl SqlMemoryStore {
         let has_col =
             info_schema_column_exists(pool, schema_name, "mem_memories", "subject_id").await;
         if !has_col {
+            if self.has_registered_branches().await? {
+                self.ensure_native_branch_alter_capability().await?;
+            }
             match exec_ddl_with_retry(
                 pool,
                 &format!(
@@ -1943,28 +1959,41 @@ impl SqlMemoryStore {
         )
         .await;
         if !has_idx {
-            match exec_ddl_with_retry(
-                pool,
-                &format!(
-                    "ALTER TABLE {memories_table} ADD INDEX idx_scope_subject_active \
-                     (user_id, subject_id, is_active, memory_type)"
-                ),
-            )
-            .await
-            {
-                Ok(_) => tracing::info!(
-                    "migration: added idx_scope_subject_active on {memories_table}"
-                ),
-                Err(e) if is_duplicate_index(&e) => tracing::debug!(
-                    "migration: idx_scope_subject_active already exists on {memories_table}, skipping"
-                ),
-                Err(e) if is_mo_concurrent_ddl_race(&e) => tracing::warn!(
-                    "migration: concurrent DDL race for idx_scope_subject_active on \
-                     {memories_table}: {e}"
-                ),
-                Err(e) => tracing::warn!(
-                    "migration: failed to add idx_scope_subject_active on {memories_table}: {e}"
-                ),
+            let may_alter = if self.has_registered_branches().await? {
+                match self.ensure_native_branch_alter_capability().await {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(%error, "skipping optional parent index: ALTER capability unverified");
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+            if may_alter {
+                match exec_ddl_with_retry(
+                    pool,
+                    &format!(
+                        "ALTER TABLE {memories_table} ADD INDEX idx_scope_subject_active \
+                         (user_id, subject_id, is_active, memory_type)"
+                    ),
+                )
+                .await
+                {
+                    Ok(_) => tracing::info!(
+                        "migration: added idx_scope_subject_active on {memories_table}"
+                    ),
+                    Err(e) if is_duplicate_index(&e) => tracing::debug!(
+                        "migration: idx_scope_subject_active already exists on {memories_table}, skipping"
+                    ),
+                    Err(e) if is_mo_concurrent_ddl_race(&e) => tracing::warn!(
+                        "migration: concurrent DDL race for idx_scope_subject_active on \
+                         {memories_table}: {e}"
+                    ),
+                    Err(e) => tracing::warn!(
+                        "migration: failed to add idx_scope_subject_active on {memories_table}: {e}"
+                    ),
+                }
             }
         }
 
@@ -2006,6 +2035,34 @@ impl SqlMemoryStore {
         self.migrate_branch_subject_id(table, schema.as_ref()).await
     }
 
+    /// Check on disposable tables before ALTER may affect native branch lineage.
+    pub async fn ensure_native_branch_alter_capability(&self) -> Result<(), MemoriaError> {
+        let schema = self.current_schema_name().await?;
+        self.branch_alter_capability
+            .ensure(&self.pool, &schema)
+            .await
+    }
+
+    async fn has_registered_branches(&self) -> Result<bool, MemoriaError> {
+        let schema = self.current_schema_name().await?;
+        // Unlike best-effort metadata helpers, a safety gate must not turn a
+        // catalog read failure into "no branches" and allow an unchecked ALTER.
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=? AND table_name='mem_branches'",
+        ).bind(schema.as_ref()).fetch_one(&self.pool).await.map_err(db_err)?;
+        if exists == 0 {
+            return Ok(false);
+        }
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {} WHERE status='active' AND table_name != ''",
+            self.t("mem_branches")
+        ))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(count != 0)
+    }
+
     async fn migrate_branch_subject_id(
         &self,
         table: &str,
@@ -2017,6 +2074,7 @@ impl SqlMemoryStore {
         let current =
             crate::table_schema::read_table_columns(&self.pool, schema, "mem_memories").await?;
         if !info_schema_column_exists(&self.pool, schema, table, "subject_id").await {
+            self.ensure_native_branch_alter_capability().await?;
             let position = current
                 .iter()
                 .position(|column| column.name.eq_ignore_ascii_case("subject_id"))
@@ -2063,6 +2121,10 @@ impl SqlMemoryStore {
         }
         crate::table_schema::validate_native_branch_schema(&current, &columns)?;
         if !info_schema_index_exists(&self.pool, schema, table, "idx_scope_subject_active").await {
+            if let Err(error) = self.ensure_native_branch_alter_capability().await {
+                tracing::warn!(%error, %table, "skipping optional branch index: ALTER capability unverified");
+                return Ok(());
+            }
             let mut ddl = sqlx::QueryBuilder::<sqlx::MySql>::new("ALTER TABLE ");
             ddl.push(self.t(table)).push(
                 " ADD INDEX idx_scope_subject_active (user_id, subject_id, is_active, memory_type)",

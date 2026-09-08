@@ -269,6 +269,49 @@ async fn merge_preserves_scope_on_legacy_branch() {
 }
 
 #[tokio::test]
+async fn existing_parent_and_branch_migrate_with_lineage_intact() {
+    let (ctx, pool, _) = fixture(false).await;
+    call(&ctx, "memory_branch_delete", json!({"name":"工作分支"})).await;
+    // The legacy branch must be created AFTER reconstructing the old main
+    // schema. Dropping/re-adding a column on an already-new-schema branch tests
+    // a different operation: MO intentionally distinguishes that column identity.
+    for ddl in [
+        "ALTER TABLE mem_memories DROP INDEX idx_scope_subject_active",
+        "ALTER TABLE mem_memories DROP COLUMN subject_id",
+    ] {
+        sqlx::raw_sql(ddl).execute(&pool).await.unwrap();
+    }
+    let branch = "br_pre_subject";
+    let git = memoria_git::GitForDataService::new(pool.clone(), ctx.user_db_name(&ctx.user).await);
+    git.create_branch(branch, "mem_memories").await.unwrap();
+    let store = ctx.user_store(&ctx.user).await;
+    store
+        .register_branch(&ctx.user, "old-deployment", branch)
+        .await
+        .unwrap();
+    store.migrate_user().await.unwrap();
+    for table in ["mem_memories", branch] {
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM `{table}` WHERE subject_id IS NULL AND author_id='author-a'"
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 4, "legacy data must remain on {table}");
+    }
+    call(&ctx, "memory_diff", json!({"source":"old-deployment"})).await;
+    call(
+        &ctx,
+        "memory_branch_delete",
+        json!({"name":"old-deployment"}),
+    )
+    .await;
+    let probes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name LIKE 'mem_lineage_probe_%'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(probes, 0);
+}
+
+#[tokio::test]
 async fn incompatible_historical_type_is_not_registered() {
     let (ctx, pool, _) = fixture(true).await;
     call(&ctx, "memory_branch_delete", json!({"name":"工作分支"})).await;

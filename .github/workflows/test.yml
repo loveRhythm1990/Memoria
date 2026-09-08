@@ -78,5 +78,7 @@ jobs:
         run: cd memoria && cargo test -- --test-threads=1
       - name: Restore transaction failure regression
         run: cd memoria && cargo test -p memoria-git --lib failed_insert_rolls_back_preceding_delete -- --ignored --nocapture
+      - name: Branch capability probe cleanup regression
+        run: cd memoria && cargo test -p memoria-storage --lib materialized_probe_cleanup_preserves_unrelated_tables -- --ignored --nocapture
       - name: Offline restore cleanup regressions
         run: cd memoria && cargo test -p memoria-git --example restore_cleanup -- --include-ignored --nocapture

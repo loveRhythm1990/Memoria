@@ -1,3 +1,4 @@
+mod branch_capability;
 pub mod graph;
 pub mod migration;
 pub mod pool_config;

@@ -171,6 +171,122 @@ struct Fixture {
 }
 
 #[tokio::test]
+async fn branch_alter_probe_success_cleans_up_and_keeps_user_rows() {
+    let f = Fixture::new().await;
+    sqlx::raw_sql("INSERT INTO memories VALUES (1, 'user data')")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let store = memoria_storage::SqlMemoryStore::new(f.pool.clone(), 3, "probe-test".into());
+    // Concurrent callers share a probe; repeated callers reuse its result.
+    let (a, b) = tokio::join!(
+        store.ensure_native_branch_alter_capability(),
+        store.ensure_native_branch_alter_capability()
+    );
+    a.unwrap();
+    b.unwrap();
+    store.ensure_native_branch_alter_capability().await.unwrap();
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=? AND table_name LIKE 'mem_lineage_probe_%'")
+        .bind(&f.db).fetch_one(&f.pool).await.unwrap();
+    assert_eq!(remaining, 0);
+    let content: String = sqlx::query_scalar("SELECT content FROM memories WHERE id=1")
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(content, "user data");
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn failed_probe_prevents_permitted_user_branch_alter() {
+    let f = Fixture::new().await;
+    sqlx::raw_sql("CREATE TABLE mem_memories (memory_id VARCHAR(64) PRIMARY KEY,user_id VARCHAR(64),is_active TINYINT,memory_type VARCHAR(20),content TEXT); INSERT INTO mem_memories VALUES ('old','user',1,'semantic','untouched')")
+        .execute(&f.pool).await.unwrap();
+    f.git
+        .create_branch("br_guarded", "mem_memories")
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "ALTER TABLE mem_memories ADD COLUMN subject_id VARCHAR(128) DEFAULT NULL AFTER user_id",
+    )
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let role = format!("probe_role_{}", uuid::Uuid::new_v4().simple());
+    let user = format!("probe_user_{}", uuid::Uuid::new_v4().simple());
+    sqlx::raw_sql(&format!("CREATE ROLE {role}"))
+        .execute(&f.admin)
+        .await
+        .unwrap();
+    sqlx::raw_sql(&format!(
+        "CREATE USER {user} IDENTIFIED BY 'disposable_test_only' DEFAULT ROLE {role}"
+    ))
+    .execute(&f.admin)
+    .await
+    .unwrap();
+    // ALTER is deliberately allowed. Failure must come from the preflight,
+    // not from permission-denied on the actual user branch mutation.
+    for privilege in ["SELECT", "INSERT"] {
+        sqlx::raw_sql(&format!("GRANT {privilege} ON TABLE {}.* TO {role}", f.db))
+            .execute(&f.admin)
+            .await
+            .unwrap();
+    }
+    sqlx::raw_sql(&format!("GRANT ALTER TABLE ON DATABASE {} TO {role}", f.db))
+        .execute(&f.admin)
+        .await
+        .unwrap();
+    let options: MySqlConnectOptions = std::env::var("DATABASE_URL").unwrap().parse().unwrap();
+    let limited = MySqlPool::connect_with(
+        options
+            .database(&f.db)
+            .username(&user)
+            .password("disposable_test_only"),
+    )
+    .await
+    .unwrap();
+    sqlx::raw_sql("ALTER TABLE memories ADD COLUMN allowed_control INT")
+        .execute(&limited)
+        .await
+        .expect("role really can ALTER existing tables");
+    let store = memoria_storage::SqlMemoryStore::new(limited.clone(), 3, "guard-test".into());
+    let error = store
+        .ensure_branch_subject_id("br_guarded")
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Native branch ALTER capability could not be verified"),
+        "{error}"
+    );
+    let subject_columns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=? AND table_name='br_guarded' AND column_name='subject_id'")
+        .bind(&f.db).fetch_one(&f.pool).await.unwrap();
+    assert_eq!(
+        subject_columns, 0,
+        "must not ALTER the user branch before capability is known"
+    );
+    let content: String =
+        sqlx::query_scalar("SELECT content FROM br_guarded WHERE memory_id='old'")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(content, "untouched");
+    // Its lineage is intact and native cleanup remains available.
+    f.git.drop_branch("br_guarded").await.unwrap();
+    limited.close().await;
+    sqlx::raw_sql(&format!("DROP USER {user}"))
+        .execute(&f.admin)
+        .await
+        .unwrap();
+    sqlx::raw_sql(&format!("DROP ROLE {role}"))
+        .execute(&f.admin)
+        .await
+        .unwrap();
+    f.cleanup().await;
+}
+
+#[tokio::test]
 async fn branch_index_permission_failure_is_nonfatal_but_missing_column_is_fatal() {
     let f = Fixture::new().await;
     sqlx::raw_sql("CREATE TABLE mem_memories (memory_id VARCHAR(64) PRIMARY KEY, user_id VARCHAR(64), subject_id VARCHAR(128), is_active TINYINT, memory_type VARCHAR(20), content TEXT); CREATE TABLE br_index_optional LIKE mem_memories; CREATE TABLE br_column_required LIKE br_index_optional; ALTER TABLE br_column_required DROP COLUMN subject_id")
