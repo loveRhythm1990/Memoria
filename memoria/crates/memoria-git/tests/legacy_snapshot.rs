@@ -6,12 +6,180 @@ use sqlx::{
     MySql, MySqlPool, QueryBuilder,
 };
 
+#[tokio::test]
+async fn indexed_snapshot_restores_512_embeddings_and_search_indexes() {
+    let f = Fixture::new().await;
+    sqlx::raw_sql("ALTER TABLE memories ADD COLUMN subject_id VARCHAR(128) DEFAULT NULL; ALTER TABLE memories ADD COLUMN embedding VECF32(3); ALTER TABLE memories ADD FULLTEXT INDEX ft_content (content) WITH PARSER ngram; ALTER TABLE memories ADD UNIQUE INDEX unique_content (content)")
+        .execute(&f.pool).await.unwrap();
+    let mut insert = QueryBuilder::<MySql>::new("INSERT INTO memories (id, content, embedding) ");
+    insert.push_values(0..512, |mut row, id| {
+        row.push_bind(id)
+            .push_bind(format!("historical searchable memory {id}"))
+            .push_bind(format!(
+                "[{}, {}, 0.5]",
+                id as f32 / 512.0,
+                (512 - id) as f32 / 512.0
+            ));
+    });
+    insert.build().execute(&f.pool).await.unwrap();
+    sqlx::raw_sql("CREATE INDEX memories_embedding_ivf USING ivfflat ON memories(embedding) LISTS 10 op_type 'vector_l2_ops'")
+        .execute(&f.pool).await.unwrap();
+    let types: Vec<String> = sqlx::query_scalar("SELECT DISTINCT INDEX_TYPE FROM information_schema.statistics WHERE table_schema = ? AND table_name = 'memories'")
+        .bind(&f.db).fetch_all(&f.pool).await.unwrap();
+    assert!(
+        types.iter().any(|t| t.eq_ignore_ascii_case("ivfflat")),
+        "{types:?}"
+    );
+    assert!(
+        types.iter().any(|t| t.eq_ignore_ascii_case("fulltext")),
+        "{types:?}"
+    );
+    let baseline: Vec<i32> = sqlx::query_scalar(
+        "SELECT id FROM memories WHERE MATCH(content) AGAINST ('+historical' IN BOOLEAN MODE)",
+    )
+    .fetch_all(&f.pool)
+    .await
+    .expect("fulltext search before restore");
+    assert_eq!(baseline.len(), 512);
+    f.snapshot().await;
+    sqlx::raw_sql("UPDATE memories SET content = CONCAT('current ', id), subject_id = 'current'")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let current: Vec<i32> = sqlx::query_scalar(
+        "SELECT id FROM memories WHERE MATCH(content) AGAINST ('+current' IN BOOLEAN MODE)",
+    )
+    .fetch_all(&f.pool)
+    .await
+    .expect("fulltext search before restore");
+    assert_eq!(current.len(), 512);
+    f.git
+        .restore_table_from_snapshot("memories", &f.snapshot)
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL AND subject_id IS NULL AND content LIKE 'historical%'")
+        .fetch_one(&f.pool).await.unwrap();
+    assert_eq!(count, 512);
+    let matches: Vec<i32> = sqlx::query_scalar(
+        "SELECT id FROM memories WHERE MATCH(content) AGAINST ('+historical' IN BOOLEAN MODE)",
+    )
+    .fetch_all(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        matches.len(),
+        512,
+        "restored fulltext index must remain searchable"
+    );
+    let nearest: i32 = sqlx::query_scalar(
+        "SELECT id FROM memories ORDER BY l2_distance(embedding, '[0, 1, 0.5]') ASC LIMIT 1",
+    )
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(nearest, 0);
+    let after: Vec<String> = sqlx::query_scalar("SELECT DISTINCT INDEX_TYPE FROM information_schema.statistics WHERE table_schema = ? AND table_name = 'memories'")
+        .bind(&f.db).fetch_all(&f.pool).await.unwrap();
+    assert!(after.iter().any(|t| t.eq_ignore_ascii_case("ivfflat")));
+    assert!(after.iter().any(|t| t.eq_ignore_ascii_case("fulltext")));
+    // Staging index removal must not relax the live UNIQUE constraint.
+    assert!(sqlx::query(
+        "INSERT INTO memories (id, content) VALUES (900, 'historical searchable memory 0')"
+    )
+    .execute(&f.pool)
+    .await
+    .is_err());
+    f.assert_no_stage().await;
+    f.cleanup().await;
+}
+
 struct Fixture {
     pool: MySqlPool,
     admin: MySqlPool,
     db: String,
     snapshot: String,
     git: GitForDataService,
+}
+
+#[tokio::test]
+async fn branch_index_permission_failure_is_nonfatal_but_missing_column_is_fatal() {
+    let f = Fixture::new().await;
+    sqlx::raw_sql("CREATE TABLE mem_memories (memory_id VARCHAR(64) PRIMARY KEY, user_id VARCHAR(64), subject_id VARCHAR(128), is_active TINYINT, memory_type VARCHAR(20), content TEXT); CREATE TABLE br_index_optional LIKE mem_memories; CREATE TABLE br_column_required LIKE br_index_optional; ALTER TABLE br_column_required DROP COLUMN subject_id")
+        .execute(&f.pool).await.unwrap();
+    let role = format!("restore_role_{}", uuid::Uuid::new_v4().simple());
+    let user = format!("restore_user_{}", uuid::Uuid::new_v4().simple());
+    let mut create_role = QueryBuilder::<MySql>::new("CREATE ROLE ");
+    create_role.push(&role);
+    sqlx::raw_sql(&create_role.into_sql())
+        .execute(&f.admin)
+        .await
+        .unwrap();
+    let mut create_user = QueryBuilder::<MySql>::new("CREATE USER ");
+    create_user
+        .push(&user)
+        .push(" IDENTIFIED BY 'disposable_test_only' DEFAULT ROLE ")
+        .push(&role);
+    sqlx::raw_sql(&create_user.into_sql())
+        .execute(&f.admin)
+        .await
+        .unwrap();
+    for privilege in ["SELECT", "INSERT"] {
+        let mut grant = QueryBuilder::<MySql>::new("GRANT ");
+        grant
+            .push(privilege)
+            .push(" ON TABLE ")
+            .push(&f.db)
+            .push(".* TO ")
+            .push(&role);
+        sqlx::raw_sql(&grant.into_sql())
+            .execute(&f.admin)
+            .await
+            .unwrap();
+    }
+    let options: MySqlConnectOptions = std::env::var("DATABASE_URL").unwrap().parse().unwrap();
+    let limited = MySqlPool::connect_with(
+        options
+            .database(&f.db)
+            .username(&user)
+            .password("disposable_test_only"),
+    )
+    .await
+    .unwrap();
+    // Prove the real DDL failure, not a mock or an already-created index.
+    let denied = sqlx::raw_sql("ALTER TABLE br_index_optional ADD INDEX idx_scope_subject_active (user_id, subject_id, is_active, memory_type)")
+        .execute(&limited).await.unwrap_err();
+    assert!(denied.to_string().contains("privilege"), "{denied}");
+    let store = memoria_storage::SqlMemoryStore::new(limited.clone(), 3, "test".into());
+    let optional = store.ensure_branch_subject_id("br_index_optional").await;
+    let required = store.ensure_branch_subject_id("br_column_required").await;
+    let write = sqlx::query("INSERT INTO br_index_optional VALUES ('memory', 'user', 'subject', 1, 'semantic', 'usable branch')")
+        .execute(&limited).await;
+    let content: String =
+        sqlx::query_scalar("SELECT content FROM br_index_optional WHERE subject_id = 'subject'")
+            .fetch_one(&limited)
+            .await
+            .unwrap();
+    limited.close().await;
+    let mut drop_user = QueryBuilder::<MySql>::new("DROP USER ");
+    drop_user.push(&user);
+    sqlx::raw_sql(&drop_user.into_sql())
+        .execute(&f.admin)
+        .await
+        .unwrap();
+    let mut drop_role = QueryBuilder::<MySql>::new("DROP ROLE ");
+    drop_role.push(&role);
+    sqlx::raw_sql(&drop_role.into_sql())
+        .execute(&f.admin)
+        .await
+        .unwrap();
+    f.cleanup().await;
+    assert!(
+        optional.is_ok(),
+        "index failure must not reject a usable branch: {optional:?}"
+    );
+    assert!(required.is_err(), "missing subject_id must remain fatal");
+    assert!(write.is_ok());
+    assert_eq!(content, "usable branch");
 }
 
 impl Fixture {
@@ -150,6 +318,31 @@ async fn legacy_empty_snapshot_restores_to_empty_table() {
         .unwrap();
     assert!(f.rows().await.is_empty());
     f.assert_no_stage().await;
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn restore_without_unique_keys_preserves_duplicate_row_count() {
+    let f = Fixture::new().await;
+    sqlx::raw_sql("CREATE TABLE unkeyed (content VARCHAR(100) NOT NULL); INSERT INTO unkeyed VALUES ('historical'), ('historical')")
+        .execute(&f.pool).await.unwrap();
+    f.snapshot().await;
+    sqlx::raw_sql("DELETE FROM unkeyed; INSERT INTO unkeyed VALUES ('current')")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        f.git
+            .restore_table_from_snapshot("unkeyed", &f.snapshot)
+            .await
+            .unwrap();
+        let rows: Vec<String> = sqlx::query_scalar("SELECT content FROM unkeyed")
+            .fetch_all(&f.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, vec!["historical", "historical"]);
+        f.assert_no_stage().await;
+    }
     f.cleanup().await;
 }
 

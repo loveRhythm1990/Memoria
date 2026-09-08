@@ -33,7 +33,7 @@ fn git_err(e: impl std::fmt::Display) -> MemoriaError {
 }
 
 fn validate_identifier(name: &str) -> Result<&str, MemoriaError> {
-    if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if memoria_core::is_safe_sql_identifier(name) {
         Ok(name)
     } else {
         Err(MemoriaError::Internal(format!(
@@ -98,6 +98,23 @@ fn sanitize_name(name: &str) -> String {
         clean = format!("s_{clean}");
     }
     clean
+}
+
+fn sanitize_branch_table_suffix(name: &str) -> String {
+    // Keep the previous spelling for ASCII names; only physical branch suffixes
+    // change for Unicode names. The random prefix disambiguates equal suffixes.
+    let ascii: String = name
+        .chars()
+        .take(40)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    sanitize_name(&ascii)
 }
 
 fn sanitize_snapshot_scope(scope: &str) -> String {
@@ -1046,7 +1063,10 @@ pub async fn call(
                 return Ok(mcp_text(&format!("Branch '{branch_name}' already exists.")));
             }
 
-            let safe = sanitize_name(branch_name);
+            // Physical branch names are ASCII; the registry preserves the user's
+            // original display name. Do not change sanitize_name: snapshots use
+            // its historical Unicode mapping when resolving existing names.
+            let safe = sanitize_branch_table_suffix(branch_name);
             let table_name = format!("br_{}_{}", &Uuid::new_v4().simple().to_string()[..8], safe);
 
             if let Some(snap) = from_snapshot {
@@ -2516,6 +2536,21 @@ fn parse_apply_updates(args: &Value) -> Result<Vec<memoria_git::ApplyUpdatePair>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn branch_suffix_is_ascii_without_changing_unicode_snapshot_names() {
+        for name in ["实验", "café", "分支 / 测试", "🚀"] {
+            let suffix = super::sanitize_branch_table_suffix(name);
+            assert!(suffix.is_ascii());
+            assert!(memoria_core::is_safe_sql_identifier(&suffix));
+        }
+        assert_eq!(
+            super::sanitize_branch_table_suffix("my_branch-1"),
+            super::sanitize_name("my_branch-1")
+        );
+        assert_eq!(super::sanitize_name("实验"), "实验");
+        assert!(super::snap_internal("test", "实验").ends_with("_实验"));
+    }
+
     use super::{
         expect_tool_args, is_pick_conflict_error_message, is_pick_parser_error_message,
         map_pick_conflict, normalize_keys, parse_apply_string_array, parse_apply_updates,

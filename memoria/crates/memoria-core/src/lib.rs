@@ -7,6 +7,13 @@ pub use error::MemoriaError;
 pub use sensitivity::{check_sensitivity, SensitivityResult, SensitivityTier};
 pub use types::{Memory, MemoryType, TrustTier, FEEDBACK_SIGNALS};
 
+/// Identifier allowlist used for generated and legacy physical table names.
+/// Legacy names may contain Unicode letters/digits. New branch names are ASCII,
+/// but validation must not strand previously created Unicode tables.
+pub fn is_safe_sql_identifier(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
 /// Workaround: MO#24001 — PREPARE/EXECUTE stores `Option<String>::None` as empty
 /// string `''` instead of SQL NULL for VARCHAR columns.  Normalize at both write
 /// (bind) and read boundaries so the rest of the codebase can treat `None` and

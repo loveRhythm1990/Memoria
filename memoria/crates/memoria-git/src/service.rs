@@ -11,74 +11,6 @@ fn db_err(e: sqlx::Error) -> MemoriaError {
     MemoriaError::Database(e.to_string())
 }
 
-#[cfg(test)]
-mod restore_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn restore_future_is_send() {
-        fn assert_send<T: Send>(_: T) {}
-        let pool = sqlx::mysql::MySqlPoolOptions::new()
-            .connect_lazy("mysql://root:111@127.0.0.1:6001/test")
-            .unwrap();
-        let git = GitForDataService::new(pool, "test");
-        assert_send(replace_from_stage(
-            &git.pool,
-            "DELETE FROM target",
-            "INSERT INTO target SELECT * FROM stage",
-        ));
-        assert_send(git.restore_table_from_snapshot("memories", "snapshot"));
-    }
-
-    #[tokio::test]
-    #[ignore = "requires a disposable MatrixOne server via DATABASE_URL"]
-    async fn failed_insert_rolls_back_preceding_delete() {
-        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
-        let options: sqlx::mysql::MySqlConnectOptions = url.parse().unwrap();
-        let admin = MySqlPool::connect_with(options.clone().database("mo_catalog"))
-            .await
-            .unwrap();
-        let db = format!("restore_atomic_{}", uuid::Uuid::new_v4().simple());
-        let mut ddl = QueryBuilder::<MySql>::new("CREATE DATABASE ");
-        ddl.push(&db);
-        sqlx::raw_sql(&ddl.into_sql())
-            .execute(&admin)
-            .await
-            .unwrap();
-        let pool = MySqlPool::connect_with(options.database(&db))
-            .await
-            .unwrap();
-        sqlx::raw_sql("CREATE TABLE target (id INT PRIMARY KEY, content VARCHAR(100)); CREATE TABLE stage (id INT, content VARCHAR(100)); INSERT INTO target VALUES (1, 'current'); INSERT INTO stage VALUES (2, 'first'), (2, 'duplicate')").execute(&pool).await.unwrap();
-        let result = replace_from_stage(
-            &pool,
-            "DELETE FROM target",
-            "INSERT INTO target SELECT * FROM stage",
-        )
-        .await;
-        let rows: Vec<(i32, String)> = sqlx::query_as("SELECT id, content FROM target")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-        pool.close().await;
-        let mut drop = QueryBuilder::<MySql>::new("DROP DATABASE ");
-        drop.push(&db);
-        sqlx::raw_sql(&drop.into_sql())
-            .execute(&admin)
-            .await
-            .unwrap();
-        let error = result.expect_err("duplicate primary key must fail the INSERT");
-        assert!(
-            error.to_string().to_lowercase().contains("duplicate"),
-            "{error}"
-        );
-        assert_eq!(
-            rows,
-            vec![(1, "current".into())],
-            "DELETE must be rolled back with the failed INSERT"
-        );
-    }
-}
-
 // A staging table is private to one restore, never registered as a user branch.
 // Drop also schedules cleanup when the request future is cancelled.
 struct RestoreStage {
@@ -101,9 +33,18 @@ impl RestoreStage {
 
 impl Drop for RestoreStage {
     fn drop(&mut self) {
-        if let (Some(sql), Ok(runtime)) =
-            (self.drop_sql.take(), tokio::runtime::Handle::try_current())
-        {
+        if let Some(sql) = self.drop_sql.as_ref() {
+            let runtime = match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::warn!(%error, cleanup = %sql,
+                        "restore staging cleanup unavailable without a runtime; offline cleanup required");
+                    return;
+                }
+            };
+            // Best effort only: runtime shutdown may cancel this task. Never
+            // delete tables by prefix to compensate for an interrupted cleanup.
+            let sql = self.drop_sql.take().expect("checked above");
             let pool = self.pool.clone();
             runtime.spawn(async move {
                 if let Err(error) = exec_ddl(&pool, &sql).await {
@@ -112,6 +53,17 @@ impl Drop for RestoreStage {
             });
         }
     }
+}
+
+fn restore_statement_error(
+    original: sqlx::Error,
+    rollback: Result<(), sqlx::Error>,
+) -> MemoriaError {
+    if let Err(error) = rollback {
+        tracing::warn!(%error, original_error = %original,
+            "restore transaction rollback failed; preserving the original statement error");
+    }
+    db_err(original)
 }
 
 /// Both statements operate on live tables: MatrixOne forbids historical snapshot
@@ -123,12 +75,10 @@ async fn replace_from_stage(
 ) -> Result<(), MemoriaError> {
     let mut tx = pool.begin().await.map_err(db_err)?;
     if let Err(error) = sqlx::query(delete).execute(&mut *tx).await {
-        tx.rollback().await.map_err(db_err)?;
-        return Err(db_err(error));
+        return Err(restore_statement_error(error, tx.rollback().await));
     }
     if let Err(error) = sqlx::query(insert).execute(&mut *tx).await {
-        tx.rollback().await.map_err(db_err)?;
-        return Err(db_err(error));
+        return Err(restore_statement_error(error, tx.rollback().await));
     }
     // Do not retry individual statements or compensate after an ambiguous commit.
     // The database commits the entire replacement or retains the original rows.
@@ -146,6 +96,8 @@ async fn prepare_and_replace(
     let mut create = QueryBuilder::<MySql>::new("CREATE TABLE ");
     create.push(&stage_table).push(" LIKE ").push(&target_table);
     exec_ddl(&pool, &create.into_sql()).await?;
+    // Retain copied indexes until stripping them is validated against historical
+    // clones with secondary indexes on every supported MatrixOne build.
     let mut prepare = QueryBuilder::<MySql>::new("INSERT INTO ");
     prepare
         .push(&stage_table)
@@ -159,7 +111,12 @@ async fn prepare_and_replace(
         .push(snapshot)
         .push("'}");
     // All source reads and constraint validation finish before live-row deletion.
-    exec_ddl(&pool, &prepare.into_sql()).await?;
+    // This INSERT is not idempotent (some restored tables have no unique key).
+    // Do not route it through the DDL retry helper, even for MO retry errors.
+    sqlx::raw_sql(&prepare.into_sql())
+        .execute(&pool)
+        .await
+        .map_err(db_err)?;
     let mut delete = QueryBuilder::<MySql>::new("DELETE FROM ");
     delete.push(&target_table);
     let mut insert = QueryBuilder::<MySql>::new("INSERT INTO ");
@@ -237,7 +194,7 @@ async fn exec_ddl(pool: &MySqlPool, sql: &str) -> Result<(), MemoriaError> {
 
 /// Validate identifier — alphanumeric + underscore only, prevents SQL injection in DDL.
 fn validate_identifier(name: &str) -> Result<&str, MemoriaError> {
-    if name.chars().all(|c| c.is_alphanumeric() || c == '_') && !name.is_empty() {
+    if memoria_core::is_safe_sql_identifier(name) {
         Ok(name)
     } else {
         Err(MemoriaError::Internal(format!(
@@ -248,6 +205,12 @@ fn validate_identifier(name: &str) -> Result<&str, MemoriaError> {
 
 fn quote_identifier(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
+}
+
+fn qualified_identifier(schema: &str, table: &str) -> String {
+    let mut sql = QueryBuilder::<MySql>::new(quote_identifier(schema));
+    sql.push(".").push(quote_identifier(table));
+    sql.into_sql()
 }
 
 fn quote_sql_literal(value: &str) -> String {
@@ -800,6 +763,11 @@ impl GitForDataService {
     /// Restore historical data into the current schema. Prepare and validate all
     /// rows in a private table first, then atomically replace live rows. New
     /// columns receive the current schema's defaults (subject_id defaults to NULL).
+    ///
+    /// Callers must serialize snapshot operations and quiesce concurrent writes.
+    /// MO#23860 (write conflicts) / MO#23861 (FULLTEXT secondary-table loss)
+    /// motivated this restriction; atomic row replacement does not remove it.
+    /// Never retry individual statements in the replacement transaction.
     pub async fn restore_table_from_snapshot(
         &self,
         table: &str,
@@ -808,20 +776,13 @@ impl GitForDataService {
         let safe_table = validate_identifier(table)?;
         let safe_snap = validate_identifier(snapshot_name)?;
         let db = quote_identifier(&self.db_name);
-        let qualified_table = format!("{db}.{safe_table}");
+        let qualified_table = qualified_identifier(&self.db_name, safe_table);
 
         // Verify snapshot exists
         self.get_snapshot(snapshot_name)
             .await?
             .ok_or_else(|| MemoriaError::NotFound(format!("Snapshot {snapshot_name}")))?;
 
-        let mut current_query = QueryBuilder::<MySql>::new("SELECT * FROM ");
-        current_query.push(&qualified_table).push(" LIMIT 0");
-        let current = self
-            .pool
-            .describe(&current_query.into_sql())
-            .await
-            .map_err(db_err)?;
         let mut historical_query = QueryBuilder::<MySql>::new("SELECT * FROM ");
         historical_query
             .push(&qualified_table)
@@ -835,39 +796,36 @@ impl GitForDataService {
             .map_err(db_err)?;
         // Reject missing required fields explicitly: permissive MySQL SQL modes
         // can otherwise invent implicit zero/empty values for NOT NULL columns.
-        let requirements: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
-            "SELECT COLUMN_NAME, IS_NULLABLE, COLUMN_DEFAULT, EXTRA \
-             FROM information_schema.columns WHERE table_schema = ? AND table_name = ?",
+        let requirements = memoria_storage::table_schema::read_table_columns(
+            &self.pool,
+            &self.db_name,
+            safe_table,
         )
-        .bind(&self.db_name)
-        .bind(safe_table)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
-        for (name, nullable, default, extra) in requirements {
-            if !historical
-                .columns()
-                .iter()
-                .any(|old| old.name().eq_ignore_ascii_case(&name))
-                && nullable == "NO"
-                && default.is_none()
-                && !extra.to_lowercase().contains("auto_increment")
-            {
+        .await?;
+        let historical_names: Vec<String> = historical
+            .columns()
+            .iter()
+            .map(|c| c.name().to_owned())
+            .collect();
+        for column in
+            memoria_storage::table_schema::missing_columns(&requirements, &historical_names)
+        {
+            if column.needs_snapshot_value() {
                 return Err(MemoriaError::Validation(format!(
-                    "Snapshot is missing required column '{name}' without a default"
+                    "Snapshot is missing required column '{}' without a default",
+                    column.name
                 )));
             }
         }
-        let columns: Vec<_> = current
-            .columns()
+        let columns: Vec<_> = requirements
             .iter()
             .filter(|column| {
                 historical
                     .columns()
                     .iter()
-                    .any(|old| old.name().eq_ignore_ascii_case(column.name()))
+                    .any(|old| old.name().eq_ignore_ascii_case(&column.name))
             })
-            .map(|column| quote_identifier(column.name()))
+            .map(|column| quote_identifier(&column.name))
             .collect();
         if columns.is_empty() {
             return Err(MemoriaError::Validation(
@@ -875,10 +833,9 @@ impl GitForDataService {
             ));
         }
         let column_list = columns.join(", ");
-        let all_columns = current
-            .columns()
+        let all_columns = requirements
             .iter()
-            .map(|c| quote_identifier(c.name()))
+            .map(|column| quote_identifier(&column.name))
             .collect::<Vec<_>>()
             .join(", ");
         let stage_name = format!("mem_restore_{}", uuid::Uuid::new_v4().simple());
@@ -910,8 +867,8 @@ impl GitForDataService {
         branch_name: &str,
         source_table: &str,
     ) -> Result<(), MemoriaError> {
-        let safe_branch = validate_identifier(branch_name)?;
-        let safe_source = validate_identifier(source_table)?;
+        let safe_branch = quote_identifier(validate_identifier(branch_name)?);
+        let safe_source = quote_identifier(validate_identifier(source_table)?);
         let db = quote_identifier(&self.db_name);
         exec_ddl(
             &self.pool,
@@ -928,8 +885,8 @@ impl GitForDataService {
         source_table: &str,
         snapshot_name: &str,
     ) -> Result<(), MemoriaError> {
-        let safe_branch = validate_identifier(branch_name)?;
-        let safe_source = validate_identifier(source_table)?;
+        let safe_branch = quote_identifier(validate_identifier(branch_name)?);
+        let safe_source = quote_identifier(validate_identifier(source_table)?);
         let safe_snap = validate_identifier(snapshot_name)?;
         let db = quote_identifier(&self.db_name);
         exec_ddl(
@@ -942,7 +899,7 @@ impl GitForDataService {
     }
 
     pub async fn drop_branch(&self, branch_name: &str) -> Result<(), MemoriaError> {
-        let safe = validate_identifier(branch_name)?;
+        let safe = quote_identifier(validate_identifier(branch_name)?);
         let db = quote_identifier(&self.db_name);
         exec_ddl(&self.pool, &format!("data branch delete table {db}.{safe}")).await
     }
@@ -955,8 +912,8 @@ impl GitForDataService {
         branch_table: &str,
         main_table: &str,
     ) -> Result<(), MemoriaError> {
-        let safe_branch = validate_identifier(branch_table)?;
-        let safe_main = validate_identifier(main_table)?;
+        let safe_branch = quote_identifier(validate_identifier(branch_table)?);
+        let safe_main = quote_identifier(validate_identifier(main_table)?);
         let db = quote_identifier(&self.db_name);
         exec_ddl(
             &self.pool,
@@ -979,8 +936,8 @@ impl GitForDataService {
                 "key_list selector requires at least one key".into(),
             ));
         }
-        let safe_source = validate_identifier(source_table)?;
-        let safe_target = validate_identifier(target_table)?;
+        let safe_source = quote_identifier(validate_identifier(source_table)?);
+        let safe_target = quote_identifier(validate_identifier(target_table)?);
         let conflict = pick_conflict_clause(strategy)?;
         let db = quote_identifier(&self.db_name);
         let key_list = keys
@@ -1005,8 +962,8 @@ impl GitForDataService {
         to_snapshot: &str,
         strategy: &str,
     ) -> Result<(), MemoriaError> {
-        let safe_source = validate_identifier(source_table)?;
-        let safe_target = validate_identifier(target_table)?;
+        let safe_source = quote_identifier(validate_identifier(source_table)?);
+        let safe_target = quote_identifier(validate_identifier(target_table)?);
         let safe_from = validate_identifier(from_snapshot)?;
         let safe_to = validate_identifier(to_snapshot)?;
         let conflict = pick_conflict_clause(strategy)?;
@@ -1067,8 +1024,8 @@ impl GitForDataService {
         limit: i64,
     ) -> Result<Vec<DiffRow>, MemoriaError> {
         let limit = limit.clamp(1, 5_000);
-        let safe_branch = validate_identifier(branch_table)?;
-        let safe_main = validate_identifier(main_table)?;
+        let safe_branch = quote_identifier(validate_identifier(branch_table)?);
+        let safe_main = quote_identifier(validate_identifier(main_table)?);
         let db = quote_identifier(&self.db_name);
         // Fetch more rows than requested to account for user_id filtering in Rust.
         let fetch_limit = limit * 10 + 100;
@@ -1188,9 +1145,8 @@ impl GitForDataService {
     ) -> Result<ApplyResult, MemoriaError> {
         let branch_table = validate_identifier(branch_table)?.to_string();
         let main_table = validate_identifier(main_table)?.to_string();
-        let db = quote_identifier(&self.db_name);
-        let branch_table_ref = format!("{db}.{branch_table}");
-        let main_table_ref = format!("{db}.{main_table}");
+        let branch_table_ref = qualified_identifier(&self.db_name, &branch_table);
+        let main_table_ref = qualified_identifier(&self.db_name, &main_table);
 
         let add_ids: Vec<String> = selection
             .adds
@@ -1647,8 +1603,7 @@ impl GitForDataService {
             return Ok(());
         }
         let main_table = validate_identifier(main_table)?;
-        let db = quote_identifier(&self.db_name);
-        let main_table_ref = format!("{db}.{main_table}");
+        let main_table_ref = qualified_identifier(&self.db_name, main_table);
         let remove_ids: Vec<String> = classified
             .removed
             .iter()
@@ -1696,7 +1651,7 @@ impl GitForDataService {
         snapshot_name: &str,
         user_id: &str,
     ) -> Result<i64, MemoriaError> {
-        let safe_table = validate_identifier(table)?;
+        let safe_table = quote_identifier(validate_identifier(table)?);
         let safe_snap = validate_identifier(snapshot_name)?;
         let row = sqlx::query(&format!(
             "SELECT COUNT(*) AS cnt FROM {safe_table} {{SNAPSHOT = '{safe_snap}'}} WHERE user_id = ?"
@@ -1706,5 +1661,98 @@ impl GitForDataService {
         .await
         .map_err(db_err)?;
         row.try_get::<i64, _>("cnt").map_err(db_err)
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::*;
+
+    #[test]
+    fn restore_future_is_send() {
+        fn assert_send<T: Send>(_: T) {}
+        // Compile-check the futures required by Axum without constructing a pool,
+        // starting a runtime, polling a future, or depending on a database URL.
+        let _check = |git: &GitForDataService| {
+            assert_send(replace_from_stage(
+                &git.pool,
+                "DELETE FROM target",
+                "INSERT INTO target SELECT * FROM stage",
+            ));
+            assert_send(git.restore_table_from_snapshot("memories", "snapshot"));
+        };
+    }
+
+    #[test]
+    fn rollback_failure_preserves_original_statement_error() {
+        for rollback in [Ok(()), Err(sqlx::Error::PoolClosed)] {
+            let error = restore_statement_error(
+                sqlx::Error::Protocol("duplicate key: original failure".into()),
+                rollback,
+            );
+            assert!(error
+                .to_string()
+                .contains("duplicate key: original failure"));
+        }
+    }
+
+    #[test]
+    fn dropping_stage_without_runtime_does_not_panic() {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_lifetime(None)
+            .idle_timeout(None)
+            .connect_lazy_with(sqlx::mysql::MySqlConnectOptions::new());
+        drop(RestoreStage {
+            pool,
+            drop_sql: Some("DROP TABLE IF EXISTS mem_restore_test".into()),
+        });
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable MatrixOne server via DATABASE_URL"]
+    async fn failed_insert_rolls_back_preceding_delete() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
+        let options: sqlx::mysql::MySqlConnectOptions = url.parse().unwrap();
+        let admin = MySqlPool::connect_with(options.clone().database("mo_catalog"))
+            .await
+            .unwrap();
+        let db = format!("restore_atomic_{}", uuid::Uuid::new_v4().simple());
+        let mut ddl = QueryBuilder::<MySql>::new("CREATE DATABASE ");
+        ddl.push(&db);
+        sqlx::raw_sql(&ddl.into_sql())
+            .execute(&admin)
+            .await
+            .unwrap();
+        let pool = MySqlPool::connect_with(options.database(&db))
+            .await
+            .unwrap();
+        sqlx::raw_sql("CREATE TABLE target (id INT PRIMARY KEY, content VARCHAR(100)); CREATE TABLE stage (id INT, content VARCHAR(100)); INSERT INTO target VALUES (1, 'current'); INSERT INTO stage VALUES (2, 'first'), (2, 'duplicate')").execute(&pool).await.unwrap();
+        let result = replace_from_stage(
+            &pool,
+            "DELETE FROM target",
+            "INSERT INTO target SELECT * FROM stage",
+        )
+        .await;
+        let rows: Vec<(i32, String)> = sqlx::query_as("SELECT id, content FROM target")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let mut drop = QueryBuilder::<MySql>::new("DROP DATABASE ");
+        drop.push(&db);
+        sqlx::raw_sql(&drop.into_sql())
+            .execute(&admin)
+            .await
+            .unwrap();
+        let error = result.expect_err("duplicate primary key must fail the INSERT");
+        assert!(
+            error.to_string().to_lowercase().contains("duplicate"),
+            "{error}"
+        );
+        assert_eq!(
+            rows,
+            vec![(1, "current".into())],
+            "DELETE must be rolled back with the failed INSERT"
+        );
     }
 }
