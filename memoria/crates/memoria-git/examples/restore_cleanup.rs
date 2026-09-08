@@ -1,5 +1,7 @@
 //! Offline recovery tool. Read-only by default; never run deletion alongside
 //! Memoria servers, workers, or MCP processes. See legacy-snapshot-compatibility.md.
+//! The br_ path uses native branch deletion. A matching name alone does not make
+//! an ordinary table a native branch; rejection must not trigger a DROP fallback.
 use sqlx::{MySql, MySqlPool, QueryBuilder};
 
 fn candidate(name: &str) -> bool {
@@ -162,9 +164,14 @@ mod tests {
         let pool = MySqlPool::connect_with(options.database(&db))
             .await
             .unwrap();
-        sqlx::raw_sql("CREATE TABLE mem_branches (table_name VARCHAR(100), status VARCHAR(20)); CREATE TABLE br_12345678_registered (id INT); CREATE TABLE br_12345678_orphan (id INT); CREATE TABLE mem_restore_0123456789abcdef0123456789abcdef (id INT); INSERT INTO mem_branches VALUES ('br_12345678_registered', 'inactive')")
+        // Orphan here means missing from Memoria's registry, not missing from
+        // MatrixOne's native branch lineage. Use genuine branches so this test
+        // exercises the same deletion contract as abandoned branch creation.
+        sqlx::raw_sql("CREATE TABLE mem_branches (table_name VARCHAR(100), status VARCHAR(20)); CREATE TABLE cleanup_source (id INT PRIMARY KEY); INSERT INTO cleanup_source VALUES (7); DATA BRANCH CREATE TABLE br_12345678_registered FROM cleanup_source; DATA BRANCH CREATE TABLE br_12345678_orphan FROM cleanup_source; CREATE TABLE mem_restore_0123456789abcdef0123456789abcdef (id INT); INSERT INTO mem_branches VALUES ('br_12345678_registered', 'inactive')")
             .execute(&pool).await.unwrap();
-        sqlx::raw_sql("CREATE TABLE `br_12345678_已有` (id INT); CREATE TABLE `br_12345678_孤儿` (id INT); INSERT INTO mem_branches VALUES ('br_12345678_已有', 'active')")
+        // ASCII clone + quoted rename also works on older MO versions whose
+        // native clone parser does not accept a Unicode destination directly.
+        sqlx::raw_sql("DATA BRANCH CREATE TABLE br_12345678_unicode_registered FROM cleanup_source; ALTER TABLE br_12345678_unicode_registered RENAME TO `br_12345678_已有`; DATA BRANCH CREATE TABLE br_12345678_unicode_orphan FROM cleanup_source; ALTER TABLE br_12345678_unicode_orphan RENAME TO `br_12345678_孤儿`; INSERT INTO mem_branches VALUES ('br_12345678_已有', 'active')")
             .execute(&pool).await.unwrap();
         let protected = delete_unregistered(&pool, "br_12345678_registered").await;
         let unicode_protected = delete_unregistered(&pool, "br_12345678_已有").await;
@@ -180,6 +187,10 @@ mod tests {
         let closed = delete_unregistered(&pool, "br_12345678_unverified").await;
         let tables: Vec<String> = sqlx::query_scalar("SELECT table_name FROM information_schema.tables WHERE table_schema = ? ORDER BY table_name")
             .bind(&db).fetch_all(&pool).await.unwrap();
+        let source_rows: Vec<i32> = sqlx::query_scalar("SELECT id FROM cleanup_source ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
         pool.close().await;
         let mut drop = QueryBuilder::<MySql>::new("DROP DATABASE ");
         drop.push(&db);
@@ -194,8 +205,14 @@ mod tests {
         assert!(orphan.is_ok(), "{orphan:?}");
         assert!(stage.is_ok(), "{stage:?}");
         assert!(closed.is_err());
-        assert_eq!(tables.len(), 3);
+        assert_eq!(
+            source_rows,
+            vec![7],
+            "cleanup must preserve the source table"
+        );
+        assert_eq!(tables.len(), 4);
         for name in [
+            "cleanup_source",
             "br_12345678_registered",
             "br_12345678_unverified",
             "br_12345678_已有",

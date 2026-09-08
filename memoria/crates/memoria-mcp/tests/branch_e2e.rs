@@ -364,9 +364,11 @@ async fn test_existing_unicode_physical_branch_migrates_and_remains_usable() {
     let (svc, git, uid, ctx) = setup().await;
     let store = ctx.user_store(&uid).await;
     let pool = ctx.user_db_pool(&uid).await;
-    // Model an already-existing quoted physical table. New branches must never
-    // ask MO's native clone operation to generate a Unicode destination name.
-    sqlx::raw_sql("CREATE TABLE `br_1234abcd_实验` LIKE mem_memories; ALTER TABLE `br_1234abcd_实验` DROP INDEX idx_scope_subject_active; ALTER TABLE `br_1234abcd_实验` DROP COLUMN subject_id")
+    // Model a real native branch with a legacy Unicode physical name. A plain
+    // CREATE TABLE LIKE has no branch lineage and newer MO correctly rejects
+    // DATA BRANCH DELETE on it. Clone to ASCII first, then rename: older MO's
+    // native clone parser cannot create a Unicode destination directly.
+    sqlx::raw_sql("DATA BRANCH CREATE TABLE br_1234abcd_legacy FROM mem_memories; ALTER TABLE br_1234abcd_legacy RENAME TO `br_1234abcd_实验`; ALTER TABLE `br_1234abcd_实验` DROP INDEX idx_scope_subject_active; ALTER TABLE `br_1234abcd_实验` DROP COLUMN subject_id")
         .execute(&pool).await.unwrap();
     // Validate the historical-clone path, then the startup path for an already
     // registered old table. Neither may reject Unicode physical identifiers.
@@ -410,6 +412,13 @@ async fn test_existing_unicode_physical_branch_migrates_and_remains_usable() {
     )
     .await;
     assert!(store.list_branches(&uid).await.unwrap().is_empty());
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'br_1234abcd_实验'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(remaining, 0, "native branch deletion must remove the table");
 }
 
 #[tokio::test]
