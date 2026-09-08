@@ -7,6 +7,7 @@ use sqlx::MySqlPool;
 #[derive(Debug)]
 pub struct TableColumn {
     pub name: String,
+    pub column_type: String,
     pub nullable: bool,
     pub default: Option<String>,
     pub extra: String,
@@ -27,8 +28,8 @@ pub async fn read_table_columns(
     schema: &str,
     table: &str,
 ) -> Result<Vec<TableColumn>, MemoriaError> {
-    let rows: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
-        "SELECT COLUMN_NAME, IS_NULLABLE, COLUMN_DEFAULT, EXTRA \
+    let rows: Vec<(String, String, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA \
          FROM information_schema.columns WHERE table_schema = ? AND table_name = ? \
          ORDER BY ORDINAL_POSITION",
     )
@@ -44,12 +45,15 @@ pub async fn read_table_columns(
     }
     Ok(rows
         .into_iter()
-        .map(|(name, nullable, default, extra)| TableColumn {
-            name,
-            nullable: nullable == "YES",
-            default,
-            extra,
-        })
+        .map(
+            |(name, column_type, nullable, default, extra)| TableColumn {
+                name,
+                column_type,
+                nullable: nullable == "YES",
+                default,
+                extra,
+            },
+        )
         .collect())
 }
 
@@ -67,33 +71,111 @@ pub fn missing_columns<'a>(
         .collect()
 }
 
+/// Native DATA BRANCH operations on older MatrixOne builds can silently pair
+/// fields by ordinal. Be conservative across supported versions, even if a
+/// newer build accepts a particular order difference. Explicit row restoration
+/// has a separate compatibility rule and must not use this check.
+pub fn validate_native_branch_schema(
+    current: &[TableColumn],
+    branch: &[TableColumn],
+) -> Result<(), MemoriaError> {
+    // MO CREATE TABLE LIKE reports an implicit nullable default as SQL text
+    // "null", while the source metadata can use SQL NULL. They are equivalent;
+    // a quoted string default ('null') must remain distinct.
+    fn normalized_default(column: &TableColumn) -> Option<&str> {
+        column
+            .default
+            .as_deref()
+            .filter(|value| !value.trim().eq_ignore_ascii_case("null"))
+    }
+    if current.len() != branch.len()
+        || current.iter().zip(branch).any(|(a, b)| {
+            !a.name.eq_ignore_ascii_case(&b.name)
+                || !a.column_type.eq_ignore_ascii_case(&b.column_type)
+                || a.nullable != b.nullable
+                || normalized_default(a) != normalized_default(b)
+                || !a.extra.eq_ignore_ascii_case(&b.extra)
+        })
+    {
+        return Err(MemoriaError::Database(
+            "Branch schema is incompatible with the current table (column order, type, or constraints differ); native branch operations are disabled. Preserve the branch data and recreate a compatible branch before retrying".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn column(name: &str, ty: &str) -> TableColumn {
+        TableColumn {
+            name: name.into(),
+            column_type: ty.into(),
+            nullable: true,
+            default: None,
+            extra: String::new(),
+        }
+    }
+
+    #[test]
+    fn native_schema_requires_matching_order_types_and_constraints() {
+        let current = vec![column("id", "INT"), column("embedding", "VECF32(3)")];
+        assert!(validate_native_branch_schema(
+            &current,
+            &[column("ID", "int"), column("embedding", "vecf32(3)")]
+        )
+        .is_ok());
+        for branch in [
+            vec![column("id", "INT")],
+            vec![column("embedding", "VECF32(3)"), column("id", "INT")],
+            vec![
+                column("id", "VARCHAR(32)"),
+                column("embedding", "VECF32(3)"),
+            ],
+            vec![column("id", "INT"), column("embedding", "VECF32(4)")],
+        ] {
+            assert!(validate_native_branch_schema(&current, &branch).is_err());
+        }
+        let mut branch = vec![column("id", "INT"), column("embedding", "VECF32(3)")];
+        branch[0].nullable = false;
+        assert!(validate_native_branch_schema(&current, &branch).is_err());
+        branch[0].nullable = true;
+        branch[0].default = Some("0".into());
+        assert!(validate_native_branch_schema(&current, &branch).is_err());
+        branch[0].default = Some("null".into());
+        assert!(validate_native_branch_schema(&current, &branch).is_ok());
+        branch[0].default = Some("'null'".into());
+        assert!(validate_native_branch_schema(&current, &branch).is_err());
+    }
 
     #[test]
     fn row_defaults_do_not_make_missing_table_columns_safe() {
         let expected = vec![
             TableColumn {
                 name: "source_event_ids".into(),
+                column_type: "TEXT".into(),
                 nullable: false,
                 default: None,
                 extra: String::new(),
             },
             TableColumn {
                 name: "embedding".into(),
+                column_type: "VECF32(3)".into(),
                 nullable: true,
                 default: None,
                 extra: String::new(),
             },
             TableColumn {
                 name: "is_active".into(),
+                column_type: "TINYINT".into(),
                 nullable: false,
                 default: Some("1".into()),
                 extra: String::new(),
             },
             TableColumn {
                 name: "id".into(),
+                column_type: "INT".into(),
                 nullable: false,
                 default: None,
                 extra: "auto_increment".into(),

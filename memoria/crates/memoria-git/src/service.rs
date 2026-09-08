@@ -667,7 +667,7 @@ impl GitForDataService {
     // ── Snapshots ─────────────────────────────────────────────────────────────
 
     pub async fn create_snapshot(&self, name: &str) -> Result<Snapshot, MemoriaError> {
-        let safe = validate_identifier(name)?;
+        let safe = quote_identifier(validate_identifier(name)?);
         exec_ddl(
             &self.pool,
             &format!(
@@ -757,7 +757,11 @@ impl GitForDataService {
 
     pub async fn drop_snapshot(&self, name: &str) -> Result<(), MemoriaError> {
         let safe = validate_identifier(name)?;
-        exec_ddl(&self.pool, &format!("DROP SNAPSHOT {safe}")).await
+        exec_ddl(
+            &self.pool,
+            &format!("DROP SNAPSHOT {}", quote_identifier(safe)),
+        )
+        .await
     }
 
     /// Restore historical data into the current schema. Prepare and validate all
@@ -914,6 +918,8 @@ impl GitForDataService {
     ) -> Result<(), MemoriaError> {
         let safe_branch = quote_identifier(validate_identifier(branch_table)?);
         let safe_main = quote_identifier(validate_identifier(main_table)?);
+        self.check_native_branch_schema(branch_table, main_table)
+            .await?;
         let db = quote_identifier(&self.db_name);
         exec_ddl(
             &self.pool,
@@ -939,6 +945,8 @@ impl GitForDataService {
         let safe_source = quote_identifier(validate_identifier(source_table)?);
         let safe_target = quote_identifier(validate_identifier(target_table)?);
         let conflict = pick_conflict_clause(strategy)?;
+        self.check_native_branch_schema(source_table, target_table)
+            .await?;
         let db = quote_identifier(&self.db_name);
         let key_list = keys
             .iter()
@@ -967,6 +975,8 @@ impl GitForDataService {
         let safe_from = validate_identifier(from_snapshot)?;
         let safe_to = validate_identifier(to_snapshot)?;
         let conflict = pick_conflict_clause(strategy)?;
+        self.check_native_branch_schema(source_table, target_table)
+            .await?;
         let db = quote_identifier(&self.db_name);
         exec_ddl(
             &self.pool,
@@ -998,6 +1008,28 @@ impl GitForDataService {
         Ok(total as i64)
     }
 
+    async fn check_native_branch_schema(
+        &self,
+        branch_table: &str,
+        main_table: &str,
+    ) -> Result<(), MemoriaError> {
+        // Check on every native operation, including previously registered
+        // branches whose startup migration only logged an incompatibility.
+        let branch = memoria_storage::table_schema::read_table_columns(
+            &self.pool,
+            &self.db_name,
+            branch_table,
+        )
+        .await?;
+        let current = memoria_storage::table_schema::read_table_columns(
+            &self.pool,
+            &self.db_name,
+            main_table,
+        )
+        .await?;
+        memoria_storage::table_schema::validate_native_branch_schema(&current, &branch)
+    }
+
     /// Native LCA-based diff rows, filtered by user_id.
     ///
     /// `data branch diff` is account-level (no WHERE clause supported), so we fetch
@@ -1026,6 +1058,8 @@ impl GitForDataService {
         let limit = limit.clamp(1, 5_000);
         let safe_branch = quote_identifier(validate_identifier(branch_table)?);
         let safe_main = quote_identifier(validate_identifier(main_table)?);
+        self.check_native_branch_schema(branch_table, main_table)
+            .await?;
         let db = quote_identifier(&self.db_name);
         // Fetch more rows than requested to account for user_id filtering in Rust.
         let fetch_limit = limit * 10 + 100;
@@ -1274,10 +1308,10 @@ impl GitForDataService {
                     "INSERT INTO {main_table_ref} \
                      (memory_id, user_id, memory_type, content, embedding, session_id, \
                       source_event_ids, extra_metadata, is_active, superseded_by, \
-                      trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id) \
+                      trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id, subject_id) \
                      SELECT memory_id, user_id, memory_type, content, embedding, session_id, \
                             source_event_ids, extra_metadata, is_active, superseded_by, \
-                            trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id \
+                            trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id, subject_id \
                      FROM {branch_table_ref} WHERE user_id = ? AND is_active = 1 AND memory_id IN ({ph})"
                 );
                 let mut q = sqlx::query(&insert_sql).bind(user_id);
@@ -1309,10 +1343,10 @@ impl GitForDataService {
                     "INSERT INTO {main_table_ref} \
                      (memory_id, user_id, memory_type, content, embedding, session_id, \
                       source_event_ids, extra_metadata, is_active, superseded_by, \
-                      trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id) \
+                      trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id, subject_id) \
                      SELECT memory_id, user_id, memory_type, content, embedding, session_id, \
                             source_event_ids, extra_metadata, is_active, superseded_by, \
-                            trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id \
+                            trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id, subject_id \
                      FROM {branch_table_ref} WHERE user_id = ? AND is_active = 1 AND memory_id IN ({ph})"
                 );
                 let mut q = sqlx::query(&insert_sql).bind(user_id);
@@ -1371,10 +1405,10 @@ impl GitForDataService {
                         "INSERT INTO {main_table_ref} \
                          (memory_id, user_id, memory_type, content, embedding, session_id, \
                           source_event_ids, extra_metadata, is_active, superseded_by, \
-                          trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id) \
+                          trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id, subject_id) \
                          SELECT memory_id, user_id, memory_type, content, embedding, session_id, \
                                 source_event_ids, extra_metadata, is_active, superseded_by, \
-                                trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id \
+                                trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id, subject_id \
                          FROM {branch_table_ref} WHERE memory_id = ? AND user_id = ?"
                     ))
                     .bind(&pair.old_id)
@@ -1387,10 +1421,10 @@ impl GitForDataService {
                         "INSERT INTO {main_table_ref} \
                          (memory_id, user_id, memory_type, content, embedding, session_id, \
                           source_event_ids, extra_metadata, is_active, superseded_by, \
-                          trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id) \
+                          trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id, subject_id) \
                          SELECT memory_id, user_id, memory_type, content, embedding, session_id, \
                                 source_event_ids, extra_metadata, is_active, superseded_by, \
-                                trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id \
+                                trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id, subject_id \
                          FROM {branch_table_ref} WHERE memory_id = ? AND user_id = ? AND is_active = 1"
                     ))
                     .bind(&pair.new_id)
@@ -1471,10 +1505,10 @@ impl GitForDataService {
                     "INSERT INTO {main_table_ref} \
                      (memory_id, user_id, memory_type, content, embedding, session_id, \
                       source_event_ids, extra_metadata, is_active, superseded_by, \
-                      trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id) \
+                      trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id, subject_id) \
                      SELECT memory_id, user_id, memory_type, content, embedding, session_id, \
                             source_event_ids, extra_metadata, is_active, superseded_by, \
-                            trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id \
+                            trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id, subject_id \
                      FROM {branch_table_ref} WHERE user_id = ? AND is_active = 0 AND memory_id IN ({ph})"
                 );
                 let mut q = sqlx::query(&ins_sql).bind(user_id);
@@ -1562,10 +1596,10 @@ impl GitForDataService {
                     "INSERT INTO {main_table_ref} \
                      (memory_id, user_id, memory_type, content, embedding, session_id, \
                       source_event_ids, extra_metadata, is_active, superseded_by, \
-                      trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id) \
+                      trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id, subject_id) \
                      SELECT memory_id, user_id, memory_type, content, embedding, session_id, \
                             source_event_ids, extra_metadata, is_active, superseded_by, \
-                            trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id \
+                            trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id, subject_id \
                      FROM {branch_table_ref} WHERE user_id = ? AND memory_id IN ({branch_ph})"
                 );
                 let mut q = sqlx::query(&ins_sql).bind(user_id);

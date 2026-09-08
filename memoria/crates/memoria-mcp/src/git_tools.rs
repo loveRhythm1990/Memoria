@@ -1223,10 +1223,10 @@ pub async fn call(
                 "INSERT INTO {main_table} \
                     (memory_id, user_id, memory_type, content, embedding, session_id, \
                      source_event_ids, extra_metadata, is_active, superseded_by, \
-                     trust_tier, initial_confidence, observed_at, created_at, updated_at) \
+                     trust_tier, initial_confidence, observed_at, created_at, updated_at, author_id, subject_id) \
                   SELECT b.memory_id, b.user_id, b.memory_type, b.content, b.embedding, b.session_id, \
                       b.source_event_ids, b.extra_metadata, b.is_active, b.superseded_by, \
-                      b.trust_tier, b.initial_confidence, b.observed_at, b.created_at, b.updated_at \
+                      b.trust_tier, b.initial_confidence, b.observed_at, b.created_at, b.updated_at, b.author_id, b.subject_id \
                   FROM {branch_table} b \
                   WHERE b.user_id = ? AND b.is_active = 1 \
                     AND NOT EXISTS (SELECT 1 FROM {main_table} m WHERE m.memory_id = b.memory_id) \
@@ -1237,6 +1237,7 @@ pub async fn call(
                         WHERE m.user_id = ? AND m.is_active = 1 \
                           AND m.embedding IS NOT NULL AND vector_dims(m.embedding) > 0 \
                           AND m.memory_type = b.memory_type \
+                          AND m.subject_id <=> b.subject_id \
                           AND l2_distance(m.embedding, b.embedding) < {L2_CONFLICT} \
                       ) \
                    )"
@@ -1776,6 +1777,7 @@ async fn collect_replace_candidates(
            ON b.user_id = ? AND b.is_active = 1 \
            AND b.content IS NOT NULL \
            AND b.memory_type = m.memory_type \
+           AND b.subject_id <=> m.subject_id \
            AND b.embedding IS NOT NULL AND vector_dims(b.embedding) > 0 \
          WHERE m.user_id = ? AND m.is_active = 1 \
            AND m.embedding IS NOT NULL AND vector_dims(m.embedding) > 0 \

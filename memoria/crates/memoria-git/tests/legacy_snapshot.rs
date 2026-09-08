@@ -7,6 +7,75 @@ use sqlx::{
 };
 
 #[tokio::test]
+async fn native_operations_reject_incompatible_existing_branch_without_mutation() {
+    let f = Fixture::new().await;
+    sqlx::raw_sql("INSERT INTO memories VALUES (1, 'main')")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    f.git
+        .create_branch("br_schema_order", "memories")
+        .await
+        .unwrap();
+    // Simulate a previously registered branch whose startup migration could not
+    // reconcile its schema. Native operations must check it independently.
+    sqlx::raw_sql("ALTER TABLE memories ADD COLUMN subject_id VARCHAR(128) DEFAULT NULL AFTER id")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql("ALTER TABLE br_schema_order ADD COLUMN subject_id VARCHAR(128) DEFAULT NULL")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    for result in [
+        f.git
+            .merge_branch("br_schema_order", "memories")
+            .await
+            .map(|_| ()),
+        f.git
+            .diff_branch_rows("br_schema_order", "memories", "user", 10)
+            .await
+            .map(|_| ()),
+    ] {
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Branch schema is incompatible"));
+    }
+    assert_eq!(f.rows().await, vec![(1, "main".into(), None)]);
+    f.git.drop_branch("br_schema_order").await.unwrap();
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn chinese_snapshot_names_round_trip_without_changing_physical_names() {
+    let mut f = Fixture::new().await;
+    f.snapshot.push_str("_实验");
+    sqlx::raw_sql("INSERT INTO memories VALUES (1, 'historical')")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    f.snapshot().await;
+    assert!(f.git.get_snapshot(&f.snapshot).await.unwrap().is_some());
+    sqlx::raw_sql("UPDATE memories SET content='current'")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    f.git
+        .restore_table_from_snapshot("memories", &f.snapshot)
+        .await
+        .unwrap();
+    let content: String = sqlx::query_scalar("SELECT content FROM memories WHERE id=1")
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(content, "historical");
+    f.git.drop_snapshot(&f.snapshot).await.unwrap();
+    assert!(f.git.get_snapshot(&f.snapshot).await.unwrap().is_none());
+    f.cleanup().await;
+}
+
+#[tokio::test]
 async fn indexed_snapshot_restores_512_embeddings_and_search_indexes() {
     let f = Fixture::new().await;
     sqlx::raw_sql("ALTER TABLE memories ADD COLUMN subject_id VARCHAR(128) DEFAULT NULL; ALTER TABLE memories ADD COLUMN embedding VECF32(3); ALTER TABLE memories ADD FULLTEXT INDEX ft_content (content) WITH PARSER ngram; ALTER TABLE memories ADD UNIQUE INDEX unique_content (content)")

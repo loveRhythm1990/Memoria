@@ -2014,10 +2014,27 @@ impl SqlMemoryStore {
         if !memoria_core::is_safe_sql_identifier(table) {
             return Err(MemoriaError::Validation("Invalid branch table name".into()));
         }
+        let current =
+            crate::table_schema::read_table_columns(&self.pool, schema, "mem_memories").await?;
         if !info_schema_column_exists(&self.pool, schema, table, "subject_id").await {
+            let position = current
+                .iter()
+                .position(|column| column.name.eq_ignore_ascii_case("subject_id"))
+                .ok_or_else(|| {
+                    MemoriaError::Database("Current table is missing subject_id".into())
+                })?;
             let mut ddl = sqlx::QueryBuilder::<sqlx::MySql>::new("ALTER TABLE ");
             ddl.push(self.t(table))
                 .push(" ADD COLUMN subject_id VARCHAR(128) DEFAULT NULL");
+            // Match the live ordinal, not merely the name: some MO versions
+            // silently misinterpret native diffs between differently ordered tables.
+            if position == 0 {
+                ddl.push(" FIRST");
+            } else {
+                ddl.push(" AFTER `")
+                    .push(current[position - 1].name.replace('`', "``"))
+                    .push("`");
+            }
             if let Err(error) = exec_ddl_with_retry(&self.pool, &ddl.into_sql()).await {
                 if !is_duplicate_column(&error) && !is_mo_concurrent_ddl_race(&error) {
                     return Err(db_err(error));
@@ -2029,7 +2046,7 @@ impl SqlMemoryStore {
         // Require ALL live column names afterwards, including nullable/defaulted
         // columns: current INSERT/SELECT statements explicitly reference them.
         let columns = crate::table_schema::read_table_columns(&self.pool, schema, table).await?;
-        let present: Vec<String> = columns.into_iter().map(|c| c.name).collect();
+        let present: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
         if !present
             .iter()
             .any(|name| name.eq_ignore_ascii_case("subject_id"))
@@ -2038,14 +2055,13 @@ impl SqlMemoryStore {
                 "Branch subject_id migration did not complete".into(),
             ));
         }
-        let current =
-            crate::table_schema::read_table_columns(&self.pool, schema, "mem_memories").await?;
         if let Some(column) = crate::table_schema::missing_columns(&current, &present).first() {
             return Err(MemoriaError::Database(format!(
                 "Branch schema is missing required column '{}'",
                 column.name
             )));
         }
+        crate::table_schema::validate_native_branch_schema(&current, &columns)?;
         if !info_schema_index_exists(&self.pool, schema, table, "idx_scope_subject_active").await {
             let mut ddl = sqlx::QueryBuilder::<sqlx::MySql>::new("ALTER TABLE ");
             ddl.push(self.t(table)).push(
