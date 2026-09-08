@@ -137,6 +137,142 @@ fn pick_result_or_skip(result: Result<Value, MemoriaError>, test_name: &str) -> 
 // ── 1. Basic workflow: create → checkout → store → checkout main → merge ──────
 
 #[tokio::test]
+async fn test_legacy_snapshot_branch_and_rollback_after_subject_migration() {
+    let (svc, git, uid, ctx) = setup().await;
+    let store = ctx.user_store(&uid).await;
+    let pool = ctx.user_db_pool(&uid).await;
+    store_mem("historical memory before schema upgrade", &svc, &uid).await;
+    // Reconstruct the v0.4 memory schema before taking the historical snapshot.
+    sqlx::raw_sql("ALTER TABLE mem_memories DROP INDEX idx_scope_subject_active")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql("ALTER TABLE mem_memories DROP COLUMN subject_id")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let snapshot = bname("legacy");
+    gc(
+        "memory_snapshot",
+        json!({"name": snapshot}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    store.migrate_user().await.unwrap();
+    store_mem("current memory after schema upgrade", &svc, &uid).await;
+    let branch = bname("legacybranch");
+    let result = gc(
+        "memory_branch",
+        json!({"name": branch, "from_snapshot": snapshot}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    assert!(text(&result).contains("Created"), "{result}");
+    gc("memory_checkout", json!({"name": branch}), &git, &svc, &uid).await;
+    let memories = svc.list_active(&uid, 10).await.unwrap();
+    assert_eq!(memories.len(), 1);
+    assert_eq!(
+        memories[0].content,
+        "historical memory before schema upgrade"
+    );
+    assert_eq!(memories[0].subject_id, None);
+    memoria_mcp::tools::call(
+        "memory_store",
+        json!({"content":"branch write after migration", "subject_id":"restored-subject"}),
+        &svc,
+        &uid,
+    )
+    .await
+    .unwrap();
+    let memories = svc.list_active(&uid, 10).await.unwrap();
+    assert_eq!(memories.len(), 2);
+    assert_eq!(
+        memories
+            .iter()
+            .find(|m| m.content == "branch write after migration")
+            .unwrap()
+            .subject_id
+            .as_deref(),
+        Some("restored-subject")
+    );
+    gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
+    assert_eq!(svc.list_active(&uid, 10).await.unwrap().len(), 2);
+    gc(
+        "memory_rollback",
+        json!({"name": snapshot}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    let memories = svc.list_active(&uid, 10).await.unwrap();
+    assert_eq!(memories.len(), 1);
+    assert_eq!(
+        memories[0].content,
+        "historical memory before schema upgrade"
+    );
+    store_mem("main write after legacy rollback", &svc, &uid).await;
+    assert_eq!(svc.list_active(&uid, 10).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn test_legacy_snapshot_branch_migration_failure_does_not_register_clone() {
+    let (svc, git, uid, ctx) = setup().await;
+    let store = ctx.user_store(&uid).await;
+    let pool = ctx.user_db_pool(&uid).await;
+    store_mem("keep current memory on migration failure", &svc, &uid).await;
+    sqlx::raw_sql("ALTER TABLE mem_memories DROP INDEX idx_scope_subject_active")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql("ALTER TABLE mem_memories DROP COLUMN subject_id")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // An incompatible historical type column forces the branch-index migration
+    // to fail after cloning; the registered current schema remains valid.
+    sqlx::raw_sql(
+        "ALTER TABLE mem_memories CHANGE COLUMN memory_type historical_type VARCHAR(20) NOT NULL",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let snapshot = bname("incompatible");
+    gc(
+        "memory_snapshot",
+        json!({"name":snapshot}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    sqlx::raw_sql(
+        "ALTER TABLE mem_memories CHANGE COLUMN historical_type memory_type VARCHAR(20) NOT NULL",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    store.migrate_user().await.unwrap();
+    let result = memoria_mcp::git_tools::call(
+        "memory_branch",
+        json!({"name":"rejected", "from_snapshot":snapshot}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    assert!(result.is_err(), "incompatible clone must not be exposed");
+    assert!(store.list_branches(&uid).await.unwrap().is_empty());
+    let clones: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name LIKE 'br_%'").fetch_one(&pool).await.unwrap();
+    assert_eq!(clones, 0, "failed migration must clean up its clone");
+    assert_eq!(svc.list_active(&uid, 10).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn test_basic_branch_workflow() {
     let (svc, git, uid, _ctx) = setup().await;
     let branch = bname("basic");

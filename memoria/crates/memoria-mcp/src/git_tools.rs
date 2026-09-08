@@ -1050,15 +1050,20 @@ pub async fn call(
             let table_name = format!("br_{}_{}", &Uuid::new_v4().simple().to_string()[..8], safe);
 
             if let Some(snap) = from_snapshot {
-                // Create branch from snapshot: restore snapshot to temp, then branch.
-                // Source is always mem_memories — new branch inherits its schema including
-                // subject_id, so no post-create column migration is needed.
+                // Snapshot clones inherit the historical schema, which may predate
+                // subject_id. Reconcile it before the branch becomes visible.
                 let internal = resolve_snapshot_for_user(svc, user_id, snap)
                     .await?
                     .ok_or_else(|| MemoriaError::NotFound(format!("Snapshot '{snap}'")))?;
                 git.create_branch_from_snapshot(&table_name, "mem_memories", &internal)
                     .await
                     .map_err(git_err)?;
+                if let Err(error) = sql.ensure_branch_subject_id(&table_name).await {
+                    if let Err(cleanup_error) = git.drop_branch(&table_name).await {
+                        tracing::warn!(%cleanup_error, table = %table_name, "failed to clean up incompatible snapshot branch");
+                    }
+                    return Err(error);
+                }
             } else {
                 // Source is always mem_memories (never another branch table).
                 // schema.subject_id is guaranteed present after migrate_user(), so MO's

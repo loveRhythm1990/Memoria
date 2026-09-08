@@ -2060,6 +2060,53 @@ impl SqlMemoryStore {
         Ok(())
     }
 
+    /// A branch cloned from a historical snapshot inherits the historical schema,
+    /// not today's mem_memories schema. Call before registering the new branch.
+    pub async fn ensure_branch_subject_id(&self, table: &str) -> Result<(), MemoriaError> {
+        if !table.starts_with("br_")
+            || !table
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        {
+            return Err(MemoriaError::Validation("Invalid branch table name".into()));
+        }
+        let schema = self.current_schema_name().await?;
+        if !info_schema_column_exists(&self.pool, schema.as_ref(), table, "subject_id").await {
+            let mut ddl = sqlx::QueryBuilder::<sqlx::MySql>::new("ALTER TABLE ");
+            ddl.push(self.t(table))
+                .push(" ADD COLUMN subject_id VARCHAR(128) DEFAULT NULL");
+            if let Err(error) = exec_ddl_with_retry(&self.pool, &ddl.into_sql()).await {
+                if !is_duplicate_column(&error) {
+                    return Err(db_err(error));
+                }
+            }
+        }
+        if !info_schema_column_exists(&self.pool, schema.as_ref(), table, "subject_id").await {
+            return Err(MemoriaError::Database(
+                "Branch subject_id migration did not complete".into(),
+            ));
+        }
+        if !info_schema_index_exists(
+            &self.pool,
+            schema.as_ref(),
+            table,
+            "idx_scope_subject_active",
+        )
+        .await
+        {
+            let mut ddl = sqlx::QueryBuilder::<sqlx::MySql>::new("ALTER TABLE ");
+            ddl.push(self.t(table)).push(
+                " ADD INDEX idx_scope_subject_active (user_id, subject_id, is_active, memory_type)",
+            );
+            if let Err(error) = exec_ddl_with_retry(&self.pool, &ddl.into_sql()).await {
+                if !is_duplicate_index(&error) {
+                    return Err(db_err(error));
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn ensure_snapshot_extra_column(
         &self,
         pool: &MySqlPool,

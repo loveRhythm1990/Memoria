@@ -1,7 +1,7 @@
 use chrono::NaiveDateTime;
 use memoria_core::MemoriaError;
 use serde::{Deserialize, Serialize};
-use sqlx::{mysql::MySqlPool, Column, Row};
+use sqlx::{mysql::MySqlPool, Column, Executor, MySql, QueryBuilder, Row};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -9,6 +9,169 @@ use std::sync::{
 
 fn db_err(e: sqlx::Error) -> MemoriaError {
     MemoriaError::Database(e.to_string())
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn restore_future_is_send() {
+        fn assert_send<T: Send>(_: T) {}
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://root:111@127.0.0.1:6001/test")
+            .unwrap();
+        let git = GitForDataService::new(pool, "test");
+        assert_send(replace_from_stage(
+            &git.pool,
+            "DELETE FROM target",
+            "INSERT INTO target SELECT * FROM stage",
+        ));
+        assert_send(git.restore_table_from_snapshot("memories", "snapshot"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable MatrixOne server via DATABASE_URL"]
+    async fn failed_insert_rolls_back_preceding_delete() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
+        let options: sqlx::mysql::MySqlConnectOptions = url.parse().unwrap();
+        let admin = MySqlPool::connect_with(options.clone().database("mo_catalog"))
+            .await
+            .unwrap();
+        let db = format!("restore_atomic_{}", uuid::Uuid::new_v4().simple());
+        let mut ddl = QueryBuilder::<MySql>::new("CREATE DATABASE ");
+        ddl.push(&db);
+        sqlx::raw_sql(&ddl.into_sql())
+            .execute(&admin)
+            .await
+            .unwrap();
+        let pool = MySqlPool::connect_with(options.database(&db))
+            .await
+            .unwrap();
+        sqlx::raw_sql("CREATE TABLE target (id INT PRIMARY KEY, content VARCHAR(100)); CREATE TABLE stage (id INT, content VARCHAR(100)); INSERT INTO target VALUES (1, 'current'); INSERT INTO stage VALUES (2, 'first'), (2, 'duplicate')").execute(&pool).await.unwrap();
+        let result = replace_from_stage(
+            &pool,
+            "DELETE FROM target",
+            "INSERT INTO target SELECT * FROM stage",
+        )
+        .await;
+        let rows: Vec<(i32, String)> = sqlx::query_as("SELECT id, content FROM target")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let mut drop = QueryBuilder::<MySql>::new("DROP DATABASE ");
+        drop.push(&db);
+        sqlx::raw_sql(&drop.into_sql())
+            .execute(&admin)
+            .await
+            .unwrap();
+        let error = result.expect_err("duplicate primary key must fail the INSERT");
+        assert!(
+            error.to_string().to_lowercase().contains("duplicate"),
+            "{error}"
+        );
+        assert_eq!(
+            rows,
+            vec![(1, "current".into())],
+            "DELETE must be rolled back with the failed INSERT"
+        );
+    }
+}
+
+// A staging table is private to one restore, never registered as a user branch.
+// Drop also schedules cleanup when the request future is cancelled.
+struct RestoreStage {
+    pool: MySqlPool,
+    drop_sql: Option<String>,
+}
+
+impl RestoreStage {
+    async fn cleanup(&mut self) {
+        if let Some(sql) = self.drop_sql.as_ref() {
+            match exec_ddl(&self.pool, sql).await {
+                Ok(()) => self.drop_sql = None,
+                Err(error) => {
+                    tracing::warn!(%error, cleanup = %sql, "restore staging cleanup failed")
+                }
+            }
+        }
+    }
+}
+
+impl Drop for RestoreStage {
+    fn drop(&mut self) {
+        if let (Some(sql), Ok(runtime)) =
+            (self.drop_sql.take(), tokio::runtime::Handle::try_current())
+        {
+            let pool = self.pool.clone();
+            runtime.spawn(async move {
+                if let Err(error) = exec_ddl(&pool, &sql).await {
+                    tracing::warn!(%error, cleanup = %sql, "cancelled restore staging cleanup failed");
+                }
+            });
+        }
+    }
+}
+
+/// Both statements operate on live tables: MatrixOne forbids historical snapshot
+/// reads inside a transaction. Materialize those reads before entering here.
+async fn replace_from_stage(
+    pool: &MySqlPool,
+    delete: &str,
+    insert: &str,
+) -> Result<(), MemoriaError> {
+    let mut tx = pool.begin().await.map_err(db_err)?;
+    if let Err(error) = sqlx::query(delete).execute(&mut *tx).await {
+        tx.rollback().await.map_err(db_err)?;
+        return Err(db_err(error));
+    }
+    if let Err(error) = sqlx::query(insert).execute(&mut *tx).await {
+        tx.rollback().await.map_err(db_err)?;
+        return Err(db_err(error));
+    }
+    // Do not retry individual statements or compensate after an ambiguous commit.
+    // The database commits the entire replacement or retains the original rows.
+    tx.commit().await.map_err(db_err)
+}
+
+async fn prepare_and_replace(
+    pool: MySqlPool,
+    stage_table: String,
+    target_table: String,
+    column_list: String,
+    all_columns: String,
+    snapshot: String,
+) -> Result<(), MemoriaError> {
+    let mut create = QueryBuilder::<MySql>::new("CREATE TABLE ");
+    create.push(&stage_table).push(" LIKE ").push(&target_table);
+    exec_ddl(&pool, &create.into_sql()).await?;
+    let mut prepare = QueryBuilder::<MySql>::new("INSERT INTO ");
+    prepare
+        .push(&stage_table)
+        .push(" (")
+        .push(&column_list)
+        .push(") SELECT ")
+        .push(&column_list)
+        .push(" FROM ")
+        .push(&target_table)
+        .push(" {SNAPSHOT = '")
+        .push(snapshot)
+        .push("'}");
+    // All source reads and constraint validation finish before live-row deletion.
+    exec_ddl(&pool, &prepare.into_sql()).await?;
+    let mut delete = QueryBuilder::<MySql>::new("DELETE FROM ");
+    delete.push(&target_table);
+    let mut insert = QueryBuilder::<MySql>::new("INSERT INTO ");
+    insert
+        .push(&target_table)
+        .push(" (")
+        .push(&all_columns)
+        .push(") SELECT ")
+        .push(&all_columns)
+        .push(" FROM ")
+        .push(&stage_table);
+    replace_from_stage(&pool, &delete.into_sql(), &insert.into_sql()).await
 }
 
 /// Look up a column index by name, case-insensitively.
@@ -634,9 +797,9 @@ impl GitForDataService {
         exec_ddl(&self.pool, &format!("DROP SNAPSHOT {safe}")).await
     }
 
-    /// Restore a single table from snapshot (non-destructive alternative to full account restore).
-    /// DELETE current rows + INSERT SELECT from snapshot.
-    /// Workaround for MO#23860: retry on w-w conflict.
+    /// Restore historical data into the current schema. Prepare and validate all
+    /// rows in a private table first, then atomically replace live rows. New
+    /// columns receive the current schema's defaults (subject_id defaults to NULL).
     pub async fn restore_table_from_snapshot(
         &self,
         table: &str,
@@ -652,23 +815,91 @@ impl GitForDataService {
             .await?
             .ok_or_else(|| MemoriaError::NotFound(format!("Snapshot {snapshot_name}")))?;
 
-        // MO#23860: concurrent snapshot restore causes w-w conflict
-        // MO#23861: concurrent snapshot restore loses FULLTEXT INDEX secondary tables
-        // Callers must serialize snapshot operations until these are fixed.
-        //
-        // Note: ideally this would be transactional, but MatrixOne does not
-        // support {SNAPSHOT = '...'} syntax inside transactions. The DELETE+INSERT
-        // is non-atomic; callers should create a safety snapshot before rollback.
-        exec_ddl(&self.pool, &format!("DELETE FROM {qualified_table}")).await?;
-        exec_ddl(
-            &self.pool,
-            &format!(
-                "INSERT INTO {qualified_table} SELECT * FROM {qualified_table} {{SNAPSHOT = '{safe_snap}'}}"
-            ),
+        let mut current_query = QueryBuilder::<MySql>::new("SELECT * FROM ");
+        current_query.push(&qualified_table).push(" LIMIT 0");
+        let current = self
+            .pool
+            .describe(&current_query.into_sql())
+            .await
+            .map_err(db_err)?;
+        let mut historical_query = QueryBuilder::<MySql>::new("SELECT * FROM ");
+        historical_query
+            .push(&qualified_table)
+            .push(" {SNAPSHOT = '")
+            .push(safe_snap)
+            .push("'} LIMIT 0");
+        let historical = self
+            .pool
+            .describe(&historical_query.into_sql())
+            .await
+            .map_err(db_err)?;
+        // Reject missing required fields explicitly: permissive MySQL SQL modes
+        // can otherwise invent implicit zero/empty values for NOT NULL columns.
+        let requirements: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
+            "SELECT COLUMN_NAME, IS_NULLABLE, COLUMN_DEFAULT, EXTRA \
+             FROM information_schema.columns WHERE table_schema = ? AND table_name = ?",
         )
-        .await?;
-
-        Ok(())
+        .bind(&self.db_name)
+        .bind(safe_table)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        for (name, nullable, default, extra) in requirements {
+            if !historical
+                .columns()
+                .iter()
+                .any(|old| old.name().eq_ignore_ascii_case(&name))
+                && nullable == "NO"
+                && default.is_none()
+                && !extra.to_lowercase().contains("auto_increment")
+            {
+                return Err(MemoriaError::Validation(format!(
+                    "Snapshot is missing required column '{name}' without a default"
+                )));
+            }
+        }
+        let columns: Vec<_> = current
+            .columns()
+            .iter()
+            .filter(|column| {
+                historical
+                    .columns()
+                    .iter()
+                    .any(|old| old.name().eq_ignore_ascii_case(column.name()))
+            })
+            .map(|column| quote_identifier(column.name()))
+            .collect();
+        if columns.is_empty() {
+            return Err(MemoriaError::Validation(
+                "Snapshot and current table have no common columns".into(),
+            ));
+        }
+        let column_list = columns.join(", ");
+        let all_columns = current
+            .columns()
+            .iter()
+            .map(|c| quote_identifier(c.name()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let stage_name = format!("mem_restore_{}", uuid::Uuid::new_v4().simple());
+        let stage_table = [db.as_str(), ".", quote_identifier(&stage_name).as_str()].concat();
+        let mut drop_query = QueryBuilder::<MySql>::new("DROP TABLE IF EXISTS ");
+        drop_query.push(&stage_table);
+        let mut stage = RestoreStage {
+            pool: self.pool.clone(),
+            drop_sql: Some(drop_query.sql().to_string()),
+        };
+        let result = prepare_and_replace(
+            self.pool.clone(),
+            stage_table,
+            qualified_table,
+            column_list,
+            all_columns,
+            safe_snap.to_owned(),
+        )
+        .await;
+        stage.cleanup().await;
+        result
     }
 
     // ── Branches ──────────────────────────────────────────────────────────────

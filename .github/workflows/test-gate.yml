@@ -47,3 +47,5 @@ jobs:
           done
       - name: All tests
         run: cd memoria && cargo test -- --test-threads=1
+      - name: Restore transaction failure regression
+        run: cd memoria && cargo test -p memoria-git --lib failed_insert_rolls_back_preceding_delete -- --ignored --nocapture
