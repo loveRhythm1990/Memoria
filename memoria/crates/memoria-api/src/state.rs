@@ -31,6 +31,7 @@ struct ApiKeyCacheEntry {
     group_id: Option<String>,
     key_prefix: String,
     scopes: Vec<String>,
+    expires_at: Option<chrono::NaiveDateTime>,
     cached_at: Instant,
 }
 
@@ -41,6 +42,7 @@ pub struct CachedApiKeyPrincipal {
     pub group_id: Option<String>,
     pub key_prefix: String,
     pub scopes: Vec<String>,
+    pub expires_at: Option<chrono::NaiveDateTime>,
 }
 
 #[derive(Clone)]
@@ -58,16 +60,27 @@ impl ApiKeyCache {
     }
 
     pub fn get(&self, key_hash: &str) -> Option<CachedApiKeyPrincipal> {
-        let now = Instant::now();
+        self.get_at(key_hash, Instant::now(), chrono::Utc::now().naive_utc())
+    }
+
+    fn get_at(
+        &self,
+        key_hash: &str,
+        now: Instant,
+        wall_now: chrono::NaiveDateTime,
+    ) -> Option<CachedApiKeyPrincipal> {
         if let Ok(cache) = self.inner.read() {
             if let Some(entry) = cache.get(key_hash) {
-                if now.duration_since(entry.cached_at) < self.ttl {
+                if now.duration_since(entry.cached_at) < self.ttl
+                    && entry.expires_at.is_none_or(|expiry| wall_now < expiry)
+                {
                     return Some(CachedApiKeyPrincipal {
                         key_id: entry.key_id.clone(),
                         user_id: entry.user_id.clone(),
                         group_id: entry.group_id.clone(),
                         key_prefix: entry.key_prefix.clone(),
                         scopes: entry.scopes.clone(),
+                        expires_at: entry.expires_at,
                     });
                 }
             }
@@ -87,6 +100,7 @@ impl ApiKeyCache {
                     group_id: principal.group_id,
                     key_prefix: principal.key_prefix,
                     scopes: principal.scopes,
+                    expires_at: principal.expires_at,
                     cached_at: Instant::now(),
                 },
             );
@@ -365,6 +379,61 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cached_principal(expires_at: Option<chrono::NaiveDateTime>) -> CachedApiKeyPrincipal {
+        CachedApiKeyPrincipal {
+            key_id: "test-key".into(),
+            user_id: "test-user".into(),
+            group_id: None,
+            key_prefix: "sk-test".into(),
+            scopes: vec!["identity:read".into()],
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn api_key_cache_enforces_exact_key_expiry_before_cache_ttl() {
+        let cache = ApiKeyCache::new(Duration::from_secs(300));
+        let expiry = chrono::Utc::now().naive_utc() + chrono::Duration::seconds(10);
+        cache.insert("hash".into(), cached_principal(Some(expiry)));
+        let now = Instant::now();
+        assert!(cache
+            .get_at("hash", now, expiry - chrono::Duration::microseconds(1))
+            .is_some());
+        assert!(cache.get_at("hash", now, expiry).is_none());
+        assert!(
+            !cache.inner.read().unwrap().contains_key("hash"),
+            "expired entry evicted"
+        );
+    }
+
+    #[test]
+    fn api_key_cache_keeps_nonexpiring_keys_but_still_enforces_cache_ttl() {
+        let cache = ApiKeyCache::new(Duration::from_secs(300));
+        cache.insert("hash".into(), cached_principal(None));
+        let now = Instant::now();
+        let wall_now = chrono::Utc::now().naive_utc();
+        assert!(cache.get_at("hash", now, wall_now).is_some());
+        assert!(cache
+            .get_at("hash", now + Duration::from_secs(301), wall_now)
+            .is_none());
+    }
+
+    #[test]
+    fn api_key_cache_rejects_expired_entries_on_every_public_read() {
+        let cache = ApiKeyCache::new(Duration::from_secs(300));
+        let expired = chrono::Utc::now().naive_utc() - chrono::Duration::seconds(1);
+        cache.insert("hash".into(), cached_principal(Some(expired)));
+        assert!(cache.get("hash").is_none());
+        // A concurrent stale lookup must not extend the key's absolute lifetime.
+        cache.insert("hash".into(), cached_principal(Some(expired)));
+        assert!(cache.get("hash").is_none());
+        cache.insert(
+            "hash".into(),
+            cached_principal(Some(expired + chrono::Duration::hours(1))),
+        );
+        assert!(cache.get("hash").is_some());
+    }
 
     #[tokio::test]
     async fn test_metrics_cache_hit() {

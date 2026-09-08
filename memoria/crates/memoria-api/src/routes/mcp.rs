@@ -192,6 +192,7 @@ fn spawn_metrics_dirty_mark(
 pub async fn mcp_handler(
     State(state): State<AppState>,
     auth: AuthUser,
+    headers: axum::http::HeaderMap,
     body: String,
 ) -> impl IntoResponse {
     // Start timing after auth. Billable MCP requests are recorded below; transport
@@ -202,14 +203,9 @@ pub async fn mcp_handler(
     // Uses underscore-prefixed paths so they never collide with real tool names.
     macro_rules! validation_err {
         ($path:expr, $code:expr, $body:expr) => {{
-            state.call_log_batcher.record_rpc(
-                auth.user_id.clone(),
-                "POST".to_string(),
-                $path.to_string(),
-                200,
-                t.elapsed().as_millis() as u32,
-                RpcMeta::err($code),
-            );
+            // No tool has been admitted. Per-user log flushing can provision a
+            // memory DB, so malformed requests use non-memory telemetry only.
+            tracing::warn!(user_id = %auth.user_id, path = $path, rpc_code = $code, "invalid MCP request");
             if let Some(reporter) = &state.stats_reporter {
                 reporter.report(memoria_service::stats_reporter::StatsEvent::ApiCallLogged {
                     user_id: auth.user_id.clone(),
@@ -294,9 +290,6 @@ pub async fn mcp_handler(
     };
     let user_id = auth.user_id.clone();
     let scope_id = auth.scope_id.clone();
-    if let Some(tool) = tracked_tool.clone() {
-        state.tool_usage_batcher.mark_used(user_id.clone(), tool);
-    }
 
     // Single reporting point for MCP call stats, shared by both the
     // notification path and the regular-request path below.
@@ -330,6 +323,44 @@ pub async fn mcp_handler(
         }
     } else {
         None
+    };
+
+    // Reject before *any* per-user instrumentation or group storage lookup.
+    // A missing memory grant is not authorization to create a database merely
+    // to log the refusal. Shared stats and tracing retain the denial evidence.
+    if let Some(message) = authorization_error {
+        report_stats(&track_path, false);
+        tracing::warn!(user_id = %user_id, path = %track_path, rpc_code = -32003, "MCP scope admission denied");
+        if req.get("id").is_none() {
+            return StatusCode::NO_CONTENT.into_response();
+        }
+        return Json(json!({"jsonrpc": "2.0", "id": req["id"],
+            "error": {"code": -32003, "message": message}}))
+        .into_response();
+    }
+
+    // Identity-only metadata calls (initialize, tools/list, etc.) must not
+    // implicitly enable memory storage either. AuthUser defers MCP headers here.
+    let memory_telemetry = auth.has_scope(SCOPE_MEMORY_READ) || auth.has_scope(SCOPE_MEMORY_WRITE);
+    if memory_telemetry {
+        if let Some(tool) = tracked_tool.clone() {
+            state.tool_usage_batcher.mark_used(user_id.clone(), tool);
+        }
+        if let Some(agent) = crate::auth::request_tool_name(&headers) {
+            state.tool_usage_batcher.mark_used(user_id.clone(), agent);
+        }
+    }
+    let record_call = |status_code, rpc| {
+        if memory_telemetry {
+            state.call_log_batcher.record_rpc(
+                user_id.clone(),
+                "POST".to_string(),
+                track_path.clone(),
+                status_code,
+                t.elapsed().as_millis() as u32,
+                rpc,
+            );
+        }
     };
 
     // ── Group main-write guard (computed once, shared by both code paths) ─────
@@ -399,30 +430,11 @@ pub async fn mcp_handler(
     // JSON-RPC 2.0: a Notification is a *valid* Request without an "id" member.
     // The server MUST NOT reply to Notifications.
     if req.get("id").is_none() {
-        if authorization_error.is_some() {
-            report_stats(&track_path, false);
-            state.call_log_batcher.record_rpc(
-                user_id,
-                "POST".to_string(),
-                track_path,
-                204,
-                t.elapsed().as_millis() as u32,
-                RpcMeta::err(-32003),
-            );
-            return StatusCode::NO_CONTENT.into_response();
-        }
         // Write guard: per JSON-RPC 2.0 the server MUST NOT reply to Notifications,
         // so we silently drop blocked writes without dispatching.
         if blocked_tool.is_some() {
             report_stats(&track_path, false);
-            state.call_log_batcher.record_rpc(
-                user_id,
-                "POST".to_string(),
-                track_path,
-                204,
-                t.elapsed().as_millis() as u32,
-                RpcMeta::err(-32001),
-            );
+            record_call(204, RpcMeta::err(-32001));
             return StatusCode::NO_CONTENT.into_response();
         }
         let dispatch_result = memoria_mcp::dispatch_http(
@@ -445,39 +457,11 @@ pub async fn mcp_handler(
         // Report accurate ops metrics using the real RPC path and success flag
         // (JSON-RPC errors still return HTTP 200, so is_success must come from rpc.success).
         report_stats(&track_path, rpc.success);
-        state.call_log_batcher.record_rpc(
-            user_id,
-            "POST".to_string(),
-            track_path,
-            204, // HTTP 204 No Content — correct for notifications
-            t.elapsed().as_millis() as u32,
-            rpc,
-        );
+        record_call(204, rpc);
         return StatusCode::NO_CONTENT.into_response();
     }
 
     let id = req["id"].clone();
-
-    if let Some(message) = authorization_error {
-        let err_body = Json(json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": {
-                "code": -32003,
-                "message": message
-            }
-        }));
-        report_stats(&track_path, false);
-        state.call_log_batcher.record_rpc(
-            user_id,
-            "POST".to_string(),
-            track_path,
-            200,
-            t.elapsed().as_millis() as u32,
-            RpcMeta::err(-32003),
-        );
-        return err_body.into_response();
-    }
 
     // Use the pre-computed write-guard decision (see above).
     if let Some(tool) = &blocked_tool {
@@ -498,14 +482,7 @@ pub async fn mcp_handler(
             }
         }));
         report_stats(&track_path, false);
-        state.call_log_batcher.record_rpc(
-            user_id,
-            "POST".to_string(),
-            track_path,
-            200,
-            t.elapsed().as_millis() as u32,
-            RpcMeta::err(-32001),
-        );
+        record_call(200, RpcMeta::err(-32001));
         return err_body.into_response();
     }
 
@@ -547,14 +524,7 @@ pub async fn mcp_handler(
     // Report accurate ops metrics using the real RPC path and success flag
     // (JSON-RPC errors still return HTTP 200, so is_success must come from rpc.success).
     report_stats(&track_path, rpc.success);
-    state.call_log_batcher.record_rpc(
-        user_id,
-        "POST".to_string(),
-        track_path,
-        200, // HTTP 200 — always correct for JSON-RPC responses
-        t.elapsed().as_millis() as u32,
-        rpc,
-    );
+    record_call(200, rpc);
 
     response
 }

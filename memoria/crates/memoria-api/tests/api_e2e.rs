@@ -1993,6 +1993,360 @@ async fn test_scoped_api_key_whoami_and_memory_authorization() {
         .contains("memory:write"));
 }
 
+async fn assert_scoped_user_has_no_database(server: &support::multi_db::ApiTestServer, user: &str) {
+    let registry: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM mem_user_registry WHERE user_id = ?")
+            .bind(user)
+            .fetch_one(&server.shared_pool())
+            .await
+            .unwrap();
+    assert_eq!(registry, 0, "denied request registered {user}");
+    let db_name = memoria_storage::DbRouter::user_db_name_for_id(user);
+    let databases: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?",
+    )
+    .bind(db_name)
+    .fetch_one(&server.shared_pool())
+    .await
+    .unwrap();
+    assert_eq!(databases, 0, "denied request created a database for {user}");
+}
+
+#[tokio::test]
+async fn test_scoped_mcp_denials_do_not_provision_storage_even_after_flush() {
+    let master = "denied-telemetry-test-master";
+    let (base, client, server) = spawn_server_with_master_key(master).await;
+    let mut users = Vec::new();
+    let mut write_key = String::new();
+    for (scopes, denied_tools) in [
+        (
+            json!(["identity:read"]),
+            vec!["memory_store", "memory_search"],
+        ),
+        (
+            json!(["identity:read", "memory:read"]),
+            vec!["memory_store", "memory_tune_params"],
+        ),
+        (
+            json!(["identity:read", "memory:read", "memory:write"]),
+            vec!["memory_unclassified"],
+        ),
+    ] {
+        let user = uid();
+        let response = client
+            .post(format!("{base}/auth/keys"))
+            .bearer_auth(master)
+            .json(&json!({"user_id":user,"name":"denial-test","scopes":scopes}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        let key = response.json::<Value>().await.unwrap()["raw_key"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_scoped_user_has_no_database(&server, &user).await;
+        for tool in denied_tools {
+            for notification in [false, true] {
+                for header in ["X-Memoria-Tool", "X-Tool-Name"] {
+                    let mut request = json!({"jsonrpc":"2.0","method":"tools/call",
+                        "params":{"name":tool,"arguments":{"content":"must not be stored"}}});
+                    if !notification {
+                        request["id"] = json!(1);
+                    }
+                    let response = client
+                        .post(format!("{base}/mcp"))
+                        .bearer_auth(&key)
+                        .header(header, "denied-test-agent")
+                        .json(&request)
+                        .send()
+                        .await
+                        .unwrap();
+                    if notification {
+                        assert_eq!(response.status(), 204);
+                        assert!(response.bytes().await.unwrap().is_empty());
+                    } else {
+                        assert_eq!(response.status(), 200);
+                        let result: Value = response.json().await.unwrap();
+                        assert_eq!(result["error"]["code"], -32003, "{result}");
+                    }
+                }
+            }
+        }
+        // Parse failures have not admitted any tool either.
+        for invalid in [
+            "not json",
+            "[]",
+            r#"{"jsonrpc":"1.0","method":"tools/call"}"#,
+        ] {
+            let response = client
+                .post(format!("{base}/mcp"))
+                .bearer_auth(&key)
+                .header("X-Memoria-Tool", "denied-test-agent")
+                .body(invalid)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            assert!(response
+                .json::<Value>()
+                .await
+                .unwrap()
+                .get("error")
+                .is_some());
+        }
+        if scopes.as_array().unwrap().len() == 1 {
+            let response = client
+                .get(format!("{base}/auth/whoami"))
+                .bearer_auth(&key)
+                .header("X-Memoria-Tool", "identity-test-agent")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            for method in [
+                "initialize",
+                "tools/list",
+                "ping",
+                "notifications/initialized",
+            ] {
+                let response = client
+                    .post(format!("{base}/mcp"))
+                    .bearer_auth(&key)
+                    .header("X-Tool-Name", "identity-test-agent")
+                    .json(&json!({"jsonrpc":"2.0","id":2,"method":method,"params":{}}))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 200);
+            }
+        }
+        assert!(server
+            .state()
+            .tool_usage_batcher
+            .get_user_tool_usage(&user)
+            .is_empty());
+        users.push(user);
+        write_key = key;
+    }
+    server
+        .state()
+        .tool_usage_batcher
+        .flush(&server.service())
+        .await;
+    server
+        .state()
+        .call_log_batcher
+        .flush(&server.service())
+        .await;
+    for user in &users {
+        assert_scoped_user_has_no_database(&server, user).await;
+    }
+    server.state().drain_flushers().await;
+    for user in &users {
+        assert_scoped_user_has_no_database(&server, user).await;
+    }
+
+    // Positive control: an admitted write still provisions and tracks usage.
+    let response = client
+        .post(format!("{base}/mcp"))
+        .bearer_auth(&write_key)
+        .header("X-Memoria-Tool", "allowed-test-agent")
+        .json(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"memory_store","arguments":{"content":"authorized fixture"}}}))
+        .send()
+        .await
+        .unwrap();
+    let result: Value = response.json().await.unwrap();
+    assert!(result.get("error").is_none(), "{result}");
+    assert_ne!(result["result"]["isError"], true, "{result}");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mem_user_registry WHERE user_id = ?")
+        .bind(users.last().unwrap())
+        .fetch_one(&server.shared_pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    assert!(!server
+        .state()
+        .tool_usage_batcher
+        .get_user_tool_usage(users.last().unwrap())
+        .is_empty());
+    server
+        .state()
+        .tool_usage_batcher
+        .flush(&server.service())
+        .await;
+    server
+        .state()
+        .call_log_batcher
+        .flush(&server.service())
+        .await;
+}
+
+#[tokio::test]
+async fn test_scoped_key_warm_cache_expires_for_rest_and_mcp() {
+    use sha2::{Digest, Sha256};
+    let master = "expiry-test-master";
+    let (base, client, server) = spawn_server_with_master_key(master).await;
+    // DATETIME(6) stores microseconds; Linux clocks can expose nanoseconds.
+    let expiry = chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
+        .unwrap()
+        .naive_utc()
+        + chrono::Duration::seconds(5);
+    let mut keys = Vec::new();
+    for expires_at in [
+        Some(expiry),
+        Some(expiry),
+        None,
+        Some(expiry + chrono::Duration::hours(1)),
+    ] {
+        let response = client.post(format!("{base}/auth/keys")).bearer_auth(master)
+            .json(&json!({"user_id":uid(),"name":"expiry-test","expires_at":expires_at.map(|ts|ts.to_string()),
+                "scopes":["identity:read","memory:read","memory:write"]})).send().await.unwrap();
+        assert_eq!(response.status(), 201);
+        let key = response.json::<Value>().await.unwrap()["raw_key"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let response = client
+            .post(format!("{base}/mcp"))
+            .bearer_auth(&key)
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "must warm before expiry");
+        let hash = format!("{:x}", Sha256::digest(key.as_bytes()));
+        let cached = server
+            .state()
+            .api_key_cache
+            .get(&hash)
+            .expect("principal cached");
+        assert_eq!(cached.expires_at, expires_at);
+        keys.push(key);
+    }
+    let wait = (expiry - chrono::Utc::now().naive_utc())
+        .to_std()
+        .unwrap_or_default();
+    tokio::time::sleep(wait + std::time::Duration::from_millis(100)).await;
+    // Separate warmed entries: REST rejection must not evict the MCP entry
+    // before its own first post-expiry authentication attempt.
+    let rest = client
+        .get(format!("{base}/v1/memories"))
+        .bearer_auth(&keys[0])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rest.status(), 401);
+    let mcp = client
+        .post(format!("{base}/mcp"))
+        .bearer_auth(&keys[1])
+        .json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_store","arguments":{"content":"expired denial"}}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mcp.status(), 401);
+    for key in &keys[..2] {
+        let response = client
+            .get(format!("{base}/auth/whoami"))
+            .bearer_auth(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            401,
+            "fresh DB validation agrees with cache expiry"
+        );
+    }
+    for key in &keys[2..] {
+        let response = client
+            .get(format!("{base}/v1/memories"))
+            .bearer_auth(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            200,
+            "non-expiring/future keys remain valid"
+        );
+        let response = client
+            .post(format!("{base}/mcp"))
+            .bearer_auth(key)
+            .json(&json!({"jsonrpc":"2.0","id":3,"method":"ping"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+    }
+}
+
+#[tokio::test]
+async fn test_scoped_group_denial_precedes_memory_storage_lookup() {
+    let master = "group-denial-test-master";
+    let (base, client, server) = spawn_server_with_master_key(master).await;
+    let user = uid();
+    let group = format!("grp_{}", uuid::Uuid::new_v4().simple());
+    let group_db = memoria_storage::DbRouter::user_db_name_for_id(&group);
+    // Seed only control-plane metadata; neither member nor group has a memory DB.
+    sqlx::query("INSERT INTO mem_groups (group_id,group_name,db_name,owner_user_id,status,created_at,updated_at) VALUES (?, 'denial fixture', ?, ?, 'active', NOW(6), NOW(6))")
+        .bind(&group).bind(&group_db).bind(&user).execute(&server.shared_pool()).await.unwrap();
+    sqlx::query("INSERT INTO mem_group_members (group_id,user_id,role,is_active,joined_at) VALUES (?, ?, 'owner', 1, NOW(6))")
+        .bind(&group).bind(&user).execute(&server.shared_pool()).await.unwrap();
+    let response = client.post(format!("{base}/auth/keys")).bearer_auth(master)
+        .json(&json!({"user_id":user,"group_id":group,"name":"group-denial","scopes":["identity:read","memory:read"]})).send().await.unwrap();
+    assert_eq!(response.status(), 201);
+    let key = response.json::<Value>().await.unwrap()["raw_key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for notification in [false, true] {
+        let mut body = json!({"jsonrpc":"2.0","method":"tools/call","params":{"name":"memory_store","arguments":{"content":"denied"}}});
+        if !notification {
+            body["id"] = json!(1);
+        }
+        let response = client
+            .post(format!("{base}/mcp"))
+            .bearer_auth(&key)
+            .header("X-Memoria-Tool", "denied-group-agent")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        if notification {
+            assert_eq!(response.status(), 204);
+        } else {
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"]["code"],
+                -32003
+            );
+        }
+    }
+    let response = client
+        .post(format!("{base}/v1/memories"))
+        .bearer_auth(&key)
+        .json(&json!({"content":"denied"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    server.state().drain_flushers().await;
+    assert_scoped_user_has_no_database(&server, &user).await;
+    let databases: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?",
+    )
+    .bind(group_db)
+    .fetch_one(&server.shared_pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        databases, 0,
+        "unauthorized guard lookup provisioned the group DB"
+    );
+}
+
 #[tokio::test]
 async fn test_scoped_mcp_write_authorization_is_independent_of_metrics() {
     let master = "mcp-scope-regression-master";

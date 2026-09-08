@@ -36,6 +36,17 @@ pub fn parse_scopes(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// Agent labels are recorded only after the request's scope admission. MCP
+/// defers this until its tool-specific admission, not merely bearer validation.
+pub(crate) fn request_tool_name(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("X-Memoria-Tool")
+        .or_else(|| headers.get("X-Tool-Name"))
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map(String::from)
+}
+
 fn required_scope_for_request(method: &axum::http::Method, path: &str) -> Option<&'static str> {
     let under = |prefix: &str| path == prefix || path.starts_with(&format!("{prefix}/"));
     if (path == "/auth/whoami" && method == axum::http::Method::GET)
@@ -150,7 +161,7 @@ async fn cached_or_db_principal(token: &str, state: &AppState) -> Option<CachedA
         .or_else(|| state.service.sql_store.as_ref().map(|s| s.pool()))?;
 
     let row = sqlx::query(
-        "SELECT key_id, user_id, group_id, key_prefix, scopes FROM mem_api_keys \
+        "SELECT key_id, user_id, group_id, key_prefix, scopes, expires_at FROM mem_api_keys \
          WHERE key_hash = ? AND is_active = 1 \
          AND (expires_at IS NULL OR expires_at > NOW(6))",
     )
@@ -166,6 +177,7 @@ async fn cached_or_db_principal(token: &str, state: &AppState) -> Option<CachedA
         group_id: row.try_get("group_id").ok().flatten(),
         key_prefix: row.try_get("key_prefix").ok()?,
         scopes: parse_scopes(&row.try_get::<String, _>("scopes").ok()?),
+        expires_at: row.try_get("expires_at").ok()?,
     };
     state.api_key_cache.insert(key_hash, principal.clone());
     Some(principal)
@@ -252,6 +264,11 @@ pub async fn group_main_write_guard(
             .await
             .filter(|p| p.group_id.is_some())
         {
+            if let Err(rejection) =
+                authorize_api_key_route(req.method(), req.uri().path(), &p.scopes)
+            {
+                return rejection.into_response();
+            }
             let gid = p.group_id.as_ref().unwrap();
             // Set task-local so active_branch_name resolves per-member state
             let user_id = p.user_id.clone();
@@ -1052,13 +1069,11 @@ impl FromRequestParts<AppState> for AuthUser {
         // Agents send X-Memoria-Tool with their name: cursor / kiro / claude / codex / openclaw.
         // Fall back to X-Tool-Name for backwards compatibility with older clients.
         // Any non-empty value is accepted — no whitelist, so new agents work automatically.
-        let tool_name = parts
-            .headers
-            .get("X-Memoria-Tool")
-            .or_else(|| parts.headers.get("X-Tool-Name"))
-            .and_then(|v| v.to_str().ok())
-            .filter(|v| !v.is_empty())
-            .map(String::from);
+        let tool_name = if parts.uri.path() == "/mcp" {
+            None
+        } else {
+            request_tool_name(&parts.headers)
+        };
 
         let bearer = parts
             .headers
@@ -1082,15 +1097,20 @@ impl FromRequestParts<AppState> for AuthUser {
                 authorize_api_key_route(&parts.method, parts.uri.path(), &principal.scopes)?;
                 let uid = principal.user_id.clone();
                 let group_id = principal.group_id.clone();
-                if let Some(tool) = tool_name {
-                    state.tool_usage_batcher.mark_used(uid.clone(), tool);
-                }
-                // Notify call-log middleware (if present) of the resolved user_id.
-                // The middleware inserted CallLogContext into extensions before calling next;
-                // we fill in the user_id so it can record the call after the handler returns.
-                if let Some(ctx) = parts.extensions.get::<CallLogContext>() {
-                    if let Ok(mut guard) = ctx.0.lock() {
-                        *guard = Some(uid.clone());
+                let memory_telemetry = principal
+                    .scopes
+                    .iter()
+                    .any(|scope| matches!(scope.as_str(), SCOPE_MEMORY_READ | SCOPE_MEMORY_WRITE));
+                if memory_telemetry {
+                    if let Some(tool) = tool_name {
+                        state.tool_usage_batcher.mark_used(uid.clone(), tool);
+                    }
+                    // Only admitted memory-capable requests may enqueue logs
+                    // whose persistence can provision a personal memory DB.
+                    if let Some(ctx) = parts.extensions.get::<CallLogContext>() {
+                        if let Ok(mut guard) = ctx.0.lock() {
+                            *guard = Some(uid.clone());
+                        }
                     }
                 }
                 let scope_id = group_id.clone().unwrap_or_else(|| uid.clone());
@@ -1197,7 +1217,7 @@ async fn validate_api_key(
     };
 
     let row = sqlx::query(
-        "SELECT key_id, user_id, group_id, key_prefix, scopes FROM mem_api_keys \
+        "SELECT key_id, user_id, group_id, key_prefix, scopes, expires_at FROM mem_api_keys \
          WHERE key_hash = ? AND is_active = 1 \
          AND (expires_at IS NULL OR expires_at > NOW(6))",
     )
@@ -1215,6 +1235,7 @@ async fn validate_api_key(
         group_id: group_id.clone(),
         key_prefix: row.try_get("key_prefix").ok()?,
         scopes: parse_scopes(&row.try_get::<String, _>("scopes").ok()?),
+        expires_at: row.try_get("expires_at").ok()?,
     };
 
     // Enforce real-time group membership: even if the key references a group,

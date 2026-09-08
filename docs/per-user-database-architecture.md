@@ -107,6 +107,14 @@ per-user DB 放两类数据：
 
 注意：这些“用户级控制元数据”虽然在用户库里，但它们不是 rollback 的业务恢复目标；它们要保持当前态，否则会出现 branch / snapshot 注册表与底层事实不一致。
 
+### 3.4 鉴权与首次建库的边界
+
+API Key 校验只依赖 shared DB。缓存命中仍须检查 Key 的 `expires_at`（UTC）；缓存 TTL 不能延长 Key 的有效期。无到期时间的 Key 继续遵守正常缓存 TTL。
+
+MCP 的工具权限检查必须先于群组存储访问、工具使用统计和个人调用日志入队。因 scope 不足而拒绝的请求（包括 notification），以及格式错误的请求，不得为了记录拒绝而创建个人记忆库。这些事件保留在运行日志中，并在启用 shared stats reporter 时计入共享汇总统计。
+
+仅有 `identity:read` 的 Key 调用身份或 MCP 元数据接口时，也不写入可能触发建库的个人统计；即使带有 `X-Memoria-Tool` 或 `X-Tool-Name` Header，行为不变。获准的记忆工具调用仍正常记录使用情况，并可按原有流程首次建库。以上边界不需要新增表或数据库迁移。
+
 ---
 
 ## 4. 最终实现选择：global user pool + qualified tables
