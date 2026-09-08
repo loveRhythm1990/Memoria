@@ -167,12 +167,26 @@ mod tests {
         // Orphan here means missing from Memoria's registry, not missing from
         // MatrixOne's native branch lineage. Use genuine branches so this test
         // exercises the same deletion contract as abandoned branch creation.
-        sqlx::raw_sql("CREATE TABLE mem_branches (table_name VARCHAR(100), status VARCHAR(20)); CREATE TABLE cleanup_source (id INT PRIMARY KEY); INSERT INTO cleanup_source VALUES (7); DATA BRANCH CREATE TABLE br_12345678_registered FROM cleanup_source; DATA BRANCH CREATE TABLE br_12345678_orphan FROM cleanup_source; CREATE TABLE mem_restore_0123456789abcdef0123456789abcdef (id INT); INSERT INTO mem_branches VALUES ('br_12345678_registered', 'inactive')")
-            .execute(&pool).await.unwrap();
         // ASCII clone + quoted rename also works on older MO versions whose
         // native clone parser does not accept a Unicode destination directly.
-        sqlx::raw_sql("DATA BRANCH CREATE TABLE br_12345678_unicode_registered FROM cleanup_source; ALTER TABLE br_12345678_unicode_registered RENAME TO `br_12345678_已有`; DATA BRANCH CREATE TABLE br_12345678_unicode_orphan FROM cleanup_source; ALTER TABLE br_12345678_unicode_orphan RENAME TO `br_12345678_孤儿`; INSERT INTO mem_branches VALUES ('br_12345678_已有', 'active')")
-            .execute(&pool).await.unwrap();
+        // Native DDL must be sent separately for MO 3.0.11: its branch parser
+        // inspects the whole request text instead of just the current statement.
+        for statement in [
+            "CREATE TABLE mem_branches (table_name VARCHAR(100), status VARCHAR(20))",
+            "CREATE TABLE cleanup_source (id INT PRIMARY KEY)",
+            "INSERT INTO cleanup_source VALUES (7)",
+            "DATA BRANCH CREATE TABLE br_12345678_registered FROM cleanup_source",
+            "DATA BRANCH CREATE TABLE br_12345678_orphan FROM cleanup_source",
+            "CREATE TABLE mem_restore_0123456789abcdef0123456789abcdef (id INT)",
+            "INSERT INTO mem_branches VALUES ('br_12345678_registered', 'inactive')",
+            "DATA BRANCH CREATE TABLE br_12345678_unicode_registered FROM cleanup_source",
+            "ALTER TABLE br_12345678_unicode_registered RENAME TO `br_12345678_已有`",
+            "DATA BRANCH CREATE TABLE br_12345678_unicode_orphan FROM cleanup_source",
+            "ALTER TABLE br_12345678_unicode_orphan RENAME TO `br_12345678_孤儿`",
+            "INSERT INTO mem_branches VALUES ('br_12345678_已有', 'active')",
+        ] {
+            sqlx::raw_sql(statement).execute(&pool).await.unwrap();
+        }
         let protected = delete_unregistered(&pool, "br_12345678_registered").await;
         let unicode_protected = delete_unregistered(&pool, "br_12345678_已有").await;
         let unicode_orphan = delete_unregistered(&pool, "br_12345678_孤儿").await;

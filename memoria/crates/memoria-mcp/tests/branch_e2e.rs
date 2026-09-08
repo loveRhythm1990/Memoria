@@ -368,16 +368,28 @@ async fn test_existing_unicode_physical_branch_migrates_and_remains_usable() {
     // CREATE TABLE LIKE has no branch lineage and newer MO correctly rejects
     // DATA BRANCH DELETE on it. Clone to ASCII first, then rename: older MO's
     // native clone parser cannot create a Unicode destination directly.
-    sqlx::raw_sql("DATA BRANCH CREATE TABLE br_1234abcd_legacy FROM mem_memories; ALTER TABLE br_1234abcd_legacy RENAME TO `br_1234abcd_实验`; ALTER TABLE `br_1234abcd_实验` DROP INDEX idx_scope_subject_active; ALTER TABLE `br_1234abcd_实验` DROP COLUMN subject_id")
-        .execute(&pool).await.unwrap();
+    // Execute native DDL separately: MO 3.0.11's branch parser inspects the
+    // original SQL text and cannot handle it inside a multi-statement request.
+    for statement in [
+        "DATA BRANCH CREATE TABLE br_1234abcd_legacy FROM mem_memories",
+        "ALTER TABLE br_1234abcd_legacy RENAME TO `br_1234abcd_实验`",
+        "ALTER TABLE `br_1234abcd_实验` DROP INDEX idx_scope_subject_active",
+        "ALTER TABLE `br_1234abcd_实验` DROP COLUMN subject_id",
+    ] {
+        sqlx::raw_sql(statement).execute(&pool).await.unwrap();
+    }
     // Validate the historical-clone path, then the startup path for an already
     // registered old table. Neither may reject Unicode physical identifiers.
     store
         .ensure_branch_subject_id("br_1234abcd_实验")
         .await
         .unwrap();
-    sqlx::raw_sql("ALTER TABLE `br_1234abcd_实验` DROP INDEX idx_scope_subject_active; ALTER TABLE `br_1234abcd_实验` DROP COLUMN subject_id")
-        .execute(&pool).await.unwrap();
+    for statement in [
+        "ALTER TABLE `br_1234abcd_实验` DROP INDEX idx_scope_subject_active",
+        "ALTER TABLE `br_1234abcd_实验` DROP COLUMN subject_id",
+    ] {
+        sqlx::raw_sql(statement).execute(&pool).await.unwrap();
+    }
     store
         .register_branch(&uid, "已有实验", "br_1234abcd_实验")
         .await
