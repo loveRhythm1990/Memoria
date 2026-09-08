@@ -1840,11 +1840,9 @@ impl SqlMemoryStore {
         // helper instead of plain sqlx::query().execute().
         for bt_raw in &branch_table_names {
             // bt_raw is the raw table name (e.g. br_abc123_my_branch) without DB prefix.
-            // Validate against a strict allowlist before interpolating into DDL.
-            if !bt_raw
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
+            // Use the same allowlist as subject migration: existing physical
+            // names may contain Unicode. self.t() quotes those identifiers.
+            if !memoria_core::is_safe_sql_identifier(bt_raw) {
                 tracing::warn!(
                     "migration: skipping branch table with invalid identifier '{bt_raw}'"
                 );
