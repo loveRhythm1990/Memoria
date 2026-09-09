@@ -312,33 +312,44 @@ async fn existing_parent_and_branch_migrate_with_lineage_intact() {
 }
 
 #[tokio::test]
-async fn unicode_pre_author_branch_migrates_and_remains_usable() {
+async fn unicode_branch_skipped_by_old_author_migration_is_repaired_at_version_2() {
     let (ctx, pool, _) = fixture(false).await;
     call(&ctx, "memory_branch_delete", json!({"name":"工作分支"})).await;
-    // Reconstruct a pre-author/pre-subject deployment BEFORE cloning, so both
-    // tables inherit the same native column identities and legacy data.
+    // Reconstruct the state left by the old migration: it added author_id to
+    // main, skipped the Unicode branch, and still recorded schema version 2.
     for ddl in [
         "ALTER TABLE mem_memories DROP INDEX idx_author",
         "ALTER TABLE mem_memories DROP COLUMN author_id",
-        "ALTER TABLE mem_memories DROP INDEX idx_scope_subject_active",
-        "ALTER TABLE mem_memories DROP COLUMN subject_id",
-        "UPDATE mem_schema_meta SET schema_version=1 WHERE schema_key='user_schema'",
         "DATA BRANCH CREATE TABLE br_1234abcd_legacy FROM mem_memories",
         "ALTER TABLE br_1234abcd_legacy RENAME TO `br_1234abcd_实验`",
+        "ALTER TABLE mem_memories ADD COLUMN author_id VARCHAR(64) DEFAULT NULL",
+        "ALTER TABLE mem_memories ADD INDEX idx_author (author_id)",
+        "UPDATE mem_schema_meta SET schema_version=2 WHERE schema_key='user_schema'",
     ] {
         sqlx::raw_sql(ddl).execute(&pool).await.unwrap();
     }
     let branch = "br_1234abcd_实验";
     let store = ctx.user_store(&ctx.user).await;
-    store.register_branch(&ctx.user, "工作分支", branch).await.unwrap();
+    store
+        .register_branch(&ctx.user, "工作分支", branch)
+        .await
+        .unwrap();
+    let missing_before: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name=? AND column_name='author_id'"
+    ).bind(branch).fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        missing_before, 0,
+        "fixture must model the skipped old migration"
+    );
     store.migrate_user().await.unwrap();
-    // Check the first upgrade, not just a later restart that could mask a
-    // skipped compatibility migration by seeing a current schema version.
+    // The targeted repair must run despite the current schema-version marker.
     for table in ["mem_memories", branch] {
         let count: i64 = sqlx::query_scalar(&format!(
-            "SELECT COUNT(*) FROM `{table}` WHERE subject_id IS NULL AND author_id IS NULL"
+            "SELECT COUNT(*) FROM `{table}` WHERE subject_id='subject-a' AND author_id IS NULL"
         ))
-        .fetch_one(&pool).await.unwrap();
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(count, 4, "legacy data must remain on {table}");
         let index: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name=? AND index_name='idx_author'"
@@ -347,8 +358,13 @@ async fn unicode_pre_author_branch_migrates_and_remains_usable() {
     }
     store.migrate_user().await.unwrap();
     let added = scoped_write(&ctx, "scoped write after Unicode author migration").await;
-    sqlx::query(&format!("UPDATE `{branch}` SET author_id='new-author' WHERE memory_id=?"))
-        .bind(&added).execute(&pool).await.unwrap();
+    sqlx::query(&format!(
+        "UPDATE `{branch}` SET author_id='new-author' WHERE memory_id=?"
+    ))
+    .bind(&added)
+    .execute(&pool)
+    .await
+    .unwrap();
     call(&ctx, "memory_checkout", json!({"name":"工作分支"})).await;
     let memories = ctx.service().list_active(&ctx.user, 100).await.unwrap();
     assert_eq!(memories.len(), 5);
@@ -357,13 +373,22 @@ async fn unicode_pre_author_branch_migrates_and_remains_usable() {
     assert_eq!(memory.subject_id.as_deref(), Some("subject-a"));
     call(&ctx, "memory_checkout", json!({"name":"main"})).await;
     let git = memoria_git::GitForDataService::new(pool.clone(), ctx.user_db_name(&ctx.user).await);
-    let diff = git.diff_branch_rows(branch, "mem_memories", &ctx.user, 100).await.unwrap();
+    let diff = git
+        .diff_branch_rows(branch, "mem_memories", &ctx.user, 100)
+        .await
+        .unwrap();
     assert!(diff.iter().any(|row| row.memory_id == added));
     git.merge_branch(branch, "mem_memories").await.unwrap();
-    let merged: (Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT author_id,subject_id FROM mem_memories WHERE memory_id=?"
-    ).bind(&added).fetch_one(&pool).await.unwrap();
-    assert_eq!(merged, (Some("new-author".into()), Some("subject-a".into())));
+    let merged: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT author_id,subject_id FROM mem_memories WHERE memory_id=?")
+            .bind(&added)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        merged,
+        (Some("new-author".into()), Some("subject-a".into()))
+    );
     call(&ctx, "memory_branch_delete", json!({"name":"工作分支"})).await;
     let remaining: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name=?"
