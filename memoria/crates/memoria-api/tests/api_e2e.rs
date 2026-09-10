@@ -2946,8 +2946,12 @@ async fn test_owner_scoped_master_cannot_cross_user_memory_ids() {
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
+    let corrected_user_a_memory = response.json::<Value>().await.unwrap()["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let response = client
-        .delete(format!("{base}/v1/memories/{user_a_memory}"))
+        .delete(format!("{base}/v1/memories/{corrected_user_a_memory}"))
         .header("Authorization", &owner_auth)
         .header("X-User-Id", &user_a)
         .send()
