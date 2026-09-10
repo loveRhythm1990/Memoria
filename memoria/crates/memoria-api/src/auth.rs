@@ -1075,12 +1075,64 @@ impl FromRequestParts<AppState> for AuthUser {
             request_tool_name(&parts.headers)
         };
 
-        let bearer = parts
+        let authorization = parts
             .headers
             .get("Authorization")
             .and_then(|v| v.to_str().ok())
-            .filter(|v| v.starts_with("Bearer "))
-            .map(|v| &v[7..]);
+            .unwrap_or_default();
+        let owner_scoped_master = authorization.strip_prefix("Memoria-Owner ");
+        let bearer = authorization.strip_prefix("Bearer ");
+
+        // A trusted proxy may authenticate with the deployment master secret
+        // while explicitly attenuating it to one owner.  This is a distinct
+        // scheme so older Memoria servers fail closed with 401 instead of
+        // silently treating the request as an unrestricted Bearer master key.
+        if let Some(token) = owner_scoped_master {
+            let master_match = !state.master_key.is_empty()
+                && token.len() == state.master_key.len()
+                && token.as_bytes().ct_eq(state.master_key.as_bytes()).into();
+            if !master_match {
+                crate::metrics::registry().security.auth_failures.inc();
+                return Err((StatusCode::UNAUTHORIZED, "Invalid token".to_string()));
+            }
+            let user_id = parts
+                .headers
+                .get("X-User-Id")
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| {
+                    !value.is_empty()
+                        && value.trim() == *value
+                        && value.len() <= 128
+                        && !value.chars().any(char::is_control)
+                })
+                .ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "Owner-scoped master authentication requires an exact X-User-Id"
+                            .to_string(),
+                    )
+                })?
+                .to_string();
+            let scopes = parse_scopes("identity:read,memory:read,memory:write");
+            authorize_api_key_route(&parts.method, parts.uri.path(), &scopes)?;
+            if let Some(tool) = tool_name {
+                state.tool_usage_batcher.mark_used(user_id.clone(), tool);
+            }
+            if let Some(ctx) = parts.extensions.get::<CallLogContext>() {
+                if let Ok(mut guard) = ctx.0.lock() {
+                    *guard = Some(user_id.clone());
+                }
+            }
+            return Ok(AuthUser {
+                scope_id: user_id.clone(),
+                group_id: None,
+                user_id,
+                is_master: false,
+                key_id: None,
+                key_prefix: None,
+                scopes,
+            });
+        }
 
         if let Some(token) = bearer {
             // 1) Master key — full access, fall through to X-User-Id extraction

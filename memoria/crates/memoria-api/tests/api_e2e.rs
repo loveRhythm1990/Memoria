@@ -2867,6 +2867,113 @@ async fn test_master_key_can_impersonate_and_access_any_user() {
 }
 
 #[tokio::test]
+async fn test_owner_scoped_master_cannot_cross_user_memory_ids() {
+    let master = "test-master-key-owner-scoped";
+    let (base, client, _server) = spawn_server_with_master_key(master).await;
+    let user_a = uid();
+    let user_b = uid();
+    let owner_auth = format!("Memoria-Owner {master}");
+
+    let store = |user_id: &str, content: &str| {
+        client
+            .post(format!("{base}/v1/memories"))
+            .header("Authorization", &owner_auth)
+            .header("X-User-Id", user_id)
+            .json(&json!({"content": content, "memory_type": "semantic"}))
+            .send()
+    };
+    let response = store(&user_b, "user-b private memory").await.unwrap();
+    assert_eq!(response.status(), 201);
+    let user_b_memory = response.json::<Value>().await.unwrap()["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let response = client
+        .get(format!("{base}/v1/memories/{user_b_memory}"))
+        .header("Authorization", &owner_auth)
+        .header("X-User-Id", &user_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.json::<Value>().await.unwrap(), Value::Null);
+
+    let response = client
+        .put(format!("{base}/v1/memories/{user_b_memory}/correct"))
+        .header("Authorization", &owner_auth)
+        .header("X-User-Id", &user_a)
+        .json(&json!({"new_content": "cross-user overwrite"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+
+    let response = client
+        .delete(format!("{base}/v1/memories/{user_b_memory}"))
+        .header("Authorization", &owner_auth)
+        .header("X-User-Id", &user_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+
+    let response = client
+        .get(format!("{base}/v1/memories/{user_b_memory}"))
+        .header("Authorization", &owner_auth)
+        .header("X-User-Id", &user_b)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["content"],
+        "user-b private memory"
+    );
+
+    let response = store(&user_a, "user-a own memory").await.unwrap();
+    assert_eq!(response.status(), 201);
+    let user_a_memory = response.json::<Value>().await.unwrap()["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let response = client
+        .put(format!("{base}/v1/memories/{user_a_memory}/correct"))
+        .header("Authorization", &owner_auth)
+        .header("X-User-Id", &user_a)
+        .json(&json!({"new_content": "user-a corrected own memory"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let response = client
+        .delete(format!("{base}/v1/memories/{user_a_memory}"))
+        .header("Authorization", &owner_auth)
+        .header("X-User-Id", &user_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+
+    let response = client
+        .get(format!("{base}/admin/stats"))
+        .header("Authorization", &owner_auth)
+        .header("X-User-Id", &user_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+
+    let response = client
+        .get(format!("{base}/v1/memories"))
+        .header("Authorization", &owner_auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+}
+
+#[tokio::test]
 async fn test_non_master_cannot_probe_other_users_memory_ids() {
     let mk = "test-master-key-tenant-isolation";
     let (base, client, _server) = spawn_server_with_master_key(mk).await;
