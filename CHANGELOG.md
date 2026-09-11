@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.2] - 2026-09-11
+
+### 🐛 Bug Fixes
+
+- **auth**: Add owner-scoped master authority (#250) ([bc55ee3](https://github.com/matrixorigin/Memoria/commit/bc55ee355f236cafd0701a107f30e44b1711b3c8))
+- **openclaw**: Ship runnable npm package and preserve search scores (#249) ([61001bc](https://github.com/matrixorigin/Memoria/commit/61001bc8fa47e40eecf907812ad4a9932e59b275))
+- **snapshot**: Preserve data when restoring pre-subject_id snapshots (#248) ([a2e1e25](https://github.com/matrixorigin/Memoria/commit/a2e1e254060b72b74813387dcd357f53cdfeeb0a))
+- **mcp**: Handle ping requests (#237) ([6279342](https://github.com/matrixorigin/Memoria/commit/62793426103d772f856209a3bd4b3ac8fb783a24))
+
+### 📚 Documentation
+
+- Fix broken star history chart (#233) ([85f6c3f](https://github.com/matrixorigin/Memoria/commit/85f6c3fba0c939052500250c42375e460a0bca02))
+
+### 🚀 Features
+
+- **auth**: Add scoped API keys for Astra (#244) ([58012cf](https://github.com/matrixorigin/Memoria/commit/58012cffaea2ab610f4847a877a8dad2048d1eb5))
+
+### Release Notes
+
+- OpenClaw npm and Python SDK packages use separate release workflows; this release tag does not publish them.
+- The legacy snapshot restore fix does not resolve the MatrixOne upgrade failure observed on `v4.2.1-d2393868a-2026-08-28`. See [compatibility and verification notes](docs/legacy-snapshot-compatibility.md) before upgrading a production database.
+
 ## [0.5.1] - 2026-08-26
 
 ### 🐛 Bug Fixes
