@@ -48,7 +48,7 @@ jobs:
           shared-key: memoria-check
           save-if: false
       - name: Unit tests
-        run: cd memoria && cargo test --lib -p memoria-core -p memoria-service -p memoria-mcp
+        run: cd memoria && cargo test --lib -p memoria-api -p memoria-core -p memoria-service -p memoria-mcp
 
   test-db:
     name: DB Tests

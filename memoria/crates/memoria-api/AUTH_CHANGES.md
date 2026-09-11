@@ -122,8 +122,10 @@ are visible in logs.
 ## Auth matrix
 
 Trusted multi-user proxies that hold the deployment master secret must use
-`Authorization: Memoria-Owner <master_key>` together with an exact
-`X-User-Id`. This scheme validates the master secret, then constructs a
+`Authorization: Memoria-Owner <master_key>` together with exactly one
+`X-User-Id` whose value is at most 64 bytes. Missing, duplicate, blank,
+whitespace-padded, or otherwise invalid owner headers are rejected. This
+scheme validates the master secret, then constructs a
 non-master principal limited to identity and memory scopes. It therefore
 retains owner enforcement for ID-based reads and mutations and cannot access
 admin, key-management, group, or unclassified routes. `Bearer <master_key>`
