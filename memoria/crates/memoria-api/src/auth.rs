@@ -67,6 +67,7 @@ fn validate_owner_scoped_master_request(
             !value.is_empty()
                 && value.trim() == *value
                 && value.len() <= MAX_OWNER_SCOPED_USER_ID_LEN
+                && !value.starts_with("grp_")
                 && !value.chars().any(char::is_control)
         })
         .ok_or_else(|| {
@@ -1512,6 +1513,17 @@ mod tests {
         headers.insert("X-User-Id", oversized_owner.parse().unwrap());
         let rejection =
             validate_owner_scoped_master_request("master", "master", &headers).unwrap_err();
+        assert_eq!(rejection.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn owner_scoped_master_rejects_reserved_group_namespace() {
+        let rejection = validate_owner_scoped_master_request(
+            "master",
+            "master",
+            &owner_headers(&["grp_existing_group"]),
+        )
+        .unwrap_err();
         assert_eq!(rejection.0, StatusCode::BAD_REQUEST);
     }
 

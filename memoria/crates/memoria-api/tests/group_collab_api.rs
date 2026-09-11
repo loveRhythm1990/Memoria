@@ -378,6 +378,82 @@ async fn test_solo_owner_group_key_can_write_on_main() {
 
 #[tokio::test]
 #[serial]
+async fn test_owner_scoped_master_cannot_enter_group_database() {
+    let server = spawn_server().await;
+    let group = create_group(&server, "alice").await;
+    let group_id = group["group_id"].as_str().unwrap();
+    let raw_key = create_group_key(&server, "alice", group_id).await;
+    let group_auth = format!("Bearer {raw_key}");
+    let created = store_memory(&server, &group_auth, "group private memory").await;
+    let memory_id = created["memory_id"].as_str().unwrap();
+    let owner_auth = "Memoria-Owner master-group-test-key";
+
+    let response = server
+        .client
+        .get(format!("{}/v1/memories", server.base))
+        .header("Authorization", owner_auth)
+        .header("X-User-Id", group_id)
+        .send()
+        .await
+        .expect("owner-scoped group list attempt");
+    assert_eq!(response.status(), 400);
+
+    let response = server
+        .client
+        .get(format!("{}/v1/memories/{memory_id}", server.base))
+        .header("Authorization", owner_auth)
+        .header("X-User-Id", group_id)
+        .send()
+        .await
+        .expect("owner-scoped group read attempt");
+    assert_eq!(response.status(), 400);
+
+    let response = server
+        .client
+        .post(format!("{}/v1/memories", server.base))
+        .header("Authorization", owner_auth)
+        .header("X-User-Id", group_id)
+        .json(&json!({"content": "unauthorized group write", "memory_type": "semantic"}))
+        .send()
+        .await
+        .expect("owner-scoped group write attempt");
+    assert_eq!(response.status(), 400);
+
+    let response = server
+        .client
+        .put(format!("{}/v1/memories/{memory_id}/correct", server.base))
+        .header("Authorization", owner_auth)
+        .header("X-User-Id", group_id)
+        .json(&json!({"new_content": "unauthorized overwrite"}))
+        .send()
+        .await
+        .expect("owner-scoped group correction attempt");
+    assert_eq!(response.status(), 400);
+
+    let response = server
+        .client
+        .delete(format!("{}/v1/memories/{memory_id}", server.base))
+        .header("Authorization", owner_auth)
+        .header("X-User-Id", group_id)
+        .send()
+        .await
+        .expect("owner-scoped group delete attempt");
+    assert_eq!(response.status(), 400);
+
+    let memories = list_memories(&server, &group_auth).await;
+    let items = memories["items"].as_array().unwrap();
+    assert!(items.iter().any(|item| {
+        item["memory_id"] == memory_id && item["content"] == "group private memory"
+    }));
+    assert!(!items
+        .iter()
+        .any(|item| item["content"] == "unauthorized group write"));
+
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
 async fn test_create_group_can_seed_from_personal_db() {
     let server = spawn_server().await;
 
