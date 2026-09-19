@@ -1513,6 +1513,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn missing_session_id_preserves_message_and_input_classification() {
+        for args in [
+            json!({"session_scope":"only"}),
+            json!({"session_scope":"only", "session_id":"  "}),
+        ] {
+            let error = parse_retrieve_options_arg(&args)
+                .err()
+                .expect("missing session id");
+            let message = "session_id is required when session_scope is set";
+            assert_eq!(error.to_string(), message);
+            let result = crate::tool_result::execution_error("memory_search", error);
+            assert_eq!(
+                crate::tool_result::error_kind(&result),
+                Some(crate::tool_result::ErrorKind::Input)
+            );
+            assert_eq!(result["content"][0]["text"], message);
+        }
+    }
+
+    #[test]
     fn parse_required_str_rejects_missing_and_blank() {
         for val in [json!({}), json!({"k": ""}), json!({"k": "   \t\n"})] {
             assert!(parse_required_str(&val, "k", "k is required").is_err());

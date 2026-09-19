@@ -21,8 +21,20 @@ impl ErrorKind {
 const ERROR_KIND: &str = "io.matrixorigin.memoria/errorKind";
 
 pub(crate) fn input_error(message: impl std::fmt::Display) -> anyhow::Error {
-    memoria_core::MemoriaError::Validation(message.to_string()).into()
+    InputError(message.to_string()).into()
 }
+
+/// Add input classification without changing the legacy user-facing message.
+#[derive(Debug)]
+struct InputError(String);
+
+impl std::fmt::Display for InputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InputError {}
 
 pub fn classified_error(kind: ErrorKind, text: impl std::fmt::Display) -> Value {
     json!({"content": [{"type": "text", "text": text.to_string()}], "isError": true,
@@ -72,6 +84,7 @@ pub(crate) fn execution_error(tool: &str, error: impl Into<anyhow::Error>) -> Va
             | MemoriaError::InvalidTrustTier(_),
         ) => ErrorKind::Input,
         Some(MemoriaError::NotFound(_) | MemoriaError::Blocked(_)) => ErrorKind::Rejected,
+        _ if error.is::<InputError>() => ErrorKind::Input,
         _ => error
             .downcast_ref::<RemoteError>()
             .map(|e| e.kind)
@@ -125,6 +138,16 @@ fn may_mutate(tool: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_classification_preserves_the_original_message() {
+        let message = "session_id is required when session_scope is set";
+        let error = input_error(message);
+        assert_eq!(error.to_string(), message);
+        let result = execution_error("memory_correct", error);
+        assert_eq!(error_kind(&result), Some(ErrorKind::Input));
+        assert_eq!(result["content"][0]["text"], message);
+    }
 
     #[test]
     fn only_mutations_warn_about_partial_writes() {
