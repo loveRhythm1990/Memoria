@@ -280,8 +280,10 @@ pub async fn mcp_handler(
 
     // Control notifications are not business calls. Authentication and request
     // validation have already run; keep them out of usage/error statistics.
+    // This intentionally includes initialized and its agent-header usage marker;
+    // the initialize request remains an accounted handshake call.
     // Do not bypass tool authorization for arbitrary id-less tools/call messages.
-    if req.get("id").is_none() && memoria_mcp::accept_notification(&method) {
+    if memoria_mcp::accept_notification(&method, req.get("id")) {
         return StatusCode::NO_CONTENT.into_response();
     }
 
@@ -573,6 +575,7 @@ mod tests {
         use axum::response::IntoResponse;
         let state = test_state();
         for method in [
+            "notifications/initialized",
             "notifications/cancelled",
             "notifications/roots/list_changed",
             "notifications/trae/session_stop",
@@ -593,6 +596,25 @@ mod tests {
         }
         assert!(state.call_log_batcher.pending_rpc_outcomes().is_empty());
         // An id-less tool call is not a control notification and cannot bypass scopes.
+        use tracing::instrument::WithSubscriber;
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let capture = Capture(Default::default());
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
         let response = super::mcp_handler(
             axum::extract::State(state.clone()),
             test_auth(vec![]),
@@ -601,6 +623,7 @@ mod tests {
                 "params":{"name":"memory_store", "arguments":{"content":"denied"}}})
             .to_string(),
         )
+        .with_subscriber(subscriber)
         .await
         .into_response();
         assert_eq!(response.status(), 204);
@@ -608,6 +631,37 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+        let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("MCP scope admission denied"), "{logs}");
+        assert!(logs.contains("/mcp/memory_store"), "{logs}");
+        assert!(logs.contains("-32003"), "{logs}");
+        assert!(state.call_log_batcher.pending_rpc_outcomes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn notification_methods_with_ids_are_not_successful_calls() {
+        use axum::response::IntoResponse;
+        let state = test_state();
+        for id in [json!(7), json!("request"), serde_json::Value::Null] {
+            let response = super::mcp_handler(
+                axum::extract::State(state.clone()),
+                test_auth(vec![SCOPE_MEMORY_READ.into()]),
+                Default::default(),
+                json!({"jsonrpc":"2.0","id":id,"method":"notifications/cancelled"}).to_string(),
+            )
+            .await;
+            let body = axum::body::to_bytes(response.into_response().into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["id"], id);
+            assert_eq!(body["error"]["code"], -32601);
+            assert!(body.get("result").is_none());
+        }
+        assert_eq!(
+            state.call_log_batcher.pending_rpc_outcomes(),
+            vec![(false, Some(-32601)); 3]
+        );
     }
 
     // ── tools/call — happy path ───────────────────────────────────────────────

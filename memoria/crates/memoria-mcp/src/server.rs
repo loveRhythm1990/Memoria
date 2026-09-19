@@ -28,10 +28,18 @@ struct Request {
     #[serde(default)]
     #[allow(dead_code)]
     jsonrpc: String,
+    #[serde(default, deserialize_with = "present_id")]
     id: Option<Value>,
     method: String,
     #[serde(default)]
     params: Option<Value>,
+}
+
+// Preserve explicit null as a present id; only an absent member is a notification.
+fn present_id<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
 }
 
 #[derive(Serialize)]
@@ -49,7 +57,6 @@ enum RpcMethod {
     Ping,
     ToolsList,
     ToolsCall,
-    NotificationsInitialized,
     Unknown(String),
 }
 
@@ -59,14 +66,13 @@ fn parse_rpc_method(method: &str) -> RpcMethod {
         "ping" => RpcMethod::Ping,
         "tools/list" => RpcMethod::ToolsList,
         "tools/call" => RpcMethod::ToolsCall,
-        "notifications/initialized" => RpcMethod::NotificationsInitialized,
         _ => RpcMethod::Unknown(method.to_string()),
     }
 }
 
 /// Accept control notifications without invoking tools or storage.
-pub fn accept_notification(method: &str) -> bool {
-    if !method.starts_with("notifications/") {
+pub fn accept_notification(method: &str, id: Option<&Value>) -> bool {
+    if id.is_some() || !method.starts_with("notifications/") {
         return false;
     }
     if method == "notifications/cancelled" {
@@ -230,10 +236,16 @@ fn sse_router(
             let method = req["method"].as_str().unwrap_or("").to_string();
             // Only a valid request without an id is a notification. Malformed
             // payloads still need an Invalid Request response, even without id.
-            if !req.is_object() || req["jsonrpc"] != "2.0" || method.is_empty() {
-                let resp = serde_json::json!({"jsonrpc":"2.0","id":null,
+            // Preserve the legacy endpoint's jsonrpc-field compatibility here;
+            // tightening envelope validation is separate from notification handling.
+            if !req.is_object() || method.is_empty() {
+                let response_id = req.get("id").filter(|id| id.is_string() || id.is_number()).cloned().unwrap_or(Value::Null);
+                let resp = serde_json::json!({"jsonrpc":"2.0","id":response_id,
                     "error":{"code":-32600,"message":"Invalid Request"}});
                 let _ = s.tx.send(serde_json::to_string(&resp).unwrap_or_default());
+                return;
+            }
+            if accept_notification(&method, req.get("id")) {
                 return;
             }
             let params = req["params"].clone();
@@ -304,6 +316,9 @@ async fn run_io(
 
         let id = req.id.clone().unwrap_or(Value::Null);
 
+        if accept_notification(&req.method, req.id.as_ref()) {
+            continue;
+        }
         if req.id.is_none() {
             let _ = dispatch(&req.method, req.params, &mode, &user_id).await;
             continue;
@@ -350,9 +365,6 @@ async fn dispatch(
     mode: &Mode,
     user_id: &str,
 ) -> Result<Value, McpRpcError> {
-    if accept_notification(method) {
-        return Ok(Value::Null);
-    }
     let p = params.unwrap_or(Value::Null);
     let method = parse_rpc_method(method);
     match method {
@@ -392,7 +404,6 @@ async fn dispatch(
                 }
             }
         }
-        RpcMethod::NotificationsInitialized => Ok(Value::Null),
         RpcMethod::Unknown(method) => Err(McpRpcError {
             code: -32601,
             message: format!("Method not found: {method}"),
@@ -407,9 +418,6 @@ async fn dispatch_embedded_owned(
     git: Arc<GitForDataService>,
     user_id: String,
 ) -> Result<Value, McpRpcError> {
-    if accept_notification(&method) {
-        return Ok(Value::Null);
-    }
     let p = params.unwrap_or(Value::Null);
     let method = parse_rpc_method(&method);
     match method {
@@ -444,7 +452,6 @@ async fn dispatch_embedded_owned(
                     .map_err(internal_err)
             }
         }
-        RpcMethod::NotificationsInitialized => Ok(Value::Null),
         RpcMethod::Unknown(method) => Err(McpRpcError {
             code: -32601,
             message: format!("Method not found: {method}"),
@@ -473,6 +480,7 @@ mod tests {
             None,
         ));
         let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":42}}\n",
             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/roots/list_changed\"}\n",
             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/trae/session_stop\"}\n",
@@ -494,7 +502,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn notification_dispatch_accepts_standard_and_vendor_methods() {
+    async fn control_notifications_are_accepted_only_at_request_boundaries() {
         let mode = Mode::Remote(RemoteClient::new(
             "http://127.0.0.1:1",
             None,
@@ -517,20 +525,28 @@ mod tests {
             "notifications/roots/list_changed",
             "notifications/trae/session_stop",
         ] {
-            assert!(dispatch(method, None, &mode, "test")
+            assert!(super::accept_notification(method, None));
+            assert!(!super::accept_notification(method, Some(&json!(1))));
+            assert_eq!(
+                dispatch(method, None, &mode, "test")
+                    .await
+                    .unwrap_err()
+                    .code,
+                -32601
+            );
+            assert_eq!(
+                super::dispatch_http(
+                    method.into(),
+                    None,
+                    service.clone(),
+                    git.clone(),
+                    "test".into()
+                )
                 .await
-                .unwrap()
-                .is_null());
-            assert!(super::dispatch_http(
-                method.into(),
-                None,
-                service.clone(),
-                git.clone(),
-                "test".into()
-            )
-            .await
-            .unwrap()
-            .is_null());
+                .unwrap_err()
+                .code,
+                -32601
+            );
         }
         assert_eq!(
             dispatch("resources/list", None, &mode, "test")
@@ -539,7 +555,42 @@ mod tests {
                 .code,
             -32601
         );
-        assert!(!super::accept_notification("tools/call"));
+        assert!(!super::accept_notification("tools/call", None));
+    }
+
+    #[tokio::test]
+    async fn stdio_notification_methods_with_ids_are_requests() {
+        let mode = Mode::Remote(RemoteClient::new(
+            "http://127.0.0.1:1",
+            None,
+            "test".into(),
+            None,
+        ));
+        let mut input = String::new();
+        for id in [json!(7), json!("request"), serde_json::Value::Null] {
+            input.push_str(
+                &json!({"jsonrpc":"2.0","id":id,"method":"notifications/cancelled"}).to_string(),
+            );
+            input.push('\n');
+        }
+        let mut output = Vec::new();
+        super::run_io(input.as_bytes(), &mut output, mode, "test".into())
+            .await
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        let messages: Vec<serde_json::Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(messages.len(), 3);
+        for (message, id) in
+            messages
+                .iter()
+                .zip([json!(7), json!("request"), serde_json::Value::Null])
+        {
+            assert_eq!(message["id"], id);
+            assert_eq!(message["error"]["code"], -32601);
+        }
     }
 
     #[tokio::test]
@@ -606,6 +657,43 @@ mod tests {
         assert!(String::from_utf8(invalid.to_vec())
             .unwrap()
             .contains("-32600"));
+        for (request, code) in [
+            (json!({"id":7,"method":42}), Some(-32600)),
+            (json!({"id":"legacy","method":"tools/list"}), None),
+            (
+                json!({"jsonrpc":"2.0","id":9,"method":"notifications/cancelled"}),
+                Some(-32601),
+            ),
+        ] {
+            client
+                .post(format!("http://{address}/message"))
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            // A large tools/list event can span multiple HTTP chunks.
+            let bytes = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let mut bytes = Vec::new();
+                while !bytes.windows(2).any(|window| window == b"\n\n") {
+                    bytes.extend_from_slice(&stream.chunk().await.unwrap().unwrap());
+                }
+                bytes
+            })
+            .await
+            .unwrap();
+            let text = String::from_utf8(bytes).unwrap();
+            let data = text
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap();
+            let response: serde_json::Value = serde_json::from_str(data).unwrap();
+            assert_eq!(response["id"], request["id"]);
+            if let Some(code) = code {
+                assert_eq!(response["error"]["code"], code);
+            } else {
+                assert!(response.get("result").is_some());
+            }
+        }
         server.abort();
     }
 
