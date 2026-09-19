@@ -64,6 +64,26 @@ fn parse_rpc_method(method: &str) -> RpcMethod {
     }
 }
 
+/// Accept control notifications without invoking tools or storage.
+pub fn accept_notification(method: &str) -> bool {
+    if !method.starts_with("notifications/") {
+        return false;
+    }
+    if method == "notifications/cancelled" {
+        // Intentionally a no-op: execution tracking and cooperative cancellation
+        // are follow-up #256. In particular, aborting the HTTP waiter would not
+        // stop its spawn_blocking worker, and stdio currently dispatches serially.
+        tracing::debug!(
+            "MCP cancellation accepted; execution cancellation is not implemented (#256)"
+        );
+    } else {
+        // Roots are not used by this server. Unknown vendor notifications are
+        // ignored as well; accepting them does not advertise their capability.
+        tracing::debug!(method, "MCP notification accepted");
+    }
+    true
+}
+
 const GIT_TOOL_NAMES: &[&str] = &[
     "memory_snapshot",
     "memory_snapshots",
@@ -145,6 +165,21 @@ pub async fn run_sse(
     user_id: String,
     port: u16,
 ) -> Result<()> {
+    let app = sse_router(service, git, user_id);
+    let addr = format!("0.0.0.0:{port}");
+    tracing::info!("Memoria MCP SSE transport listening on {addr}");
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    Ok(())
+}
+
+fn sse_router(
+    service: Arc<MemoryService>,
+    git: Arc<GitForDataService>,
+    user_id: String,
+) -> axum::Router {
     use axum::{
         extract::State,
         response::sse::{Event, Sse},
@@ -171,7 +206,7 @@ pub async fn run_sse(
         user_id,
     };
 
-    let app = Router::new()
+    Router::new()
         .route("/sse", get(|State(s): State<SseState>| async move {
             let rx = s.tx.subscribe();
             let stream = stream::unfold(rx, |mut rx| async move {
@@ -193,6 +228,14 @@ pub async fn run_sse(
             };
             let id = req["id"].clone();
             let method = req["method"].as_str().unwrap_or("").to_string();
+            // Only a valid request without an id is a notification. Malformed
+            // payloads still need an Invalid Request response, even without id.
+            if !req.is_object() || req["jsonrpc"] != "2.0" || method.is_empty() {
+                let resp = serde_json::json!({"jsonrpc":"2.0","id":null,
+                    "error":{"code":-32600,"message":"Invalid Request"}});
+                let _ = s.tx.send(serde_json::to_string(&resp).unwrap_or_default());
+                return;
+            }
             let params = req["params"].clone();
             let result = dispatch_http(
                 method,
@@ -202,21 +245,16 @@ pub async fn run_sse(
                 s.user_id.clone(),
             )
             .await;
+            if req.get("id").is_none() {
+                return;
+            }
             let resp = match result {
                 Ok(v) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":if v.is_null(){serde_json::json!({})}else{v}}),
                 Err(e) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":e.code,"message":e.message}}),
             };
             let _ = s.tx.send(serde_json::to_string(&resp).unwrap_or_default());
         }))
-        .with_state(state);
-
-    let addr = format!("0.0.0.0:{port}");
-    tracing::info!("Memoria MCP SSE transport listening on {addr}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    Ok(())
+        .with_state(state)
 }
 
 enum Mode {
@@ -228,8 +266,15 @@ enum Mode {
 }
 
 async fn run_loop(mode: Mode, user_id: String) -> Result<()> {
-    let stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
+    run_io(tokio::io::stdin(), tokio::io::stdout(), mode, user_id).await
+}
+
+async fn run_io(
+    stdin: impl tokio::io::AsyncRead + Unpin,
+    mut stdout: impl tokio::io::AsyncWrite + Unpin,
+    mode: Mode,
+    user_id: String,
+) -> Result<()> {
     let mut reader = BufReader::new(stdin).lines();
 
     loop {
@@ -288,7 +333,10 @@ async fn run_loop(mode: Mode, user_id: String) -> Result<()> {
     Ok(())
 }
 
-async fn write_line(stdout: &mut tokio::io::Stdout, v: &impl Serialize) -> Result<()> {
+async fn write_line(
+    stdout: &mut (impl tokio::io::AsyncWrite + Unpin),
+    v: &impl Serialize,
+) -> Result<()> {
     let mut line = serde_json::to_string(v)?;
     line.push('\n');
     stdout.write_all(line.as_bytes()).await?;
@@ -302,6 +350,9 @@ async fn dispatch(
     mode: &Mode,
     user_id: &str,
 ) -> Result<Value, McpRpcError> {
+    if accept_notification(method) {
+        return Ok(Value::Null);
+    }
     let p = params.unwrap_or(Value::Null);
     let method = parse_rpc_method(method);
     match method {
@@ -356,6 +407,9 @@ async fn dispatch_embedded_owned(
     git: Arc<GitForDataService>,
     user_id: String,
 ) -> Result<Value, McpRpcError> {
+    if accept_notification(&method) {
+        return Ok(Value::Null);
+    }
     let p = params.unwrap_or(Value::Null);
     let method = parse_rpc_method(&method);
     match method {
@@ -408,6 +462,151 @@ mod tests {
     #[test]
     fn ping_is_a_known_rpc_method() {
         assert!(matches!(parse_rpc_method("ping"), RpcMethod::Ping));
+    }
+
+    #[tokio::test]
+    async fn stdio_notifications_are_silent_and_do_not_break_following_requests() {
+        let mode = Mode::Remote(RemoteClient::new(
+            "http://127.0.0.1:1",
+            None,
+            "test".into(),
+            None,
+        ));
+        let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":42}}\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/roots/list_changed\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/trae/session_stop\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":\"after\"}\n"
+        );
+        let mut output = Vec::new();
+        super::run_io(input.as_bytes(), &mut output, mode, "test".into())
+            .await
+            .unwrap();
+        let messages: Vec<serde_json::Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            messages,
+            vec![json!({"jsonrpc":"2.0", "id":"after", "result":{}})]
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_dispatch_accepts_standard_and_vendor_methods() {
+        let mode = Mode::Remote(RemoteClient::new(
+            "http://127.0.0.1:1",
+            None,
+            "test".into(),
+            None,
+        ));
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://test:test@127.0.0.1/test")
+            .unwrap();
+        let store = std::sync::Arc::new(memoria_storage::SqlMemoryStore::new(
+            pool.clone(),
+            3,
+            "test".into(),
+        ));
+        let service = std::sync::Arc::new(memoria_service::MemoryService::new(store, None, None));
+        let git = std::sync::Arc::new(memoria_git::GitForDataService::new(pool, "test"));
+        for method in [
+            "notifications/initialized",
+            "notifications/cancelled",
+            "notifications/roots/list_changed",
+            "notifications/trae/session_stop",
+        ] {
+            assert!(dispatch(method, None, &mode, "test")
+                .await
+                .unwrap()
+                .is_null());
+            assert!(super::dispatch_http(
+                method.into(),
+                None,
+                service.clone(),
+                git.clone(),
+                "test".into()
+            )
+            .await
+            .unwrap()
+            .is_null());
+        }
+        assert_eq!(
+            dispatch("resources/list", None, &mode, "test")
+                .await
+                .unwrap_err()
+                .code,
+            -32601
+        );
+        assert!(!super::accept_notification("tools/call"));
+    }
+
+    #[tokio::test]
+    async fn sse_notifications_do_not_emit_json_rpc_responses() {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://test:test@127.0.0.1/test")
+            .unwrap();
+        let store = std::sync::Arc::new(memoria_storage::SqlMemoryStore::new(
+            pool.clone(),
+            3,
+            "test".into(),
+        ));
+        let service = std::sync::Arc::new(memoria_service::MemoryService::new(store, None, None));
+        let git = std::sync::Arc::new(memoria_git::GitForDataService::new(pool, "test"));
+        let app = super::sse_router(service, git, "test".into());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let mut stream = client
+            .get(format!("http://{address}/sse"))
+            .send()
+            .await
+            .unwrap();
+        for method in [
+            "notifications/cancelled",
+            "notifications/roots/list_changed",
+            "notifications/trae/session_stop",
+        ] {
+            client
+                .post(format!("http://{address}/message"))
+                .json(&json!({"jsonrpc":"2.0","method":method}))
+                .send()
+                .await
+                .unwrap();
+        }
+        client
+            .post(format!("http://{address}/message"))
+            .json(&json!({"jsonrpc":"2.0","method":"ping","id":"after"}))
+            .send()
+            .await
+            .unwrap();
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), stream.chunk())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8(chunk.to_vec()).unwrap();
+        assert!(text.contains("\"id\":\"after\""), "{text}");
+        assert!(!text.contains("\"id\":null"), "{text}");
+        client
+            .post(format!("http://{address}/message"))
+            .json(&json!([]))
+            .send()
+            .await
+            .unwrap();
+        let invalid = tokio::time::timeout(std::time::Duration::from_secs(2), stream.chunk())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8(invalid.to_vec())
+            .unwrap()
+            .contains("-32600"));
+        server.abort();
     }
 
     #[tokio::test]

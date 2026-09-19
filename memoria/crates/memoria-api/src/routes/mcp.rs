@@ -278,6 +278,13 @@ pub async fn mcp_handler(
         return Json(json!({"jsonrpc": "2.0", "id": id, "result": {}})).into_response();
     }
 
+    // Control notifications are not business calls. Authentication and request
+    // validation have already run; keep them out of usage/error statistics.
+    // Do not bypass tool authorization for arbitrary id-less tools/call messages.
+    if req.get("id").is_none() && memoria_mcp::accept_notification(&method) {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
     let params = req.get("params").cloned();
     let track_path = tracking_path(&method, params.as_ref());
     let tracked_tool = if method == "tools/call" {
@@ -534,6 +541,74 @@ mod tests {
     use super::{mcp_tool_dirty_mask, mcp_tool_required_scope, tracking_path};
     use crate::auth::{SCOPE_MEMORY_READ, SCOPE_MEMORY_WRITE};
     use serde_json::json;
+
+    fn test_state() -> crate::state::AppState {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://test:test@127.0.0.1/test")
+            .unwrap();
+        let store = std::sync::Arc::new(memoria_storage::SqlMemoryStore::new(
+            pool.clone(),
+            3,
+            "test".into(),
+        ));
+        let service = std::sync::Arc::new(memoria_service::MemoryService::new(store, None, None));
+        let git = std::sync::Arc::new(memoria_git::GitForDataService::new(pool, "test"));
+        crate::state::AppState::new(service, git, "test-master".into())
+    }
+
+    fn test_auth(scopes: Vec<String>) -> crate::auth::AuthUser {
+        crate::auth::AuthUser {
+            user_id: "test".into(),
+            scope_id: "test".into(),
+            group_id: None,
+            is_master: false,
+            key_id: None,
+            key_prefix: None,
+            scopes,
+        }
+    }
+
+    #[tokio::test]
+    async fn control_notifications_have_no_body_or_call_log() {
+        use axum::response::IntoResponse;
+        let state = test_state();
+        for method in [
+            "notifications/cancelled",
+            "notifications/roots/list_changed",
+            "notifications/trae/session_stop",
+        ] {
+            let response = super::mcp_handler(
+                axum::extract::State(state.clone()),
+                test_auth(vec![crate::auth::SCOPE_MEMORY_READ.into()]),
+                Default::default(),
+                json!({"jsonrpc":"2.0", "method":method, "params":{"requestId":42}}).to_string(),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), 204);
+            assert!(axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        assert!(state.call_log_batcher.pending_rpc_outcomes().is_empty());
+        // An id-less tool call is not a control notification and cannot bypass scopes.
+        let response = super::mcp_handler(
+            axum::extract::State(state.clone()),
+            test_auth(vec![]),
+            Default::default(),
+            json!({"jsonrpc":"2.0", "method":"tools/call",
+                "params":{"name":"memory_store", "arguments":{"content":"denied"}}})
+            .to_string(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), 204);
+        assert!(axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap()
+            .is_empty());
+    }
 
     // ── tools/call — happy path ───────────────────────────────────────────────
 

@@ -941,6 +941,16 @@ impl Default for CallLogBatcher {
 }
 
 impl CallLogBatcher {
+    #[cfg(test)]
+    pub(crate) fn pending_rpc_outcomes(&self) -> Vec<(bool, Option<i32>)> {
+        self.pending
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|entry| (entry.rpc_success, entry.rpc_error_code))
+            .collect()
+    }
+
     pub fn new() -> Self {
         Self {
             pending: Mutex::new(Vec::new()),
