@@ -128,7 +128,7 @@ pub fn validate_tool_call(params: Option<&Value>) -> Result<(String, Value), Mcp
         return Err(invalid(format!("Unknown tool: {name}")));
     }
     let args = match p.get("arguments") {
-        None => json!({}),
+        None | Some(Value::Null) => json!({}),
         Some(value) if value.is_object() => value.clone(),
         Some(_) => return Err(invalid("tools/call arguments must be an object".into())),
     };
@@ -411,16 +411,20 @@ async fn dispatch(
                 Mode::Remote(client) => Ok(client
                     .call(&name, args)
                     .await
-                    .unwrap_or_else(crate::tool_result::execution_error)),
+                    .unwrap_or_else(|error| crate::tool_result::execution_error(&name, error))),
                 Mode::Embedded { service, git } => {
                     if is_git_tool(&name) {
                         Ok(git_tools::call(&name, args, git, service, user_id)
                             .await
-                            .unwrap_or_else(crate::tool_result::execution_error))
+                            .unwrap_or_else(|error| {
+                                crate::tool_result::execution_error(&name, error)
+                            }))
                     } else {
                         Ok(tools::call(&name, args, service, user_id)
                             .await
-                            .unwrap_or_else(crate::tool_result::execution_error))
+                            .unwrap_or_else(|error| {
+                                crate::tool_result::execution_error(&name, error)
+                            }))
                     }
                 }
             }
@@ -456,13 +460,15 @@ async fn dispatch_embedded_owned(
         RpcMethod::ToolsCall => {
             let (name, args) = validate_tool_call(Some(&p))?;
             if is_git_tool(&name) {
-                Ok(git_tools::call_owned(name, args, git, service, user_id)
-                    .await
-                    .unwrap_or_else(crate::tool_result::execution_error))
+                Ok(
+                    git_tools::call_owned(name.clone(), args, git, service, user_id)
+                        .await
+                        .unwrap_or_else(|error| crate::tool_result::execution_error(&name, error)),
+                )
             } else {
-                Ok(tools::call_owned(name, args, service, user_id)
+                Ok(tools::call_owned(name.clone(), args, service, user_id)
                     .await
-                    .unwrap_or_else(crate::tool_result::execution_error))
+                    .unwrap_or_else(|error| crate::tool_result::execution_error(&name, error)))
             }
         }
         RpcMethod::Unknown(method) => Err(McpRpcError {
@@ -482,6 +488,33 @@ mod tests {
     #[test]
     fn ping_is_a_known_rpc_method() {
         assert!(matches!(parse_rpc_method("ping"), RpcMethod::Ping));
+    }
+
+    #[test]
+    fn null_arguments_preserve_legacy_compatibility() {
+        for name in [
+            "memory_capabilities",
+            "memory_branches",
+            "memory_tune_params",
+            "memory_get_retrieval_params",
+        ] {
+            for params in [json!({"name":name}), json!({"name":name,"arguments":null})] {
+                assert_eq!(
+                    super::validate_tool_call(Some(&params)).unwrap().1,
+                    json!({})
+                );
+            }
+        }
+        for args in [json!([]), json!("invalid"), json!(42)] {
+            assert_eq!(
+                super::validate_tool_call(Some(
+                    &json!({"name":"memory_capabilities", "arguments":args})
+                ))
+                .unwrap_err()
+                .code,
+                -32602
+            );
+        }
     }
 
     #[tokio::test]

@@ -57,10 +57,45 @@ async fn git_call_text(
     let result = memoria_mcp::git_tools::call(tool, args, &state.git, &state.service, user_id)
         .await
         .map_err(api_err_typed)?;
-    Ok(result["content"][0]["text"]
+    git_result_text(&result)
+}
+
+fn git_result_text(result: &Value) -> Result<String, (StatusCode, String)> {
+    let text = result["content"][0]["text"]
         .as_str()
         .unwrap_or("")
-        .to_string())
+        .to_string();
+    use memoria_mcp::tool_result::{error_kind, ErrorKind};
+    match error_kind(result) {
+        Some(ErrorKind::Input) => Err((StatusCode::BAD_REQUEST, text)),
+        Some(ErrorKind::Rejected) => Err((StatusCode::CONFLICT, text)),
+        Some(ErrorKind::Backend) => Err((StatusCode::INTERNAL_SERVER_ERROR, text)),
+        None => Ok(text),
+    }
+}
+
+#[cfg(test)]
+mod tool_result_tests {
+    use super::*;
+    use memoria_mcp::tool_result::{classified_error, ErrorKind};
+
+    #[test]
+    fn delegated_tool_failures_are_http_errors() {
+        for (kind, status) in [
+            (ErrorKind::Input, StatusCode::BAD_REQUEST),
+            (ErrorKind::Rejected, StatusCode::CONFLICT),
+            (ErrorKind::Backend, StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            assert_eq!(
+                git_result_text(&classified_error(kind, "failure")),
+                Err((status, "failure".into()))
+            );
+        }
+        assert_eq!(
+            git_result_text(&json!({"content":[{"type":"text","text":"done"}]})),
+            Ok("done".into())
+        );
+    }
 }
 
 async fn git_call(
@@ -87,10 +122,7 @@ async fn git_call_pick(
                 }
                 other => api_err_typed(other),
             })?;
-    let text = result["content"][0]["text"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
+    let text = git_result_text(&result)?;
     Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({ "result": text })))
 }
 
@@ -899,12 +931,6 @@ pub async fn create_branch(
         }),
     )
     .await?;
-    // MCP returns success with "already exists" text — surface as 409 Conflict
-    if let Some(text) = r["content"][0]["text"].as_str() {
-        if text.contains("already exists") {
-            return Err((StatusCode::CONFLICT, text.to_string()));
-        }
-    }
     Ok((StatusCode::CREATED, Json(r)))
 }
 

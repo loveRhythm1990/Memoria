@@ -189,6 +189,26 @@ fn spawn_metrics_dirty_mark(
     });
 }
 
+fn result_outcome(method: &str, result: &serde_json::Value) -> RpcMeta {
+    let mut rpc = RpcMeta::ok();
+    if method == "tools/call" {
+        let kind = memoria_mcp::tool_result::error_kind(result);
+        rpc.tool_success = Some(kind.is_none());
+        rpc.tool_error_kind = kind.map(|kind| kind.as_str());
+    }
+    rpc
+}
+
+fn report_tool_outcome(tool: Option<&str>, rpc: &RpcMeta) {
+    if let Some(kind) = rpc.tool_error_kind {
+        if kind == "backend" {
+            tracing::warn!(tool, kind, "MCP tool backend failure");
+        } else {
+            tracing::debug!(tool, kind, "MCP tool input or operation rejected");
+        }
+    }
+}
+
 pub async fn mcp_handler(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -466,7 +486,7 @@ pub async fn mcp_handler(
         )
         .await;
         let rpc = match &dispatch_result {
-            Ok(_) => RpcMeta::ok(),
+            Ok(result) => result_outcome(&method, result),
             Err(e) => RpcMeta::err(e.code),
         };
         let tool_success = dispatch_result
@@ -477,12 +497,13 @@ pub async fn mcp_handler(
                 spawn_metrics_dirty_mark(state.clone(), scope_id.clone(), mask);
             }
         }
-        // Operational statistics include execution failures; call logs below
-        // retain the separate protocol outcome.
-        if rpc.success && !tool_success {
-            tracing::warn!(tool = ?tracked_tool, "MCP tool execution failed (protocol exchange succeeded)");
-        }
-        report_stats(&track_path, tool_success);
+        // Service health excludes expected input/rejection errors; call logs
+        // retain both protocol and tool outcomes.
+        report_tool_outcome(tracked_tool.as_deref(), &rpc);
+        report_stats(
+            &track_path,
+            rpc.success && rpc.tool_error_kind != Some("backend"),
+        );
         record_call(204, rpc);
         return StatusCode::NO_CONTENT.into_response();
     }
@@ -525,10 +546,11 @@ pub async fn mcp_handler(
     {
         Ok(v) => {
             let tool_success = !memoria_mcp::tool_result::is_error(&v);
+            let rpc = result_outcome(&method, &v);
             let result = if v.is_null() { json!({}) } else { v };
             (
                 Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response(),
-                RpcMeta::ok(),
+                rpc,
                 tool_success,
             )
         }
@@ -550,12 +572,13 @@ pub async fn mcp_handler(
         }
     }
 
-    // Call logs describe protocol success. Aggregate operational statistics
-    // retain execution failures, so isError does not hide backend outages.
-    if rpc.success && !tool_success {
-        tracing::warn!(tool = ?tracked_tool, "MCP tool execution failed (protocol exchange succeeded)");
-    }
-    report_stats(&track_path, tool_success);
+    // Service health excludes input/rejection errors; the per-tool call log
+    // retains every execution failure and its classification separately.
+    report_tool_outcome(tracked_tool.as_deref(), &rpc);
+    report_stats(
+        &track_path,
+        rpc.success && rpc.tool_error_kind != Some("backend"),
+    );
     record_call(200, rpc);
 
     response
@@ -566,6 +589,26 @@ mod tests {
     use super::{mcp_tool_dirty_mask, mcp_tool_required_scope, tracking_path};
     use crate::auth::{SCOPE_MEMORY_READ, SCOPE_MEMORY_WRITE};
     use serde_json::json;
+
+    #[test]
+    fn protocol_and_tool_outcomes_remain_separate() {
+        use memoria_mcp::tool_result::{classified_error, ErrorKind};
+        for kind in [ErrorKind::Input, ErrorKind::Rejected, ErrorKind::Backend] {
+            let rpc = super::result_outcome("tools/call", &classified_error(kind, "failure"));
+            assert!(rpc.success);
+            assert_eq!(rpc.error_code, None);
+            assert_eq!(rpc.tool_success, Some(false));
+            assert_eq!(rpc.tool_error_kind, Some(kind.as_str()));
+        }
+        assert_eq!(
+            super::result_outcome("tools/call", &json!({"content":[]})).tool_success,
+            Some(true)
+        );
+        assert_eq!(
+            super::result_outcome("tools/list", &json!({"tools":[]})).tool_success,
+            None
+        );
+    }
 
     fn test_state() -> crate::state::AppState {
         let pool = sqlx::mysql::MySqlPoolOptions::new()

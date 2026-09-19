@@ -1514,6 +1514,8 @@ impl SqlMemoryStore {
                 called_at       DATETIME(6)  NOT NULL DEFAULT NOW(6),
                 rpc_success     TINYINT(1)   NOT NULL DEFAULT 1,
                 rpc_error_code  INT          NULL,
+                tool_success    TINYINT(1)   NULL,
+                tool_error_kind VARCHAR(32) NULL,
                 PRIMARY KEY (id),
                 INDEX idx_user_called (user_id, called_at)
             )"#,
@@ -1681,6 +1683,25 @@ impl SqlMemoryStore {
                      Fix DB permissions or add the column manually, then restart."
                 );
                 return Err(db_err(e));
+            }
+        }
+
+        // Nullable fields distinguish historical/non-tool calls from actual tool
+        // success. Keep additive migrations compatible with older writers.
+        for column in [
+            "tool_success TINYINT(1) NULL",
+            "tool_error_kind VARCHAR(32) NULL",
+        ] {
+            if let Err(error) = sqlx::query(&format!(
+                "ALTER TABLE {api_call_log_table} ADD COLUMN {column}"
+            ))
+            .execute(pool)
+            .await
+            {
+                if !is_duplicate_column(&error) {
+                    tracing::error!(%error, column, "Cannot migrate tool outcome call-log columns");
+                    return Err(db_err(error));
+                }
             }
         }
 

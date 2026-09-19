@@ -61,12 +61,14 @@ impl RemoteClient {
         tool: &str,
         allowed: &[&str],
     ) -> Result<&'a serde_json::Map<String, Value>> {
-        let map = args
-            .as_object()
-            .ok_or_else(|| anyhow::anyhow!("Invalid {tool} arguments: expected object"))?;
+        let map = args.as_object().ok_or_else(|| {
+            crate::tool_result::input_error(format!("Invalid {tool} arguments: expected object"))
+        })?;
         for key in map.keys() {
             if !allowed.iter().any(|allowed_key| allowed_key == key) {
-                anyhow::bail!("Invalid {tool} argument '{key}': unknown field");
+                return Err(crate::tool_result::input_error(format!(
+                    "Invalid {tool} argument '{key}': unknown field"
+                )));
             }
         }
         Ok(map)
@@ -77,15 +79,21 @@ impl RemoteClient {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("Invalid {tool} '{field}': expected non-empty string"))
+            .ok_or_else(|| {
+                crate::tool_result::input_error(format!(
+                    "Invalid {tool} '{field}': expected non-empty string"
+                ))
+            })
     }
 
     fn optional_i64_arg(args: &Value, tool: &str, field: &str, default: i64) -> Result<i64> {
         match args.get(field) {
             None => Ok(default),
-            Some(value) => value
-                .as_i64()
-                .ok_or_else(|| anyhow::anyhow!("Invalid {tool} '{field}': expected integer")),
+            Some(value) => value.as_i64().ok_or_else(|| {
+                crate::tool_result::input_error(format!(
+                    "Invalid {tool} '{field}': expected integer"
+                ))
+            }),
         }
     }
 
@@ -93,10 +101,10 @@ impl RemoteClient {
         match args.get(field) {
             None => Ok(Value::Array(Vec::new())),
             Some(Value::Array(values)) => Ok(Value::Array(values.clone())),
-            Some(other) => anyhow::bail!(
+            Some(other) => Err(crate::tool_result::input_error(format!(
                 "Invalid memory_apply '{field}': expected array, got {}",
                 other
-            ),
+            ))),
         }
     }
 
@@ -110,18 +118,46 @@ impl RemoteClient {
         if status.is_success() {
             return Ok(r.json().await?);
         }
+        let is_text = r
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/plain"))
+            });
         let body = r.text().await.unwrap_or_default();
-        tracing::warn!(%status, %body, "Remote tool API failed");
+        use crate::tool_result::{ErrorKind, RemoteError};
         if status.is_server_error() {
-            anyhow::bail!("Remote API returned {status}. Check service health before retrying; a write may have partially completed.");
+            return Err(RemoteError {
+                kind: ErrorKind::Backend,
+                message: format!(
+                    "Remote API returned {status}. Check service health before retrying."
+                ),
+            }
+            .into());
         }
         // Preserve actionable validation/conflict messages, without forwarding
         // arbitrary HTML or proxy response bodies to the model.
         let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-        let message = parsed.get("error").and_then(Value::as_str)
+        let message = parsed
+            .get("error")
+            .and_then(Value::as_str)
             .or_else(|| parsed.get("message").and_then(Value::as_str))
+            .or_else(|| (is_text && !body.trim().is_empty()).then_some(body.trim()))
             .unwrap_or("Check the tool arguments and access permissions.");
-        anyhow::bail!("API error {status}: {message}")
+        let kind = match status.as_u16() {
+            400 | 422 => ErrorKind::Input,
+            401 | 403 | 404 | 409 => ErrorKind::Rejected,
+            _ => ErrorKind::Backend,
+        };
+        Err(RemoteError {
+            kind,
+            message: format!("API error {status}: {message}"),
+        }
+        .into())
     }
 
     pub async fn call(&self, name: &str, args: Value) -> Result<Value> {
@@ -146,7 +182,11 @@ impl RemoteClient {
                 {
                     payload["subject_id"] = json!(sid);
                 }
-                if args.get("extra_metadata").map(Value::is_object).unwrap_or(false) {
+                if args
+                    .get("extra_metadata")
+                    .map(Value::is_object)
+                    .unwrap_or(false)
+                {
                     payload["extra_metadata"] = args["extra_metadata"].clone();
                 }
                 let r = self
@@ -261,8 +301,7 @@ impl RemoteClient {
                     {
                         correct_payload["subject_id"] = json!(sid);
                     }
-                    if let Some(memory_types) =
-                        args.get("memory_types").and_then(|v| v.as_array())
+                    if let Some(memory_types) = args.get("memory_types").and_then(|v| v.as_array())
                     {
                         if !memory_types.is_empty() {
                             correct_payload["memory_types"] = json!(memory_types);
@@ -342,7 +381,9 @@ impl RemoteClient {
                         session_id
                     )))
                 } else {
-                    Ok(crate::tool_result::error("Provide memory_id, topic, or session_id"))
+                    Ok(crate::tool_result::error(
+                        "Provide memory_id, topic, or session_id",
+                    ))
                 }
             }
 
@@ -789,7 +830,12 @@ impl RemoteClient {
                     "session_id": args["session_id"],
                     "branch": args["branch"],
                 });
-                if let Some(sid) = args.get("subject_id").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                if let Some(sid) = args
+                    .get("subject_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
                     payload["subject_id"] = json!(sid);
                 }
                 let r = self
@@ -842,6 +888,85 @@ mod tests {
     };
     use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn remote_errors_preserve_plain_text_and_json_without_exposing_server_bodies() {
+        use crate::tool_result::{error_kind, execution_error, ErrorKind};
+        use axum::http::{header::CONTENT_TYPE, StatusCode};
+        for (status, content_type, body, expected, kind) in [
+            (
+                404,
+                "text/plain; charset=utf-8",
+                "Memory not found: mem_abc",
+                "mem_abc",
+                ErrorKind::Rejected,
+            ),
+            (
+                422,
+                "text/plain",
+                "Validation error: content required",
+                "content required",
+                ErrorKind::Input,
+            ),
+            (
+                403,
+                "text/plain",
+                "Blocked: governance policy",
+                "governance policy",
+                ErrorKind::Rejected,
+            ),
+            (
+                409,
+                "application/json",
+                r#"{"message":"merge conflict"}"#,
+                "merge conflict",
+                ErrorKind::Rejected,
+            ),
+            (
+                502,
+                "text/html",
+                "<html>private proxy details</html>",
+                "Check service health",
+                ErrorKind::Backend,
+            ),
+            (
+                400,
+                "text/html",
+                "<html>private proxy details</html>",
+                "Check the tool arguments",
+                ErrorKind::Input,
+            ),
+        ] {
+            let app = Router::new().route(
+                "/",
+                post(move || async move {
+                    (
+                        StatusCode::from_u16(status).unwrap(),
+                        [(CONTENT_TYPE, content_type)],
+                        body,
+                    )
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let response = reqwest::Client::new()
+                .post(format!("http://{addr}/"))
+                .send()
+                .await
+                .unwrap();
+            let error = RemoteClient::parse_response(response).await.unwrap_err();
+            let result = execution_error("memory_retrieve", error);
+            assert_eq!(error_kind(&result), Some(kind));
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(expected), "{text}");
+            assert!(!text.contains("private proxy"));
+            assert!(!text.contains("write may"));
+            server.abort();
+        }
+    }
 
     #[derive(Clone)]
     struct ApplyCapture {

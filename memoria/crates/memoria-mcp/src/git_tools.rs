@@ -852,7 +852,13 @@ pub async fn call(
                 acquire_snapshot_create_lock(&lock_store, &sql, &git, user_id, &display, &internal)
                     .await?
             else {
-                return Ok(mcp_text(&format!("Snapshot '{}' already exists.", display)));
+                return Ok(crate::tool_result::classified_error(
+                    crate::tool_result::ErrorKind::Rejected,
+                    format!(
+                        "Snapshot '{}' already exists. Choose a different name.",
+                        display
+                    ),
+                ));
             };
             let result = async {
                 if sql
@@ -864,7 +870,13 @@ pub async fn call(
                         .await?
                         .is_some()
                 {
-                    return Ok(mcp_text(&format!("Snapshot '{}' already exists.", display)));
+                    return Ok(crate::tool_result::classified_error(
+                        crate::tool_result::ErrorKind::Rejected,
+                        format!(
+                            "Snapshot '{}' already exists. Choose a different name.",
+                            display
+                        ),
+                    ));
                 }
                 let snap = match git.create_snapshot(&internal).await {
                     Ok(snap) => snap,
@@ -875,10 +887,13 @@ pub async fn call(
                             .map_err(git_err)?
                             .is_some()
                         {
-                            return Ok(mcp_text(&format!(
-                                "Snapshot '{}' already exists.",
-                                display
-                            )));
+                            return Ok(crate::tool_result::classified_error(
+                                crate::tool_result::ErrorKind::Rejected,
+                                format!(
+                                    "Snapshot '{}' already exists. Choose a different name.",
+                                    display
+                                ),
+                            ));
                         }
                         return Err(git_err(err));
                     }
@@ -969,7 +984,9 @@ pub async fn call(
                     .cloned()
                     .collect()
             } else {
-                return Ok(crate::tool_result::error("Specify 'names', 'prefix', or 'older_than'"));
+                return Ok(crate::tool_result::error(
+                    "Specify 'names', 'prefix', or 'older_than'",
+                ));
             };
 
             let count = to_delete.len();
@@ -1028,7 +1045,9 @@ pub async fn call(
                     })?;
                 let now = chrono::Utc::now().naive_utc();
                 if ts > now {
-                    return Ok(crate::tool_result::error("from_timestamp cannot be in the future"));
+                    return Ok(crate::tool_result::error(
+                        "from_timestamp cannot be in the future",
+                    ));
                 }
                 if now - ts > chrono::Duration::minutes(30) {
                     return Ok(crate::tool_result::error(
@@ -1060,7 +1079,10 @@ pub async fn call(
             .map_err(db_err)?;
             let cnt: i64 = dup.try_get("cnt").unwrap_or(0);
             if cnt > 0 {
-                return Ok(mcp_text(&format!("Branch '{branch_name}' already exists.")));
+                return Ok(crate::tool_result::classified_error(
+                    crate::tool_result::ErrorKind::Rejected,
+                    format!("Branch '{branch_name}' already exists. Choose a different name."),
+                ));
             }
 
             // Physical branch names are ASCII; the registry preserves the user's
@@ -1571,7 +1593,8 @@ pub async fn call(
                 sql.deregister_branch(user_id, branch).await?;
                 Ok(mcp_text(&format!("Deleted branch '{branch}'")))
             } else {
-                Ok(mcp_text(&format!("Branch '{branch}' not found")))
+                Ok(crate::tool_result::classified_error(crate::tool_result::ErrorKind::Rejected,
+                    format!("Branch '{branch}' not found. List branches and check the name before retrying.")))
             }
         }
 
@@ -1718,7 +1741,7 @@ pub async fn call(
                 && selection.removes.is_empty()
                 && selection.accept_branch_conflicts.is_empty()
             {
-                return Ok(mcp_text(
+                return Ok(crate::tool_result::error(
                     "Nothing to apply. Provide at least one of: adds, updates, removes, accept_branch_conflicts.",
                 ));
             }

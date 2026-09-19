@@ -1,3 +1,4 @@
+use crate::tool_result::input_error;
 use anyhow::Result;
 use memoria_core::MemoryType;
 use serde_json::Value;
@@ -40,25 +41,23 @@ pub(crate) fn parse_memory_purge_args(args: &Value) -> Result<MemoryPurgeArgs> {
                 .map(|value| {
                     value
                         .as_str()
-                        .ok_or_else(|| anyhow::anyhow!("memory_types entries must be strings"))
-                        .and_then(|value| {
-                            MemoryType::from_str(value).map_err(|e| anyhow::anyhow!("{e}"))
-                        })
+                        .ok_or_else(|| input_error("memory_types entries must be strings"))
+                        .and_then(|value| MemoryType::from_str(value).map_err(input_error))
                 })
                 .collect::<Result<Vec<_>>>()?,
         ),
-        Some(_) => return Err(anyhow::anyhow!("memory_types must be an array of strings")),
+        Some(_) => return Err(input_error("memory_types must be an array of strings")),
     }
     .filter(|types| !types.is_empty());
     if memory_types.is_some() && session_id.is_none() {
-        return Err(anyhow::anyhow!("memory_types requires session_id"));
+        return Err(input_error("memory_types requires session_id"));
     }
     let selector_count = usize::from(memory_id.is_some())
         + usize::from(topic.is_some())
         + usize::from(session_id.is_some());
     if selector_count > 1 {
-        return Err(anyhow::anyhow!(
-            "Provide only one of memory_id, topic, or session_id"
+        return Err(input_error(
+            "Provide only one of memory_id, topic, or session_id",
         ));
     }
     Ok(MemoryPurgeArgs {

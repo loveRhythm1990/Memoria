@@ -898,6 +898,8 @@ pub struct RpcMeta {
     pub success: bool,
     /// JSON-RPC error code (e.g. -32601) when success = false; None otherwise.
     pub error_code: Option<i32>,
+    pub tool_success: Option<bool>,
+    pub tool_error_kind: Option<&'static str>,
 }
 
 impl RpcMeta {
@@ -905,12 +907,16 @@ impl RpcMeta {
         Self {
             success: true,
             error_code: None,
+            tool_success: None,
+            tool_error_kind: None,
         }
     }
     pub fn err(code: i32) -> Self {
         Self {
             success: false,
             error_code: Some(code),
+            tool_success: None,
+            tool_error_kind: None,
         }
     }
 }
@@ -927,6 +933,8 @@ struct CallLogEntry {
     rpc_success: bool,
     /// JSON-RPC error code (e.g. -32601) when rpc_success = false; NULL otherwise.
     rpc_error_code: Option<i32>,
+    tool_success: Option<bool>,
+    tool_error_kind: Option<&'static str>,
 }
 
 /// Accumulates call log entries in memory and flushes them in batches to DB.
@@ -997,6 +1005,8 @@ impl CallLogBatcher {
                 latency_ms,
                 rpc_success: rpc.success,
                 rpc_error_code: rpc.error_code,
+                tool_success: rpc.tool_success,
+                tool_error_kind: rpc.tool_error_kind,
             });
         }
     }
@@ -1065,12 +1075,12 @@ async fn flush_call_log_chunked(
     for chunk in entries.chunks(200) {
         let placeholders: String = chunk
             .iter()
-            .map(|_| "(?, ?, ?, ?, ?, ?, ?)")
+            .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
             "INSERT INTO {table} \
-                 (user_id, method, path, status_code, latency_ms, rpc_success, rpc_error_code) \
+                 (user_id, method, path, status_code, latency_ms, rpc_success, rpc_error_code, tool_success, tool_error_kind) \
                  VALUES {placeholders}"
         );
         let mut query = sqlx::query(&sql);
@@ -1082,7 +1092,9 @@ async fn flush_call_log_chunked(
                 .bind(e.status_code as i16)
                 .bind(e.latency_ms as i32)
                 .bind(e.rpc_success as i8)
-                .bind(e.rpc_error_code);
+                .bind(e.rpc_error_code)
+                .bind(e.tool_success.map(i8::from))
+                .bind(e.tool_error_kind);
         }
         query.execute(pool).await?;
     }

@@ -37,7 +37,7 @@ fn parse_session_scope_arg(args: &Value) -> Result<Option<memoria_service::Sessi
         .and_then(Value::as_str)
         .map(memoria_service::SessionScope::from_str)
         .transpose()
-        .map_err(|e| anyhow::anyhow!("{e}"))
+        .map_err(crate::tool_result::input_error)
 }
 
 fn parse_retrieve_options_arg(args: &Value) -> Result<memoria_service::RetrieveOptions> {
@@ -48,7 +48,9 @@ fn parse_retrieve_options_arg(args: &Value) -> Result<memoria_service::RetrieveO
         .filter(|id| !id.is_empty());
     let session_scope = parse_session_scope_arg(args)?;
     if session_scope.is_some() && session_id.is_none() {
-        anyhow::bail!("session_id is required when session_scope is set");
+        return Err(crate::tool_result::input_error(
+            "session_id is required when session_scope is set",
+        ));
     }
     let subject_id = args
         .get("subject_id")
@@ -59,14 +61,16 @@ fn parse_retrieve_options_arg(args: &Value) -> Result<memoria_service::RetrieveO
     let memory_types: Option<Vec<memoria_core::MemoryType>> = match args.get("memory_types") {
         None | Some(Value::Null) => None,
         Some(v) => {
-            let arr = v
-                .as_array()
-                .ok_or_else(|| anyhow::anyhow!("memory_types must be an array, got: {v}"))?;
+            let arr = v.as_array().ok_or_else(|| {
+                crate::tool_result::input_error(format!("memory_types must be an array, got: {v}"))
+            })?;
             let types = arr
                 .iter()
                 .map(|v| {
                     let s = v.as_str().ok_or_else(|| {
-                        anyhow::anyhow!("memory_types elements must be strings, got: {v}")
+                        crate::tool_result::input_error(format!(
+                            "memory_types elements must be strings, got: {v}"
+                        ))
                     })?;
                     let trimmed = s.trim();
                     if trimmed.is_empty() {
@@ -74,7 +78,11 @@ fn parse_retrieve_options_arg(args: &Value) -> Result<memoria_service::RetrieveO
                     }
                     memoria_core::MemoryType::from_str(trimmed)
                         .map(Some)
-                        .map_err(|_| anyhow::anyhow!("unknown memory_type: '{trimmed}'"))
+                        .map_err(|_| {
+                            crate::tool_result::input_error(format!(
+                                "unknown memory_type: '{trimmed}'"
+                            ))
+                        })
                 })
                 .filter_map(|r: Result<Option<_>, _>| r.transpose())
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1175,10 +1183,10 @@ pub async fn call(
         ToolCallName::MemoryFeedback => {
             let memory_id = args["memory_id"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("memory_id is required"))?;
+                .ok_or_else(|| crate::tool_result::input_error("memory_id is required"))?;
             let signal = args["signal"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("signal is required"))?;
+                .ok_or_else(|| crate::tool_result::input_error("signal is required"))?;
             let context = args["context"].as_str();
 
             let feedback_id = service

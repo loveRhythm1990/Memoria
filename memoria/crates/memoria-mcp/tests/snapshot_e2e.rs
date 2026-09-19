@@ -557,6 +557,7 @@ async fn test_duplicate_snapshot_name_rejected() {
         "got: {}",
         text(&second)
     );
+    assert_eq!(second["isError"], true);
 
     let sql = svc.user_sql_store(&uid).await.unwrap();
     let regs = sql.list_snapshot_registrations(&uid).await.unwrap();

@@ -1993,6 +1993,89 @@ async fn test_scoped_api_key_whoami_and_memory_authorization() {
         .contains("memory:write"));
 }
 
+#[tokio::test]
+async fn test_mcp_tool_outcomes_persist_and_remain_queryable_by_tool() {
+    let master = "tool-outcome-test-master";
+    let (base, client, server) = spawn_server_with_master_key(master).await;
+    let user = uid();
+    let response = client
+        .post(format!("{base}/mcp"))
+        .bearer_auth(master)
+        .header("X-User-Id", &user)
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"memory_store","arguments":{"content":""}}}))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    // Inject a classified backend outcome to exercise persistence/querying
+    // without relying on a flaky live database outage.
+    server.state().call_log_batcher.record_rpc(
+        user.clone(),
+        "POST".into(),
+        "/mcp/memory_retrieve".into(),
+        200,
+        1,
+        memoria_api::auth::RpcMeta {
+            success: true,
+            error_code: None,
+            tool_success: Some(false),
+            tool_error_kind: Some("backend"),
+        },
+    );
+    server
+        .state()
+        .call_log_batcher
+        .flush(&server.service())
+        .await;
+    let store = server.service().user_sql_store(&user).await.unwrap();
+    let rows: Vec<(String, i8, Option<i32>, Option<i8>, Option<String>)> = sqlx::query_as(&format!(
+        "SELECT path, rpc_success, rpc_error_code, tool_success, tool_error_kind FROM {} WHERE user_id = ? ORDER BY path",
+        store.t("mem_api_call_log")))
+        .bind(&user).fetch_all(store.pool()).await.unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "/mcp/memory_retrieve".into(),
+                1,
+                None,
+                Some(0),
+                Some("backend".into())
+            ),
+            (
+                "/mcp/memory_store".into(),
+                1,
+                None,
+                Some(0),
+                Some("input".into())
+            ),
+        ]
+    );
+    let response = client
+        .get(format!("{base}/admin/users/{user}/call-stats"))
+        .bearer_auth(master)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let stats: Value = response.json().await.unwrap();
+    let paths = stats["by_path"].as_array().expect("per-tool statistics");
+    let input = paths
+        .iter()
+        .find(|r| r["path"] == "/mcp/memory_store")
+        .unwrap();
+    assert_eq!(input["rpc_error_count"], 0);
+    assert_eq!(input["tool_input_error_count"], 1);
+    assert_eq!(input["tool_backend_error_count"], 0);
+    let backend = paths
+        .iter()
+        .find(|r| r["path"] == "/mcp/memory_retrieve")
+        .unwrap();
+    assert_eq!(backend["tool_backend_error_count"], 1);
+}
+
 async fn assert_scoped_user_has_no_database(server: &support::multi_db::ApiTestServer, user: &str) {
     let registry: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM mem_user_registry WHERE user_id = ?")
@@ -2018,18 +2101,21 @@ async fn test_scoped_mcp_denials_do_not_provision_storage_even_after_flush() {
     let (base, client, server) = spawn_server_with_master_key(master).await;
     let mut users = Vec::new();
     let mut write_key = String::new();
-    for (scopes, denied_tools) in [
+    for (scopes, denied_tools, expected_rpc_code) in [
         (
             json!(["identity:read"]),
             vec!["memory_store", "memory_search"],
+            -32003,
         ),
         (
             json!(["identity:read", "memory:read"]),
             vec!["memory_store", "memory_tune_params"],
+            -32003,
         ),
         (
             json!(["identity:read", "memory:read", "memory:write"]),
             vec!["memory_unclassified"],
+            -32602,
         ),
     ] {
         let user = uid();
@@ -2068,7 +2154,11 @@ async fn test_scoped_mcp_denials_do_not_provision_storage_even_after_flush() {
                     } else {
                         assert_eq!(response.status(), 200);
                         let result: Value = response.json().await.unwrap();
-                        assert_eq!(result["error"]["code"], -32003, "{result}");
+                        // Known tools with insufficient scopes are authorization
+                        // errors; unknown tools are invalid protocol parameters.
+                        // Neither rejection may provision user storage.
+                        assert_eq!(result["error"]["code"], expected_rpc_code, "{result}");
+                        assert!(result.get("result").is_none(), "{result}");
                     }
                 }
             }
