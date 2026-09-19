@@ -6276,15 +6276,27 @@ async fn test_api_snapshot_limit_is_per_user() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 201);
-    let body: Value = r.json().await.unwrap();
+    // A rejected tool operation must propagate as a REST error, not Created.
+    assert_eq!(r.status(), 400);
+    let body = r.text().await.unwrap();
     assert!(
-        body["result"]
-            .as_str()
-            .unwrap_or("")
-            .contains("Snapshot limit reached (20)"),
+        body.contains("Snapshot limit reached (20)"),
         "expected per-user cap message: {body}"
     );
+
+    let listed: Value = client
+        .get(format!("{base}/v1/snapshots"))
+        .header("X-User-Id", &uid_a)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let snapshots = listed["snapshots"].as_array().expect("snapshots array");
+    assert_eq!(listed["total"], 20, "rejected create must not change the total");
+    assert_eq!(snapshots.len(), 20, "rejected create must not add a snapshot");
+    assert!(snapshots.iter().all(|snapshot| snapshot["name"] != overflow));
 
     let b_snap = format!(
         "api_cap_b_{}",
