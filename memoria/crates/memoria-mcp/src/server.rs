@@ -109,6 +109,32 @@ fn is_git_tool(name: &str) -> bool {
     GIT_TOOL_NAMES.contains(&name)
 }
 
+/// Validate the protocol envelope before authorization or tool execution.
+/// Tool-specific input validation remains an execution error visible to the model.
+pub fn validate_tool_call(params: Option<&Value>) -> Result<(String, Value), McpRpcError> {
+    let invalid = |message: String| McpRpcError {
+        code: -32602,
+        message,
+    };
+    let p = params
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid("tools/call params must be an object".into()))?;
+    let name = p
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid("tools/call name must be a non-empty string".into()))?;
+    if !is_git_tool(name) && !tools::is_known_tool(name) {
+        return Err(invalid(format!("Unknown tool: {name}")));
+    }
+    let args = match p.get("arguments") {
+        None => json!({}),
+        Some(value) if value.is_object() => value.clone(),
+        Some(_) => return Err(invalid("tools/call arguments must be an object".into())),
+    };
+    Ok((name.to_string(), args))
+}
+
 /// Dispatch a single JSON-RPC method in embedded mode.
 /// Used by the server-side Streamable HTTP MCP endpoint.
 pub async fn dispatch_http(
@@ -380,26 +406,21 @@ async fn dispatch(
             Ok(json!({"tools": all_tools}))
         }
         RpcMethod::ToolsCall => {
-            let name = p["name"].as_str().unwrap_or("").to_string();
-            let args = p["arguments"].clone();
-            let internal_err = |e: anyhow::Error| McpRpcError {
-                code: -32000,
-                message: e.to_string(),
-            };
+            let (name, args) = validate_tool_call(Some(&p))?;
             match mode {
-                Mode::Remote(client) => client.call(&name, args).await.map_err(internal_err),
+                Mode::Remote(client) => Ok(client
+                    .call(&name, args)
+                    .await
+                    .unwrap_or_else(crate::tool_result::execution_error)),
                 Mode::Embedded { service, git } => {
                     if is_git_tool(&name) {
-                        git_tools::call(&name, args, git, service, user_id)
+                        Ok(git_tools::call(&name, args, git, service, user_id)
                             .await
-                            .map_err(|e| McpRpcError {
-                                code: -32000,
-                                message: e.to_string(),
-                            })
+                            .unwrap_or_else(crate::tool_result::execution_error))
                     } else {
-                        tools::call(&name, args, service, user_id)
+                        Ok(tools::call(&name, args, service, user_id)
                             .await
-                            .map_err(internal_err)
+                            .unwrap_or_else(crate::tool_result::execution_error))
                     }
                 }
             }
@@ -433,23 +454,15 @@ async fn dispatch_embedded_owned(
             Ok(json!({"tools": all_tools}))
         }
         RpcMethod::ToolsCall => {
-            let name = p["name"].as_str().unwrap_or("").to_string();
-            let args = p["arguments"].clone();
-            let internal_err = |e: anyhow::Error| McpRpcError {
-                code: -32000,
-                message: e.to_string(),
-            };
+            let (name, args) = validate_tool_call(Some(&p))?;
             if is_git_tool(&name) {
-                git_tools::call_owned(name, args, git, service, user_id)
+                Ok(git_tools::call_owned(name, args, git, service, user_id)
                     .await
-                    .map_err(|e| McpRpcError {
-                        code: -32000,
-                        message: e.to_string(),
-                    })
+                    .unwrap_or_else(crate::tool_result::execution_error))
             } else {
-                tools::call_owned(name, args, service, user_id)
+                Ok(tools::call_owned(name, args, service, user_id)
                     .await
-                    .map_err(internal_err)
+                    .unwrap_or_else(crate::tool_result::execution_error))
             }
         }
         RpcMethod::Unknown(method) => Err(McpRpcError {
@@ -695,6 +708,119 @@ mod tests {
             }
         }
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn tool_errors_are_results_in_both_dispatch_paths() {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://test:test@127.0.0.1/test")
+            .unwrap();
+        let store = std::sync::Arc::new(memoria_storage::SqlMemoryStore::new(
+            pool.clone(),
+            3,
+            "test".into(),
+        ));
+        let service = std::sync::Arc::new(memoria_service::MemoryService::new(store, None, None));
+        let git = std::sync::Arc::new(memoria_git::GitForDataService::new(pool, "test"));
+        let embedded = Mode::Embedded {
+            service: service.clone(),
+            git: git.clone(),
+        };
+        let remote = Mode::Remote(RemoteClient::new(
+            "http://127.0.0.1:1",
+            None,
+            "test".into(),
+            None,
+        ));
+        for params in [
+            json!({"name":"memory_store", "arguments":{"content":""}}),
+            json!({"name":"memory_apply", "arguments":{"source":"main"}}),
+            json!({"name":"memory_apply", "arguments":{"source":42}}),
+        ] {
+            for result in [
+                dispatch("tools/call", Some(params.clone()), &embedded, "test").await,
+                dispatch("tools/call", Some(params.clone()), &remote, "test").await,
+                super::dispatch_http(
+                    "tools/call".into(),
+                    Some(params.clone()),
+                    service.clone(),
+                    git.clone(),
+                    "test".into(),
+                )
+                .await,
+            ] {
+                let result = result.expect("execution errors must be results");
+                assert_eq!(result["isError"], true, "{result}");
+                assert!(!result["content"][0]["text"].as_str().unwrap().is_empty());
+                if params["arguments"]["source"] == 42 {
+                    assert!(
+                        result["content"][0]["text"]
+                            .as_str()
+                            .unwrap()
+                            .contains("source"),
+                        "{result}"
+                    );
+                }
+            }
+        }
+        for params in [
+            json!({"name":"unknown"}),
+            json!({"name":42}),
+            json!({"name":"memory_store", "arguments":[]}),
+        ] {
+            assert_eq!(
+                dispatch("tools/call", Some(params.clone()), &remote, "test")
+                    .await
+                    .unwrap_err()
+                    .code,
+                -32602
+            );
+            assert_eq!(
+                super::dispatch_http(
+                    "tools/call".into(),
+                    Some(params),
+                    service.clone(),
+                    git.clone(),
+                    "test".into()
+                )
+                .await
+                .unwrap_err()
+                .code,
+                -32602
+            );
+        }
+        let success = dispatch(
+            "tools/call",
+            Some(json!({"name":"memory_capabilities"})),
+            &embedded,
+            "test",
+        )
+        .await
+        .unwrap();
+        assert!(!crate::tool_result::is_error(&success));
+    }
+
+    #[tokio::test]
+    async fn downstream_failure_is_a_tool_error_without_url_leakage() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let mode = Mode::Remote(RemoteClient::new(
+            &format!("http://{address}"),
+            None,
+            "test".into(),
+            None,
+        ));
+        let result = dispatch(
+            "tools/call",
+            Some(json!({"name":"memory_store", "arguments":{"content":"hello"}})),
+            &mode,
+            "test",
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["isError"], true);
+        assert!(!result.to_string().contains(&address.to_string()));
     }
 
     #[tokio::test]

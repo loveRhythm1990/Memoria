@@ -317,6 +317,17 @@ pub async fn mcp_handler(
         }
     };
     // Use the exact dispatch name, never a sanitized/truncated metrics label.
+    if method == "tools/call" {
+        if let Err(error) = memoria_mcp::validate_tool_call(params.as_ref()) {
+            report_stats(&track_path, false);
+            if req.get("id").is_none() {
+                return StatusCode::NO_CONTENT.into_response();
+            }
+            return Json(json!({"jsonrpc": "2.0", "id": req["id"],
+                "error": {"code": error.code, "message": error.message}}))
+            .into_response();
+        }
+    }
     let authorization_error = if method == "tools/call" {
         let name = params
             .as_ref()
@@ -458,14 +469,20 @@ pub async fn mcp_handler(
             Ok(_) => RpcMeta::ok(),
             Err(e) => RpcMeta::err(e.code),
         };
-        if dispatch_result.is_ok() {
+        let tool_success = dispatch_result
+            .as_ref()
+            .is_ok_and(|result| !memoria_mcp::tool_result::is_error(result));
+        if tool_success {
             if let Some(mask) = tracked_tool.as_deref().and_then(mcp_tool_dirty_mask) {
                 spawn_metrics_dirty_mark(state.clone(), scope_id.clone(), mask);
             }
         }
-        // Report accurate ops metrics using the real RPC path and success flag
-        // (JSON-RPC errors still return HTTP 200, so is_success must come from rpc.success).
-        report_stats(&track_path, rpc.success);
+        // Operational statistics include execution failures; call logs below
+        // retain the separate protocol outcome.
+        if rpc.success && !tool_success {
+            tracing::warn!(tool = ?tracked_tool, "MCP tool execution failed (protocol exchange succeeded)");
+        }
+        report_stats(&track_path, tool_success);
         record_call(204, rpc);
         return StatusCode::NO_CONTENT.into_response();
     }
@@ -495,9 +512,9 @@ pub async fn mcp_handler(
         return err_body.into_response();
     }
 
-    // JSON-RPC spec: the HTTP response is always 200 OK, even for RPC errors.
-    // Business-level error tracking uses rpc_success / rpc_error_code in the call log.
-    let (response, rpc) = match memoria_mcp::dispatch_http(
+    // This endpoint returns HTTP 200 for dispatched JSON-RPC responses. Protocol
+    // and tool execution outcomes must be tracked separately.
+    let (response, rpc, tool_success) = match memoria_mcp::dispatch_http(
         method.clone(),
         params,
         state.service.clone(),
@@ -507,10 +524,12 @@ pub async fn mcp_handler(
     .await
     {
         Ok(v) => {
+            let tool_success = !memoria_mcp::tool_result::is_error(&v);
             let result = if v.is_null() { json!({}) } else { v };
             (
                 Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response(),
                 RpcMeta::ok(),
+                tool_success,
             )
         }
         Err(e) => (
@@ -521,18 +540,22 @@ pub async fn mcp_handler(
             }))
             .into_response(),
             RpcMeta::err(e.code),
+            false,
         ),
     };
 
-    if rpc.success {
+    if tool_success {
         if let Some(mask) = tracked_tool.as_deref().and_then(mcp_tool_dirty_mask) {
             spawn_metrics_dirty_mark(state.clone(), scope_id.clone(), mask);
         }
     }
 
-    // Report accurate ops metrics using the real RPC path and success flag
-    // (JSON-RPC errors still return HTTP 200, so is_success must come from rpc.success).
-    report_stats(&track_path, rpc.success);
+    // Call logs describe protocol success. Aggregate operational statistics
+    // retain execution failures, so isError does not hide backend outages.
+    if rpc.success && !tool_success {
+        tracing::warn!(tool = ?tracked_tool, "MCP tool execution failed (protocol exchange succeeded)");
+    }
+    report_stats(&track_path, tool_success);
     record_call(200, rpc);
 
     response
@@ -661,6 +684,65 @@ mod tests {
         assert_eq!(
             state.call_log_batcher.pending_rpc_outcomes(),
             vec![(false, Some(-32601)); 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn http_tool_errors_preserve_protocol_success_and_scope_denials() {
+        use axum::response::IntoResponse;
+        let state = test_state();
+        for (params, scopes, expected) in [
+            (
+                json!({"name":"memory_store","arguments":{"content":""}}),
+                vec![crate::auth::SCOPE_MEMORY_WRITE.into()],
+                None,
+            ),
+            (
+                json!({"name":"memory_future_tool"}),
+                vec![crate::auth::SCOPE_MEMORY_WRITE.into()],
+                Some(-32602),
+            ),
+            (
+                json!({"name":"memory_store","arguments":[]}),
+                vec![crate::auth::SCOPE_MEMORY_WRITE.into()],
+                Some(-32602),
+            ),
+            (
+                json!({"name":"memory_store","arguments":{"content":"denied"}}),
+                vec![],
+                Some(-32003),
+            ),
+        ] {
+            let response = super::mcp_handler(
+                axum::extract::State(state.clone()),
+                test_auth(scopes),
+                Default::default(),
+                json!({"jsonrpc":"2.0","id":"request","method":"tools/call","params":params})
+                    .to_string(),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), 200);
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["id"], "request");
+            if let Some(code) = expected {
+                assert_eq!(body["error"]["code"], code, "{body}");
+                assert!(body.get("result").is_none());
+            } else {
+                assert_eq!(body["result"]["isError"], true, "{body}");
+                assert!(body.get("error").is_none());
+            }
+        }
+        // Rejected protocol envelopes and scope denials do not provision per-user
+        // storage. The execution error is logged as a successful RPC exchange.
+        assert_eq!(
+            state.call_log_batcher.pending_rpc_outcomes(),
+            vec![(true, None)]
         );
     }
 

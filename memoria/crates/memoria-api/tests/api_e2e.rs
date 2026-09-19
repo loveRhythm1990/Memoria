@@ -2533,11 +2533,8 @@ async fn test_scoped_mcp_write_authorization_is_independent_of_metrics() {
                 .unwrap();
             assert_eq!(response.status(), 200);
             let body: Value = response.json().await.unwrap();
-            assert_eq!(body["error"]["code"], -32003, "{name}: {body}");
-            assert!(body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("unclassified tool"));
+            assert_eq!(body["error"]["code"], -32602, "{name}: {body}");
+            assert!(body.get("result").is_none(), "{name}: {body}");
         }
     }
 }

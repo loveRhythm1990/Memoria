@@ -102,7 +102,7 @@ impl RemoteClient {
 
     #[allow(dead_code)]
     fn mcp_err(e: impl std::fmt::Display) -> Value {
-        Self::mcp_text(&format!("Error: {e}"))
+        crate::tool_result::error(e)
     }
 
     async fn parse_response(r: reqwest::Response) -> Result<Value> {
@@ -111,20 +111,23 @@ impl RemoteClient {
             return Ok(r.json().await?);
         }
         let body = r.text().await.unwrap_or_default();
-        let msg = if body.is_empty() {
-            status.to_string()
-        } else {
-            body
-        };
-        anyhow::bail!("API error {status}: {msg}")
+        tracing::warn!(%status, %body, "Remote tool API failed");
+        if status.is_server_error() {
+            anyhow::bail!("Remote API returned {status}. Check service health before retrying; a write may have partially completed.");
+        }
+        // Preserve actionable validation/conflict messages, without forwarding
+        // arbitrary HTML or proxy response bodies to the model.
+        let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        let message = parsed.get("error").and_then(Value::as_str)
+            .or_else(|| parsed.get("message").and_then(Value::as_str))
+            .unwrap_or("Check the tool arguments and access permissions.");
+        anyhow::bail!("API error {status}: {message}")
     }
 
     pub async fn call(&self, name: &str, args: Value) -> Result<Value> {
-        // remote 模式直接拼 REST payload，会绕过 embedded handler 的必填校验；这里前置调用
-        // 与 embedded 共享的校验。失败返回**软** tool result 文本（error=null），与 embedded
-        // 契约一致（不再转成 JSON-RPC -32000）。
+        // Keep business validation errors consistent with embedded execution.
         if let Err(e) = crate::tools::validate_tool_args(name, &args) {
-            return Ok(Self::mcp_text(e));
+            return Ok(crate::tool_result::error(e));
         }
         match name {
             "memory_store" => {
@@ -339,7 +342,7 @@ impl RemoteClient {
                         session_id
                     )))
                 } else {
-                    Ok(Self::mcp_text("Provide memory_id, topic, or session_id"))
+                    Ok(crate::tool_result::error("Provide memory_id, topic, or session_id"))
                 }
             }
 
@@ -820,7 +823,7 @@ impl RemoteClient {
                 )))
             }
 
-            _ => Ok(Self::mcp_text(&format!("Unknown tool: {name}"))),
+            _ => anyhow::bail!("Unknown tool: {name}"),
         }
     }
 

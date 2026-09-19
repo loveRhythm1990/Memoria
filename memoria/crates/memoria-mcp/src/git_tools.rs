@@ -825,7 +825,7 @@ pub async fn call(
                 .filter(|s| s.registered)
                 .count() as i64;
             if user_snapshots >= MAX_USER_SNAPSHOTS {
-                return Ok(mcp_text(&format!(
+                return Ok(crate::tool_result::error(format!(
                     "Snapshot limit reached ({MAX_USER_SNAPSHOTS}) for user {user_id}. Delete old snapshots first."
                 )));
             }
@@ -969,7 +969,7 @@ pub async fn call(
                     .cloned()
                     .collect()
             } else {
-                return Ok(mcp_text("Specify 'names', 'prefix', or 'older_than'"));
+                return Ok(crate::tool_result::error("Specify 'names', 'prefix', or 'older_than'"));
             };
 
             let count = to_delete.len();
@@ -1013,7 +1013,7 @@ pub async fn call(
             let from_timestamp = args["from_timestamp"].as_str();
 
             if from_snapshot.is_some() && from_timestamp.is_some() {
-                return Ok(mcp_text(
+                return Ok(crate::tool_result::error(
                     "Specify from_snapshot or from_timestamp, not both.",
                 ));
             }
@@ -1028,10 +1028,10 @@ pub async fn call(
                     })?;
                 let now = chrono::Utc::now().naive_utc();
                 if ts > now {
-                    return Ok(mcp_text("from_timestamp cannot be in the future"));
+                    return Ok(crate::tool_result::error("from_timestamp cannot be in the future"));
                 }
                 if now - ts > chrono::Duration::minutes(30) {
-                    return Ok(mcp_text(
+                    return Ok(crate::tool_result::error(
                         "from_timestamp must be within the last 30 minutes",
                     ));
                 }
@@ -1043,7 +1043,7 @@ pub async fn call(
             // Global branch limit
             let all_branches = sql.list_branches(user_id).await?;
             if all_branches.len() as i64 >= MAX_BRANCHES {
-                return Ok(mcp_text(&format!(
+                return Ok(crate::tool_result::error(format!(
                     "Branch limit reached ({MAX_BRANCHES}). Delete old branches first."
                 )));
             }
@@ -1187,7 +1187,7 @@ pub async fn call(
                 .try_get("cnt")
                 .unwrap_or(0);
             if new_count > 5000 {
-                return Ok(mcp_text(&format!(
+                return Ok(crate::tool_result::error(format!(
                     "Too many changes ({new_count}). Max 5000. Reduce branch scope."
                 )));
             }
@@ -1557,7 +1557,7 @@ pub async fn call(
         GitToolCallName::MemoryBranchDelete => {
             let branch = args["name"].as_str().unwrap_or("");
             if branch == "main" {
-                return Ok(mcp_text("Cannot delete main"));
+                return Ok(crate::tool_result::error("Cannot delete main"));
             }
             let sql = svc.user_sql_store(user_id).await?;
             let git = git_for_store(&sql)?;
@@ -1702,7 +1702,7 @@ pub async fn call(
             )?;
             let source_branch = parse_required_string_arg(&args, "memory_apply", "source")?;
             if source_branch == "main" {
-                return Ok(mcp_text("Cannot apply from main"));
+                return Ok(crate::tool_result::error("Cannot apply from main"));
             }
             let selection = memoria_git::ApplySelection {
                 adds: parse_apply_string_array(&args, "adds")?,
@@ -2445,11 +2445,11 @@ fn expect_tool_args<'a>(
     allowed: &[&str],
 ) -> Result<&'a serde_json::Map<String, Value>, MemoriaError> {
     let map = args.as_object().ok_or_else(|| {
-        MemoriaError::Internal(format!("Invalid {tool} arguments: expected object"))
+        MemoriaError::Validation(format!("Invalid {tool} arguments: expected object"))
     })?;
     for key in map.keys() {
         if !allowed.iter().any(|allowed_key| allowed_key == key) {
-            return Err(MemoriaError::Internal(format!(
+            return Err(MemoriaError::Validation(format!(
                 "Invalid {tool} argument '{key}': unknown field"
             )));
         }
@@ -2467,7 +2467,7 @@ fn parse_required_string_arg(
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .ok_or_else(|| {
-            MemoriaError::Internal(format!(
+            MemoriaError::Validation(format!(
                 "Invalid {tool} '{field}': expected non-empty string"
             ))
         })
@@ -2482,7 +2482,7 @@ fn parse_optional_i64_arg(
     match args.get(field) {
         None => Ok(default),
         Some(value) => value.as_i64().ok_or_else(|| {
-            MemoriaError::Internal(format!("Invalid {tool} '{field}': expected integer"))
+            MemoriaError::Validation(format!("Invalid {tool} '{field}': expected integer"))
         }),
     }
 }
@@ -2495,13 +2495,13 @@ fn parse_apply_string_array(args: &Value, field: &str) -> Result<Vec<String>, Me
             .enumerate()
             .map(|(idx, value)| {
                 value.as_str().map(str::to_string).ok_or_else(|| {
-                    MemoriaError::Internal(format!(
+                    MemoriaError::Validation(format!(
                         "Invalid memory_apply '{field}[{idx}]': expected string"
                     ))
                 })
             })
             .collect(),
-        Some(_) => Err(MemoriaError::Internal(format!(
+        Some(_) => Err(MemoriaError::Validation(format!(
             "Invalid memory_apply '{field}': expected array"
         ))),
     }
@@ -2515,12 +2515,12 @@ fn parse_apply_updates(args: &Value) -> Result<Vec<memoria_git::ApplyUpdatePair>
             .enumerate()
             .map(|(idx, value)| {
                 let old_id = value.get("old_id").and_then(Value::as_str).ok_or_else(|| {
-                    MemoriaError::Internal(format!(
+                    MemoriaError::Validation(format!(
                         "Invalid memory_apply 'updates[{idx}].old_id': expected string"
                     ))
                 })?;
                 let new_id = value.get("new_id").and_then(Value::as_str).ok_or_else(|| {
-                    MemoriaError::Internal(format!(
+                    MemoriaError::Validation(format!(
                         "Invalid memory_apply 'updates[{idx}].new_id': expected string"
                     ))
                 })?;
@@ -2530,7 +2530,7 @@ fn parse_apply_updates(args: &Value) -> Result<Vec<memoria_git::ApplyUpdatePair>
                 })
             })
             .collect(),
-        Some(_) => Err(MemoriaError::Internal(
+        Some(_) => Err(MemoriaError::Validation(
             "Invalid memory_apply 'updates': expected array".to_string(),
         )),
     }
