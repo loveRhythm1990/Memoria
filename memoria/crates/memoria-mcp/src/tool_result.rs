@@ -99,10 +99,11 @@ pub(crate) fn execution_error(tool: &str, error: impl Into<anyhow::Error>) -> Va
                 .map(|remote| remote.kind)
         })
         .unwrap_or(ErrorKind::Backend);
+    let detail = format!("{error:#}");
     if kind == ErrorKind::Backend {
-        tracing::warn!(tool, error = %error, "MCP backend execution failed");
+        tracing::warn!(tool, error = %detail, "MCP backend execution failed");
     } else {
-        tracing::debug!(tool, error = %error, "MCP tool input or operation rejected");
+        tracing::debug!(tool, error = %detail, "MCP tool input or operation rejected");
     }
     let message = error.chain().find_map(|cause| {
         if let Some(mem) = cause.downcast_ref::<MemoriaError>() {
