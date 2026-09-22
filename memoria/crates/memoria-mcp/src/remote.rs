@@ -113,15 +113,82 @@ impl RemoteClient {
         crate::tool_result::error(e)
     }
 
+    fn incomplete_response(tool: &str) -> anyhow::Error {
+        use crate::tool_result::{ErrorKind, RemoteError};
+        RemoteError {
+            kind: ErrorKind::Backend,
+            message: format!(
+                "Remote API returned an incomplete {tool} response. Check service health before retrying."
+            ),
+        }
+        .into()
+    }
+
+    fn require_object<'a>(
+        body: &'a Value,
+        tool: &str,
+    ) -> Result<&'a serde_json::Map<String, Value>> {
+        body.as_object()
+            .ok_or_else(|| Self::incomplete_response(tool))
+    }
+
+    fn require_str<'a>(body: &'a Value, tool: &str, field: &str) -> Result<&'a str> {
+        Self::require_object(body, tool)?
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| Self::incomplete_response(tool))
+    }
+
+    fn require_i64(body: &Value, tool: &str, field: &str) -> Result<i64> {
+        Self::require_object(body, tool)?
+            .get(field)
+            .and_then(Value::as_i64)
+            .ok_or_else(|| Self::incomplete_response(tool))
+    }
+
+    fn require_bool(body: &Value, tool: &str, field: &str) -> Result<bool> {
+        Self::require_object(body, tool)?
+            .get(field)
+            .and_then(Value::as_bool)
+            .ok_or_else(|| Self::incomplete_response(tool))
+    }
+
     async fn parse_response(r: reqwest::Response) -> Result<Value> {
+        Self::decode_response(r, false).await
+    }
+
+    /// Branch delete is the only remote tool whose success contract is an empty 204.
+    async fn parse_response_allow_empty(r: reqwest::Response) -> Result<Value> {
+        Self::decode_response(r, true).await
+    }
+
+    async fn decode_response(r: reqwest::Response, allow_empty: bool) -> Result<Value> {
         let status = r.status();
         if status.is_success() {
-            // 204 branch delete has no body. An empty success is not a JSON error.
             let body = r.text().await?;
             if body.trim().is_empty() {
-                return Ok(Value::Null);
+                if allow_empty {
+                    return Ok(Value::Null);
+                }
+                use crate::tool_result::{ErrorKind, RemoteError};
+                return Err(RemoteError {
+                    kind: ErrorKind::Backend,
+                    message: format!(
+                        "Remote API returned {status} with an empty body. Check service health before retrying."
+                    ),
+                }
+                .into());
             }
-            return Ok(serde_json::from_str(&body)?);
+            return serde_json::from_str(&body).map_err(|_| {
+                use crate::tool_result::{ErrorKind, RemoteError};
+                anyhow::Error::from(RemoteError {
+                    kind: ErrorKind::Backend,
+                    message: format!(
+                        "Remote API returned {status} with a non-JSON body. Check service health before retrying."
+                    ),
+                })
+            });
         }
         let is_text = r
             .headers()
@@ -201,10 +268,10 @@ impl RemoteClient {
                     .send()
                     .await?;
                 let body = Self::parse_response(r).await?;
+                let memory_id = Self::require_str(&body, "memory_store", "memory_id")?;
+                let content = body["content"].as_str().unwrap_or("");
                 Ok(Self::mcp_text(&format!(
-                    "Stored memory {}: {}",
-                    body["memory_id"].as_str().unwrap_or(""),
-                    body["content"].as_str().unwrap_or("")
+                    "Stored memory {memory_id}: {content}"
                 )))
             }
 
@@ -250,7 +317,10 @@ impl RemoteClient {
                     .send()
                     .await?;
                 let body = Self::parse_response(r).await?;
-                let mems = body.as_array().cloned().unwrap_or_default();
+                let mems = body
+                    .as_array()
+                    .cloned()
+                    .ok_or_else(|| Self::incomplete_response(name))?;
                 if mems.is_empty() {
                     return Ok(Self::mcp_text("No relevant memories found."));
                 }
@@ -319,15 +389,15 @@ impl RemoteClient {
                         .await?
                 };
                 let body = Self::parse_response(r).await?;
-                if let Some(_err) = body.get("error") {
+                if body.get("error").is_some() {
                     return Ok(Self::mcp_text(&format!(
                         "No matching memory found for query '{query}'"
                     )));
                 }
+                let memory_id = Self::require_str(&body, "memory_correct", "memory_id")?;
+                let content = body["content"].as_str().unwrap_or("");
                 Ok(Self::mcp_text(&format!(
-                    "Corrected memory {}: {}",
-                    body["memory_id"].as_str().unwrap_or(""),
-                    body["content"].as_str().unwrap_or("")
+                    "Corrected memory {memory_id}: {content}"
                 )))
             }
 
@@ -339,7 +409,6 @@ impl RemoteClient {
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .collect();
-                    let count = ids.len();
                     let r = self
                         .client
                         .post(self.url("/v1/memories/purge"))
@@ -347,10 +416,8 @@ impl RemoteClient {
                         .send()
                         .await?;
                     let body = Self::parse_response(r).await?;
-                    Ok(Self::mcp_text(&format!(
-                        "Purged {} memory(s)",
-                        body["purged"].as_i64().unwrap_or(count as i64)
-                    )))
+                    let purged = Self::require_i64(&body, "memory_purge", "purged")?;
+                    Ok(Self::mcp_text(&format!("Purged {purged} memory(s)")))
                 } else if let Some(topic) = purge_args.topic {
                     let r = self
                         .client
@@ -359,9 +426,9 @@ impl RemoteClient {
                         .send()
                         .await?;
                     let body = Self::parse_response(r).await?;
+                    let purged = Self::require_i64(&body, "memory_purge", "purged")?;
                     Ok(Self::mcp_text(&format!(
-                        "Purged {} memory(s) matching '{topic}'",
-                        body["purged"].as_i64().unwrap_or(0)
+                        "Purged {purged} memory(s) matching '{topic}'"
                     )))
                 } else if let Some(session_id) = purge_args.session_id {
                     let r = self
@@ -380,10 +447,9 @@ impl RemoteClient {
                         .send()
                         .await?;
                     let body = Self::parse_response(r).await?;
+                    let purged = Self::require_i64(&body, "memory_purge", "purged")?;
                     Ok(Self::mcp_text(&format!(
-                        "Purged {} memory(s) for session '{}'",
-                        body["purged"].as_i64().unwrap_or(0),
-                        session_id
+                        "Purged {purged} memory(s) for session '{session_id}'"
                     )))
                 } else {
                     Ok(crate::tool_result::error(
@@ -412,7 +478,10 @@ impl RemoteClient {
                 }
                 let r = req.send().await?;
                 let body = Self::parse_response(r).await?;
-                let profile = body["profile"].as_str().unwrap_or("");
+                let profile = Self::require_object(&body, "memory_profile")?
+                    .get("profile")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Self::incomplete_response("memory_profile"))?;
                 if profile.is_empty() {
                     Ok(Self::mcp_text("No profile memories found."))
                 } else {
@@ -446,7 +515,11 @@ impl RemoteClient {
                     req = req.query(&[("branch", branch)]);
                 }
                 let body = Self::parse_response(req.send().await?).await?;
-                let items = body["items"].as_array().cloned().unwrap_or_default();
+                let items = Self::require_object(&body, "memory_list")?
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .ok_or_else(|| Self::incomplete_response("memory_list"))?;
                 if items.is_empty() {
                     return Ok(Self::mcp_text("No memories found."));
                 }
@@ -493,7 +566,7 @@ impl RemoteClient {
                     .send()
                     .await?;
                 let body = Self::parse_response(r).await?;
-                if body["tuned"].as_bool().unwrap_or(false) {
+                if Self::require_bool(&body, "memory_tune_params", "tuned")? {
                     let old = &body["old_params"];
                     let new = &body["new_params"];
                     Ok(Self::mcp_text(&format!(
@@ -522,16 +595,17 @@ impl RemoteClient {
                     .send()
                     .await?;
                 let body = Self::parse_response(r).await?;
-                if body["skipped"].as_bool().unwrap_or(false) {
+                if body["skipped"].as_bool() == Some(true) {
+                    let remaining =
+                        Self::require_i64(&body, "memory_governance", "cooldown_remaining_s")?;
                     return Ok(Self::mcp_text(&format!(
-                        "Governance skipped (cooldown: {}s remaining).",
-                        body["cooldown_remaining_s"].as_i64().unwrap_or(0)
+                        "Governance skipped (cooldown: {remaining}s remaining)."
                     )));
                 }
+                let quarantined = Self::require_i64(&body, "memory_governance", "quarantined")?;
+                let cleaned = Self::require_i64(&body, "memory_governance", "cleaned_stale")?;
                 Ok(Self::mcp_text(&format!(
-                    "Governance complete: quarantined={}, cleaned_stale={}",
-                    body["quarantined"].as_i64().unwrap_or(0),
-                    body["cleaned_stale"].as_i64().unwrap_or(0)
+                    "Governance complete: quarantined={quarantined}, cleaned_stale={cleaned}"
                 )))
             }
 
@@ -542,7 +616,16 @@ impl RemoteClient {
                     .json(&json!({"force": true}))
                     .send()
                     .await?;
-                let _body = Self::parse_response(r).await?;
+                let body = Self::parse_response(r).await?;
+                if body["skipped"].as_bool() == Some(true) {
+                    let remaining =
+                        Self::require_i64(&body, "memory_rebuild_index", "cooldown_remaining_s")?;
+                    return Ok(Self::mcp_text(&format!(
+                        "Index rebuild skipped (cooldown: {remaining}s remaining)."
+                    )));
+                }
+                let _quarantined = Self::require_i64(&body, "memory_rebuild_index", "quarantined")?;
+                let _cleaned = Self::require_i64(&body, "memory_rebuild_index", "cleaned_stale")?;
                 Ok(Self::mcp_text(
                     "Index rebuild requested via governance endpoint.",
                 ))
@@ -556,17 +639,20 @@ impl RemoteClient {
                     .send()
                     .await?;
                 let body = Self::parse_response(r).await?;
-                if body["skipped"].as_bool().unwrap_or(false) {
+                if body["skipped"].as_bool() == Some(true) {
+                    let remaining =
+                        Self::require_i64(&body, "memory_consolidate", "cooldown_remaining_s")?;
                     return Ok(Self::mcp_text(&format!(
-                        "Consolidation skipped (cooldown: {}s remaining).",
-                        body["cooldown_remaining_s"].as_i64().unwrap_or(0)
+                        "Consolidation skipped (cooldown: {remaining}s remaining)."
                     )));
                 }
-                Ok(Self::mcp_text(&format!("Consolidation complete: conflicts_detected={}, orphaned_scenes={}, promoted={}, demoted={}",
-                    body["conflicts_detected"].as_i64().unwrap_or(0),
-                    body["orphaned_scenes"].as_i64().unwrap_or(0),
-                    body["promoted"].as_i64().unwrap_or(0),
-                    body["demoted"].as_i64().unwrap_or(0))))
+                let conflicts = Self::require_i64(&body, "memory_consolidate", "conflicts_detected")?;
+                let orphaned = Self::require_i64(&body, "memory_consolidate", "orphaned_scenes")?;
+                let promoted = Self::require_i64(&body, "memory_consolidate", "promoted")?;
+                let demoted = Self::require_i64(&body, "memory_consolidate", "demoted")?;
+                Ok(Self::mcp_text(&format!(
+                    "Consolidation complete: conflicts_detected={conflicts}, orphaned_scenes={orphaned}, promoted={promoted}, demoted={demoted}"
+                )))
             }
 
             "memory_reflect" => {
@@ -580,11 +666,15 @@ impl RemoteClient {
                     .send()
                     .await?;
                 let body = Self::parse_response(r).await?;
-                if body["skipped"].as_bool().unwrap_or(false) {
+                if body["skipped"].as_bool() == Some(true) {
+                    let remaining =
+                        Self::require_i64(&body, "memory_reflect", "cooldown_remaining_s")?;
                     return Ok(Self::mcp_text(&format!(
-                        "Reflection skipped (cooldown: {}s remaining).",
-                        body["cooldown_remaining_s"].as_i64().unwrap_or(0)
+                        "Reflection skipped (cooldown: {remaining}s remaining)."
                     )));
+                }
+                if body.get("candidates").is_none() && body.get("scenes_created").is_none() {
+                    return Err(Self::incomplete_response("memory_reflect"));
                 }
                 if let Some(candidates) = body["candidates"].as_array() {
                     if !candidates.is_empty() {
@@ -612,10 +702,15 @@ impl RemoteClient {
                              then store each via memory_store.\n\n{}", parts.join("\n\n"))));
                     }
                 }
+                let scenes = body["scenes_created"].as_i64().unwrap_or(0);
+                let found = body
+                    .get("candidates")
+                    .and_then(Value::as_array)
+                    .map(|candidates| candidates.len() as i64)
+                    .or_else(|| body["candidates_found"].as_i64())
+                    .unwrap_or(0);
                 Ok(Self::mcp_text(&format!(
-                    "Reflection complete: scenes_created={}, candidates_found={}",
-                    body["scenes_created"].as_i64().unwrap_or(0),
-                    body["candidates_found"].as_i64().unwrap_or(0)
+                    "Reflection complete: scenes_created={scenes}, candidates_found={found}"
                 )))
             }
 
@@ -652,11 +747,9 @@ impl RemoteClient {
                     .json(&json!({"name": args["name"], "description": args["description"]}))
                     .send()
                     .await?;
-                let _body = Self::parse_response(r).await?;
-                Ok(Self::mcp_text(&format!(
-                    "Snapshot '{}' created.",
-                    args["name"].as_str().unwrap_or("")
-                )))
+                let body = Self::parse_response(r).await?;
+                let name = Self::require_str(&body, "memory_snapshot", "name")?;
+                Ok(Self::mcp_text(&format!("Snapshot '{name}' created.")))
             }
 
             "memory_snapshots" => {
@@ -686,10 +779,11 @@ impl RemoteClient {
                     .send()
                     .await?;
                 let body = Self::parse_response(r).await?;
-                Ok(Self::mcp_text(&format!(
-                    "Deleted {} snapshot(s).",
-                    body["deleted"].as_i64().unwrap_or(0)
-                )))
+                if let Some(result) = body["result"].as_str().filter(|text| !text.is_empty()) {
+                    return Ok(Self::mcp_text(result));
+                }
+                let deleted = Self::require_i64(&body, "memory_snapshot_delete", "deleted")?;
+                Ok(Self::mcp_text(&format!("Deleted {deleted} snapshot(s).")))
             }
 
             "memory_rollback" => {
@@ -700,10 +794,9 @@ impl RemoteClient {
                     .json(&json!({}))
                     .send()
                     .await?;
-                let _body = Self::parse_response(r).await?;
-                Ok(Self::mcp_text(&format!(
-                    "Rolled back to snapshot '{name}'."
-                )))
+                let body = Self::parse_response(r).await?;
+                let result = Self::require_str(&body, "memory_rollback", "result")?;
+                Ok(Self::mcp_text(result))
             }
 
             "memory_branch" => {
@@ -717,11 +810,9 @@ impl RemoteClient {
                     }))
                     .send()
                     .await?;
-                let _body = Self::parse_response(r).await?;
-                Ok(Self::mcp_text(&format!(
-                    "Branch '{}' created.",
-                    args["name"].as_str().unwrap_or("")
-                )))
+                let body = Self::parse_response(r).await?;
+                let result = Self::require_str(&body, "memory_branch", "result")?;
+                Ok(Self::mcp_text(result))
             }
 
             "memory_branches" => {
@@ -739,10 +830,8 @@ impl RemoteClient {
                     .send()
                     .await?;
                 let body = Self::parse_response(r).await?;
-                Ok(Self::mcp_text(&format!(
-                    "Switched to branch '{name}'. {} memories.",
-                    body["memory_count"].as_i64().unwrap_or(0)
-                )))
+                let result = Self::require_str(&body, "memory_checkout", "result")?;
+                Ok(Self::mcp_text(result))
             }
 
             "memory_merge" => {
@@ -773,10 +862,14 @@ impl RemoteClient {
                     .send()
                     .await?;
                 let body = Self::parse_response(r).await?;
-                if body["dry_run"].as_bool().unwrap_or(false) {
+                if body["dry_run"].as_bool() == Some(true) {
+                    Ok(Self::mcp_json(&body))
+                } else if let Some(result) = body["result"].as_str() {
+                    Ok(Self::mcp_text(result))
+                } else if body.as_object().is_some_and(|fields| !fields.is_empty()) {
                     Ok(Self::mcp_json(&body))
                 } else {
-                    Ok(Self::mcp_text(body["result"].as_str().unwrap_or("")))
+                    Err(Self::incomplete_response("memory_pick"))
                 }
             }
 
@@ -828,7 +921,7 @@ impl RemoteClient {
                     .delete(self.url(&format!("/v1/branches/{name}")))
                     .send()
                     .await?;
-                let _body = Self::parse_response(r).await?;
+                let _body = Self::parse_response_allow_empty(r).await?;
                 Ok(Self::mcp_text(&format!("Branch '{name}' deleted.")))
             }
 
@@ -869,11 +962,9 @@ impl RemoteClient {
                     .send()
                     .await?;
                 let body = Self::parse_response(r).await?;
+                let feedback_id = Self::require_str(&body, "memory_feedback", "feedback_id")?;
                 Ok(Self::mcp_text(&format!(
-                    "Recorded feedback: memory={}, signal={}, feedback_id={}",
-                    memory_id,
-                    signal,
-                    body["feedback_id"].as_str().unwrap_or("")
+                    "Recorded feedback: memory={memory_id}, signal={signal}, feedback_id={feedback_id}"
                 )))
             }
 
@@ -1058,6 +1149,185 @@ mod tests {
             "Branch 'topic' deleted."
         );
         assert!(result.get("isError").is_none());
+        server.abort();
+    }
+
+    async fn stub(
+        path: &str,
+        status: axum::http::StatusCode,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::http::header::CONTENT_TYPE;
+        use axum::routing::any;
+        let app = Router::new().route(
+            path,
+            any(move || async move { (status, [(CONTENT_TYPE, "application/json")], body) }),
+        );
+        serve(app).await
+    }
+
+    async fn tool_text(base: &str, tool: &str, args: Value) -> Result<String, String> {
+        use crate::tool_result::{execution_error, is_error};
+        let remote = RemoteClient::new(base, None, "test".into(), None);
+        match remote.call(tool, args).await {
+            Ok(result) => {
+                if is_error(&result) {
+                    Err(result["content"][0]["text"].as_str().unwrap_or("").to_string())
+                } else {
+                    Ok(result["content"][0]["text"].as_str().unwrap_or("").to_string())
+                }
+            }
+            Err(error) => Err(execution_error(tool, error)["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_json_tools_do_not_invent_success_from_an_incomplete_body() {
+        use axum::http::StatusCode;
+        let failures = [
+            (
+                "/v1/memories",
+                StatusCode::NO_CONTENT,
+                "",
+                "memory_store",
+                json!({"content": "must be acknowledged"}),
+                "Stored memory",
+            ),
+            (
+                "/v1/memories",
+                StatusCode::OK,
+                "{}",
+                "memory_store",
+                json!({"content": "must be acknowledged"}),
+                "Stored memory",
+            ),
+            (
+                "/v1/governance",
+                StatusCode::OK,
+                "{}",
+                "memory_governance",
+                json!({}),
+                "Governance complete",
+            ),
+            (
+                "/v1/governance",
+                StatusCode::OK,
+                "{}",
+                "memory_rebuild_index",
+                json!({}),
+                "requested",
+            ),
+            (
+                "/v1/branches/topic/checkout",
+                StatusCode::OK,
+                "{}",
+                "memory_checkout",
+                json!({"name": "topic"}),
+                "Switched",
+            ),
+            (
+                "/v1/snapshots",
+                StatusCode::OK,
+                "{}",
+                "memory_snapshot",
+                json!({"name": "snap"}),
+                "created",
+            ),
+            (
+                "/v1/snapshots/snap/rollback",
+                StatusCode::OK,
+                "",
+                "memory_rollback",
+                json!({"name": "snap"}),
+                "Rolled",
+            ),
+            (
+                "/v1/memories/purge",
+                StatusCode::OK,
+                "{}",
+                "memory_purge",
+                json!({"memory_id": "mem_1"}),
+                "Purged",
+            ),
+            (
+                "/v1/memories/retrieve",
+                StatusCode::OK,
+                "{}",
+                "memory_retrieve",
+                json!({"query": "topic"}),
+                "No relevant",
+            ),
+            (
+                "/v1/branches",
+                StatusCode::OK,
+                "{}",
+                "memory_branch",
+                json!({"name": "topic"}),
+                "Created branch",
+            ),
+        ];
+        for (path, status, body, tool, args, forbidden) in failures {
+            let (base, server) = stub(path, status, body).await;
+            let text = tool_text(&base, tool, args)
+                .await
+                .expect_err("incomplete response must not be a success");
+            assert!(!text.contains(forbidden), "{tool}: {text}");
+            assert!(
+                text.contains("empty body") || text.contains("incomplete"),
+                "{tool}: {text}"
+            );
+            server.abort();
+        }
+
+        let (base, server) = stub(
+            "/v1/memories",
+            StatusCode::CREATED,
+            r#"{"memory_id":"mem_1","content":"must be acknowledged"}"#,
+        )
+        .await;
+        let text = tool_text(
+            &base,
+            "memory_store",
+            json!({"content": "must be acknowledged"}),
+        )
+        .await
+        .expect("complete store response");
+        assert!(text.contains("mem_1"), "{text}");
+        server.abort();
+
+        let (base, server) = stub("/v1/memories/retrieve", StatusCode::OK, "[]").await;
+        let text = tool_text(&base, "memory_retrieve", json!({"query": "topic"}))
+            .await
+            .expect("an empty result array is a real response");
+        assert!(text.contains("No relevant memories found."), "{text}");
+        server.abort();
+
+        let (base, server) = stub(
+            "/v1/governance",
+            StatusCode::OK,
+            r#"{"quarantined":2,"cleaned_stale":1}"#,
+        )
+        .await;
+        let text = tool_text(&base, "memory_governance", json!({}))
+            .await
+            .expect("governance counts are a real response");
+        assert!(text.contains("quarantined=2"), "{text}");
+        server.abort();
+
+        let (base, server) = stub(
+            "/v1/branches/topic/checkout",
+            StatusCode::OK,
+            r#"{"result":"Switched to branch 'topic'. 3 memories on this branch."}"#,
+        )
+        .await;
+        let text = tool_text(&base, "memory_checkout", json!({"name": "topic"}))
+            .await
+            .expect("checkout result text");
+        assert!(text.contains("3 memories"), "{text}");
+        assert!(!text.contains("0 memories"), "{text}");
         server.abort();
     }
 
