@@ -116,7 +116,12 @@ impl RemoteClient {
     async fn parse_response(r: reqwest::Response) -> Result<Value> {
         let status = r.status();
         if status.is_success() {
-            return Ok(r.json().await?);
+            // 204 branch delete has no body. An empty success is not a JSON error.
+            let body = r.text().await?;
+            if body.trim().is_empty() {
+                return Ok(Value::Null);
+            }
+            return Ok(serde_json::from_str(&body)?);
         }
         let is_text = r
             .headers()
@@ -531,12 +536,13 @@ impl RemoteClient {
             }
 
             "memory_rebuild_index" => {
-                let _r = self
+                let r = self
                     .client
                     .post(self.url("/v1/governance"))
                     .json(&json!({"force": true}))
                     .send()
                     .await?;
+                let _body = Self::parse_response(r).await?;
                 Ok(Self::mcp_text(
                     "Index rebuild requested via governance endpoint.",
                 ))
@@ -817,10 +823,12 @@ impl RemoteClient {
 
             "memory_branch_delete" => {
                 let name = args["name"].as_str().unwrap_or("");
-                self.client
+                let r = self
+                    .client
                     .delete(self.url(&format!("/v1/branches/{name}")))
                     .send()
                     .await?;
+                let _body = Self::parse_response(r).await?;
                 Ok(Self::mcp_text(&format!("Branch '{name}' deleted.")))
             }
 
@@ -881,11 +889,11 @@ impl RemoteClient {
 #[cfg(test)]
 mod tests {
     use super::RemoteClient;
-    use axum::{
-        extract::{Path, State},
-        routing::post,
-        Json, Router,
-    };
+        use axum::{
+            extract::{Path, State},
+            routing::{delete, post},
+            Json, Router,
+        };
     use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};
 
@@ -966,6 +974,91 @@ mod tests {
             assert!(!text.contains("write may"));
             server.abort();
         }
+    }
+
+    async fn serve(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), server)
+    }
+
+    #[tokio::test]
+    async fn remote_delete_and_rebuild_failures_are_not_successes() {
+        use crate::tool_result::{error_kind, execution_error, is_error, ErrorKind};
+        use axum::http::{header::CONTENT_TYPE, StatusCode};
+
+        let app = Router::new().route(
+            "/v1/branches/:name",
+            delete(|| async {
+                (
+                    StatusCode::CONFLICT,
+                    [(CONTENT_TYPE, "text/plain")],
+                    "Branch 'missing' not found",
+                )
+            }),
+        );
+        let (base, server) = serve(app).await;
+        let remote = RemoteClient::new(&base, None, "test".into(), None);
+        let error = remote
+            .call("memory_branch_delete", json!({"name": "missing"}))
+            .await
+            .expect_err("a 409 must not be reported as a deleted branch");
+        let result = execution_error("memory_branch_delete", error);
+        assert!(is_error(&result));
+        assert_eq!(error_kind(&result), Some(ErrorKind::Rejected));
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Branch 'missing' not found"), "{text}");
+        assert!(!text.contains("deleted"), "{text}");
+        server.abort();
+
+        let app = Router::new().route(
+            "/v1/governance",
+            post(|| async {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [(CONTENT_TYPE, "text/html")],
+                    "<html>private sql</html>",
+                )
+            }),
+        );
+        let (base, server) = serve(app).await;
+        let remote = RemoteClient::new(&base, None, "test".into(), None);
+        let error = remote
+            .call("memory_rebuild_index", json!({"table": "mem_memories"}))
+            .await
+            .expect_err("a 5xx must not be reported as a requested rebuild");
+        let result = execution_error("memory_rebuild_index", error);
+        assert!(is_error(&result));
+        assert_eq!(error_kind(&result), Some(ErrorKind::Backend));
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Check service health"), "{text}");
+        assert!(!text.contains("requested"), "{text}");
+        assert!(!text.contains("private sql"), "{text}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_branch_delete_accepts_empty_success() {
+        use axum::http::StatusCode;
+        let app = Router::new().route(
+            "/v1/branches/:name",
+            delete(|| async { StatusCode::NO_CONTENT }),
+        );
+        let (base, server) = serve(app).await;
+        let remote = RemoteClient::new(&base, None, "test".into(), None);
+        let result = remote
+            .call("memory_branch_delete", json!({"name": "topic"}))
+            .await
+            .expect("204 is a successful delete");
+        assert_eq!(
+            result["content"][0]["text"],
+            "Branch 'topic' deleted."
+        );
+        assert!(result.get("isError").is_none());
+        server.abort();
     }
 
     #[derive(Clone)]
