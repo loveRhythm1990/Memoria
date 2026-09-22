@@ -3,7 +3,7 @@
 
 use crate::purge_args::parse_memory_purge_args;
 use crate::tool_result::error as mcp_error;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use memoria_core::{MemoryType, TrustTier};
 use memoria_git::GitForDataService;
 use memoria_service::{
@@ -427,8 +427,7 @@ pub async fn call(
             let trust_tier = args["trust_tier"]
                 .as_str()
                 .map(TrustTier::from_str)
-                .transpose()
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                .transpose()?;
             let mt = MemoryType::from_str(memory_type).unwrap_or(MemoryType::Semantic);
             let subject_id = args["subject_id"]
                 .as_str()
@@ -821,7 +820,7 @@ pub async fn call(
             let total_rows = sql
                 .rebuild_vector_index(table)
                 .await
-                .map_err(|e| anyhow::anyhow!("rebuild index failed: {e}"))?;
+                .context("rebuild index failed")?;
             Ok(mcp_text(&format!(
                 "Rebuilt IVF index for {table}: rows={total_rows}"
             )))
@@ -930,8 +929,7 @@ pub async fn call(
             let existing_rows = sqlx::query(&existing_sql)
                 .bind(user_id)
                 .fetch_all(sql.pool())
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                .await?;
             let existing_knowledge = existing_rows
                 .iter()
                 .filter_map(|r| r.try_get::<String, _>("content").ok())

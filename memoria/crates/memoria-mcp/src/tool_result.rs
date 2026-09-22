@@ -77,42 +77,59 @@ pub fn is_error(result: &Value) -> bool {
 pub(crate) fn execution_error(tool: &str, error: impl Into<anyhow::Error>) -> Value {
     let error = error.into();
     use memoria_core::MemoriaError;
-    let kind = match error.downcast_ref::<MemoriaError>() {
-        Some(
-            MemoriaError::Validation(_)
-            | MemoriaError::InvalidMemoryType(_)
-            | MemoriaError::InvalidTrustTier(_),
-        ) => ErrorKind::Input,
-        Some(MemoriaError::NotFound(_) | MemoriaError::Blocked(_)) => ErrorKind::Rejected,
-        _ if error.is::<InputError>() => ErrorKind::Input,
-        _ => error
-            .downcast_ref::<RemoteError>()
-            .map(|e| e.kind)
-            .unwrap_or(ErrorKind::Backend),
-    };
+    // Context wrappers hide the concrete type from downcast_ref. Classification
+    // and redaction follow the chain so a preserved source still controls both.
+    let kind = error
+        .chain()
+        .find_map(|cause| {
+            if let Some(mem) = cause.downcast_ref::<MemoriaError>() {
+                return Some(match mem {
+                    MemoriaError::Validation(_)
+                    | MemoriaError::InvalidMemoryType(_)
+                    | MemoriaError::InvalidTrustTier(_) => ErrorKind::Input,
+                    MemoriaError::NotFound(_) | MemoriaError::Blocked(_) => ErrorKind::Rejected,
+                    _ => ErrorKind::Backend,
+                });
+            }
+            if cause.downcast_ref::<InputError>().is_some() {
+                return Some(ErrorKind::Input);
+            }
+            cause
+                .downcast_ref::<RemoteError>()
+                .map(|remote| remote.kind)
+        })
+        .unwrap_or(ErrorKind::Backend);
     if kind == ErrorKind::Backend {
         tracing::warn!(tool, error = %error, "MCP backend execution failed");
     } else {
         tracing::debug!(tool, error = %error, "MCP tool input or operation rejected");
     }
-    let message = match error.downcast_ref::<MemoriaError>() {
-        Some(MemoriaError::Database(_)) => {
-            Some("Storage operation failed. Check service health before retrying.")
+    let message = error.chain().find_map(|cause| {
+        if let Some(mem) = cause.downcast_ref::<MemoriaError>() {
+            return Some(match mem {
+                MemoriaError::Database(_) => {
+                    "Storage operation failed. Check service health before retrying.".to_string()
+                }
+                MemoriaError::Embedding(_) => {
+                    "Embedding service failed. Check service health before retrying.".to_string()
+                }
+                MemoriaError::Internal(_) | MemoriaError::Serialization(_) => {
+                    "Tool execution failed internally. Check server logs before retrying."
+                        .to_string()
+                }
+                _ => cause.to_string(),
+            });
         }
-        Some(MemoriaError::Embedding(_)) => {
-            Some("Embedding service failed. Check service health before retrying.")
+        if cause.downcast_ref::<sqlx::Error>().is_some()
+            || cause.downcast_ref::<reqwest::Error>().is_some()
+        {
+            return Some(
+                "A downstream request failed. Check service health before retrying.".to_string(),
+            );
         }
-        Some(MemoriaError::Internal(_) | MemoriaError::Serialization(_)) => {
-            Some("Tool execution failed internally. Check server logs before retrying.")
-        }
-        _ if error.is::<sqlx::Error>() || error.is::<reqwest::Error>() => {
-            Some("A downstream request failed. Check service health before retrying.")
-        }
-        _ => None,
-    };
-    let mut message = message
-        .map(str::to_string)
-        .unwrap_or_else(|| error.to_string());
+        None
+    });
+    let mut message = message.unwrap_or_else(|| error.to_string());
     if kind == ErrorKind::Backend && may_mutate(tool) {
         message
             .push_str(" A write may have partially completed; check its outcome before retrying.");
@@ -193,5 +210,33 @@ mod tests {
             assert!(is_error(&result));
             assert!(!result.to_string().contains("private SQL"));
         }
+    }
+
+    #[test]
+    fn preserved_error_chains_keep_classification_and_redaction() {
+        let trust =
+            anyhow::Error::from(memoria_core::MemoriaError::InvalidTrustTier("nope".into()));
+        let result = execution_error("memory_store", trust);
+        assert_eq!(error_kind(&result), Some(ErrorKind::Input));
+        assert_eq!(result["content"][0]["text"], "Invalid trust tier: nope");
+        assert!(!result.to_string().contains("write may"));
+
+        let wrapped =
+            anyhow::Error::from(memoria_core::MemoriaError::Database("private SQL".into()))
+                .context("rebuild index failed");
+        let result = execution_error("memory_rebuild_index", wrapped);
+        assert_eq!(error_kind(&result), Some(ErrorKind::Backend));
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Storage operation failed"), "{text}");
+        assert!(!text.contains("private SQL"), "{text}");
+        assert!(text.contains("write may"), "{text}");
+
+        let query = anyhow::Error::from(sqlx::Error::Protocol("private SQL".into()));
+        let result = execution_error("memory_reflect", query);
+        assert_eq!(error_kind(&result), Some(ErrorKind::Backend));
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("downstream request failed"), "{text}");
+        assert!(!text.contains("private SQL"), "{text}");
+        assert!(text.contains("write may"), "{text}");
     }
 }
