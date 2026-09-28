@@ -115,6 +115,29 @@ fn apply_fulltext_score(row: &sqlx::mysql::MySqlRow, memory: &mut Memory) {
     }
 }
 
+fn merge_hybrid_results(
+    vec_results: Vec<Memory>,
+    ft_results: Vec<Memory>,
+) -> (Vec<Memory>, std::collections::HashMap<String, f64>) {
+    let ft_map = ft_results
+        .iter()
+        .filter_map(|m| m.retrieval_score.map(|s| (m.memory_id.clone(), s)))
+        .collect();
+
+    let mut seen: std::collections::HashSet<String> =
+        vec_results.iter().map(|m| m.memory_id.clone()).collect();
+    let mut candidates = vec_results;
+    for mut memory in ft_results {
+        if seen.insert(memory.memory_id.clone()) {
+            // Fulltext scores live in ft_map; retrieval_score on candidates is the vector input.
+            memory.retrieval_score = None;
+            candidates.push(memory);
+        }
+    }
+
+    (candidates, ft_map)
+}
+
 /// Returns true when a failed ALTER TABLE ADD COLUMN was rejected because
 /// the column already exists (MySQL/MatrixOne error 1060).
 /// This is the expected outcome when the column was created by CREATE TABLE
@@ -6150,19 +6173,7 @@ impl SqlMemoryStore {
         let vec_results = vec_results?;
         let ft_results = ft_results.unwrap_or_default();
 
-        let ft_map: std::collections::HashMap<String, f64> = ft_results
-            .iter()
-            .filter_map(|m| m.retrieval_score.map(|s| (m.memory_id.clone(), s)))
-            .collect();
-
-        let mut seen: std::collections::HashSet<String> =
-            vec_results.iter().map(|m| m.memory_id.clone()).collect();
-        let mut candidates = vec_results;
-        for m in ft_results {
-            if seen.insert(m.memory_id.clone()) {
-                candidates.push(m);
-            }
-        }
+        let (mut candidates, ft_map) = merge_hybrid_results(vec_results, ft_results);
 
         let now = chrono::Utc::now();
         const DECAY_HOURS: f64 = 168.0;
@@ -6468,16 +6479,57 @@ fn build_safety_snapshot_name(db_name: Option<&str>, operation: &str) -> String 
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_pool_health, detect_connection_anomaly, should_emit_saturated_warning,
-        validate_extra_metadata_filter, validate_fulltext_query, ConnectionAnomalyKind,
-        OwnedEditLogEntry, PoolHealthLevel, PoolHealthSnapshot, SqlMemoryStore,
-        FULLTEXT_QUERY_MAX_BYTES,
+        classify_pool_health, detect_connection_anomaly, merge_hybrid_results,
+        should_emit_saturated_warning, validate_extra_metadata_filter, validate_fulltext_query,
+        ConnectionAnomalyKind, OwnedEditLogEntry, PoolHealthLevel, PoolHealthSnapshot,
+        SqlMemoryStore, FULLTEXT_QUERY_MAX_BYTES,
     };
+    use memoria_core::{Memory, MemoryType, TrustTier};
     use sqlx::mysql::MySqlPoolOptions;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex, OnceLock};
 
     static LOG_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn hybrid_merge_keeps_fulltext_scores_out_of_vector_score() {
+        let scored_memory = |memory_id: &str, score: f64| Memory {
+            memory_id: memory_id.to_string(),
+            user_id: "u1".to_string(),
+            author_id: None,
+            subject_id: None,
+            memory_type: MemoryType::Semantic,
+            content: String::new(),
+            initial_confidence: 1.0,
+            embedding: None,
+            source_event_ids: Vec::new(),
+            superseded_by: None,
+            is_active: true,
+            access_count: 0,
+            session_id: None,
+            observed_at: None,
+            created_at: None,
+            updated_at: None,
+            extra_metadata: None,
+            trust_tier: TrustTier::T2Curated,
+            retrieval_score: Some(score),
+        };
+
+        let (candidates, ft_map) = merge_hybrid_results(
+            vec![scored_memory("V", 0.8), scored_memory("B", 0.6)],
+            vec![scored_memory("B", 1.0), scored_memory("F", 2.0)],
+        );
+
+        assert_eq!(ft_map.get("B"), Some(&1.0));
+        assert_eq!(ft_map.get("F"), Some(&2.0));
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|m| (m.memory_id.as_str(), m.retrieval_score))
+                .collect::<Vec<_>>(),
+            vec![("V", Some(0.8)), ("B", Some(0.6)), ("F", None)]
+        );
+    }
 
     #[test]
     fn metadata_and_fulltext_validation_are_enforced_at_storage_boundary() {
