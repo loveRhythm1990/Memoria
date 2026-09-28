@@ -646,7 +646,8 @@ impl RemoteClient {
                         "Consolidation skipped (cooldown: {remaining}s remaining)."
                     )));
                 }
-                let conflicts = Self::require_i64(&body, "memory_consolidate", "conflicts_detected")?;
+                let conflicts =
+                    Self::require_i64(&body, "memory_consolidate", "conflicts_detected")?;
                 let orphaned = Self::require_i64(&body, "memory_consolidate", "orphaned_scenes")?;
                 let promoted = Self::require_i64(&body, "memory_consolidate", "promoted")?;
                 let demoted = Self::require_i64(&body, "memory_consolidate", "demoted")?;
@@ -673,10 +674,18 @@ impl RemoteClient {
                         "Reflection skipped (cooldown: {remaining}s remaining)."
                     )));
                 }
-                if body.get("candidates").is_none() && body.get("scenes_created").is_none() {
+                let candidates = match body.get("candidates") {
+                    None => None,
+                    Some(value) => Some(
+                        value
+                            .as_array()
+                            .ok_or_else(|| Self::incomplete_response("memory_reflect"))?,
+                    ),
+                };
+                if candidates.is_none() && body.get("scenes_created").is_none() {
                     return Err(Self::incomplete_response("memory_reflect"));
                 }
-                if let Some(candidates) = body["candidates"].as_array() {
+                if let Some(candidates) = candidates {
                     if !candidates.is_empty() {
                         let parts: Vec<String> = candidates
                             .iter()
@@ -702,13 +711,13 @@ impl RemoteClient {
                              then store each via memory_store.\n\n{}", parts.join("\n\n"))));
                     }
                 }
-                let scenes = body["scenes_created"].as_i64().unwrap_or(0);
-                let found = body
-                    .get("candidates")
-                    .and_then(Value::as_array)
-                    .map(|candidates| candidates.len() as i64)
-                    .or_else(|| body["candidates_found"].as_i64())
-                    .unwrap_or(0);
+                // Every remaining success variant of /v1/reflect reports scenes_created, plus
+                // either the candidate array or candidates_found.
+                let scenes = Self::require_i64(&body, "memory_reflect", "scenes_created")?;
+                let found = match candidates {
+                    Some(candidates) => candidates.len() as i64,
+                    None => Self::require_i64(&body, "memory_reflect", "candidates_found")?,
+                };
                 Ok(Self::mcp_text(&format!(
                     "Reflection complete: scenes_created={scenes}, candidates_found={found}"
                 )))
@@ -863,14 +872,15 @@ impl RemoteClient {
                     .await?;
                 let body = Self::parse_response(r).await?;
                 if body["dry_run"].as_bool() == Some(true) {
-                    Ok(Self::mcp_json(&body))
-                } else if let Some(result) = body["result"].as_str() {
-                    Ok(Self::mcp_text(result))
-                } else if body.as_object().is_some_and(|fields| !fields.is_empty()) {
-                    Ok(Self::mcp_json(&body))
-                } else {
-                    Err(Self::incomplete_response("memory_pick"))
+                    // A preview is only trustworthy with the full envelope; the flag alone
+                    // cannot tell a real preview from a truncated mutation acknowledgement.
+                    Self::require_str(&body, "memory_pick", "result")?;
+                    Self::require_i64(&body["summary"], "memory_pick", "candidate_count")?;
+                    Self::require_i64(&body["page"], "memory_pick", "limit")?;
+                    return Ok(Self::mcp_json(&body));
                 }
+                let result = Self::require_str(&body, "memory_pick", "result")?;
+                Ok(Self::mcp_text(result))
             }
 
             "memory_diff" => {
@@ -980,11 +990,11 @@ impl RemoteClient {
 #[cfg(test)]
 mod tests {
     use super::RemoteClient;
-        use axum::{
-            extract::{Path, State},
-            routing::{delete, post},
-            Json, Router,
-        };
+    use axum::{
+        extract::{Path, State},
+        routing::{delete, post},
+        Json, Router,
+    };
     use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};
 
@@ -1144,10 +1154,7 @@ mod tests {
             .call("memory_branch_delete", json!({"name": "topic"}))
             .await
             .expect("204 is a successful delete");
-        assert_eq!(
-            result["content"][0]["text"],
-            "Branch 'topic' deleted."
-        );
+        assert_eq!(result["content"][0]["text"], "Branch 'topic' deleted.");
         assert!(result.get("isError").is_none());
         server.abort();
     }
@@ -1172,9 +1179,15 @@ mod tests {
         match remote.call(tool, args).await {
             Ok(result) => {
                 if is_error(&result) {
-                    Err(result["content"][0]["text"].as_str().unwrap_or("").to_string())
+                    Err(result["content"][0]["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string())
                 } else {
-                    Ok(result["content"][0]["text"].as_str().unwrap_or("").to_string())
+                    Ok(result["content"][0]["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string())
                 }
             }
             Err(error) => Err(execution_error(tool, error)["content"][0]["text"]
@@ -1268,6 +1281,38 @@ mod tests {
                 json!({"name": "topic"}),
                 "Created branch",
             ),
+            (
+                "/v1/branches/:name/pick",
+                StatusCode::OK,
+                r#"{"unexpected":1}"#,
+                "memory_pick",
+                json!({"source": "topic", "target": "main", "selector": {"type": "key_list", "keys": ["m1"]}}),
+                "unexpected",
+            ),
+            (
+                "/v1/branches/:name/pick",
+                StatusCode::OK,
+                r#"{"dry_run":true}"#,
+                "memory_pick",
+                json!({"source": "topic", "target": "main", "selector": {"type": "key_list", "keys": ["m1"]}, "dry_run": {}}),
+                "dry_run",
+            ),
+            (
+                "/v1/reflect",
+                StatusCode::OK,
+                r#"{"candidates":null}"#,
+                "memory_reflect",
+                json!({"mode": "candidates"}),
+                "Reflection complete",
+            ),
+            (
+                "/v1/reflect",
+                StatusCode::OK,
+                r#"{"scenes_created":2}"#,
+                "memory_reflect",
+                json!({}),
+                "Reflection complete",
+            ),
         ];
         for (path, status, body, tool, args, forbidden) in failures {
             let (base, server) = stub(path, status, body).await;
@@ -1328,6 +1373,63 @@ mod tests {
             .expect("checkout result text");
         assert!(text.contains("3 memories"), "{text}");
         assert!(!text.contains("0 memories"), "{text}");
+        server.abort();
+
+        let pick_args = json!({"source": "topic", "target": "main", "selector": {"type": "key_list", "keys": ["m1"]}});
+        let (base, server) = stub(
+            "/v1/branches/:name/pick",
+            StatusCode::OK,
+            r#"{"result":"Picked 1 memory from branch 'topic' into 'main'."}"#,
+        )
+        .await;
+        let text = tool_text(&base, "memory_pick", pick_args.clone())
+            .await
+            .expect("a confirmed pick result is a real response");
+        assert!(text.contains("Picked 1 memory"), "{text}");
+        server.abort();
+
+        let (base, server) = stub(
+            "/v1/branches/:name/pick",
+            StatusCode::OK,
+            r#"{"dry_run":true,"result":"Previewed 1 candidate change(s).","summary":{"candidate_count":1},"page":{"limit":20,"offset":0}}"#,
+        )
+        .await;
+        let mut dry_run_args = pick_args;
+        dry_run_args["dry_run"] = json!({});
+        let text = tool_text(&base, "memory_pick", dry_run_args)
+            .await
+            .expect("a full preview envelope is a real response");
+        assert!(text.contains("Previewed 1 candidate"), "{text}");
+        server.abort();
+
+        let (base, server) = stub(
+            "/v1/reflect",
+            StatusCode::OK,
+            r#"{"candidates":[],"scenes_created":0}"#,
+        )
+        .await;
+        let text = tool_text(&base, "memory_reflect", json!({"mode": "candidates"}))
+            .await
+            .expect("an empty candidate array is a real response");
+        assert!(
+            text.contains("scenes_created=0, candidates_found=0"),
+            "{text}"
+        );
+        server.abort();
+
+        let (base, server) = stub(
+            "/v1/reflect",
+            StatusCode::OK,
+            r#"{"scenes_created":2,"candidates_found":3}"#,
+        )
+        .await;
+        let text = tool_text(&base, "memory_reflect", json!({}))
+            .await
+            .expect("reflect counts are a real response");
+        assert!(
+            text.contains("scenes_created=2, candidates_found=3"),
+            "{text}"
+        );
         server.abort();
     }
 
