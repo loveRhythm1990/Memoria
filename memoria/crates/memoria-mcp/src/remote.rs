@@ -124,6 +124,25 @@ impl RemoteClient {
         .into()
     }
 
+    /// A backend that swaps the pick mode either mutated a branch that was only meant to be
+    /// previewed, or skipped a requested mutation. Both are backend contract failures, so
+    /// `execution_error` adds the partial-write warning for this mutating tool.
+    fn pick_mode_mismatch(preview_requested: bool) -> anyhow::Error {
+        use crate::tool_result::{ErrorKind, RemoteError};
+        let message = if preview_requested {
+            "Remote API ignored the requested memory_pick dry-run and answered with an execution \
+             result. Verify whether the target branch changed before retrying."
+        } else {
+            "Remote API answered a memory_pick execution with a dry-run preview, so nothing is \
+             confirmed as applied. Check service health before retrying."
+        };
+        RemoteError {
+            kind: ErrorKind::Backend,
+            message: message.to_string(),
+        }
+        .into()
+    }
+
     fn require_object<'a>(
         body: &'a Value,
         tool: &str,
@@ -145,6 +164,31 @@ impl RemoteClient {
             .get(field)
             .and_then(Value::as_i64)
             .ok_or_else(|| Self::incomplete_response(tool))
+    }
+
+    fn require_array<'a>(body: &'a Value, tool: &str, field: &str) -> Result<&'a Vec<Value>> {
+        Self::require_object(body, tool)?
+            .get(field)
+            .and_then(Value::as_array)
+            .ok_or_else(|| Self::incomplete_response(tool))
+    }
+
+    /// `/v1/branches/:source/apply` answers with a serialized `ApplyResult`. Without every
+    /// outcome list the applied/skipped split is unknown, so the write is unconfirmed.
+    fn require_apply_result(body: &Value) -> Result<()> {
+        for field in [
+            "applied_adds",
+            "skipped_adds",
+            "applied_updates",
+            "skipped_updates",
+            "applied_removes",
+            "skipped_removes",
+            "applied_conflicts",
+            "skipped_conflicts",
+        ] {
+            Self::require_array(body, "memory_apply", field)?;
+        }
+        Ok(())
     }
 
     fn require_bool(body: &Value, tool: &str, field: &str) -> Result<bool> {
@@ -852,13 +896,16 @@ impl RemoteClient {
                     .send()
                     .await?;
                 let body = Self::parse_response(r).await?;
-                Ok(Self::mcp_json(&body))
+                let result = Self::require_str(&body, "memory_merge", "result")?;
+                Ok(Self::mcp_text(result))
             }
 
             "memory_pick" => {
                 let source = args["source"].as_str().unwrap_or("");
                 let target = args["target"].as_str().unwrap_or("main");
                 let strategy = args["strategy"].as_str().unwrap_or("fail");
+                let dry_run = args.get("dry_run").cloned().unwrap_or(Value::Null);
+                let preview_requested = !dry_run.is_null();
                 let r = self
                     .client
                     .post(self.url(&format!("/v1/branches/{source}/pick")))
@@ -866,12 +913,18 @@ impl RemoteClient {
                         "target": target,
                         "strategy": strategy,
                         "selector": args["selector"],
-                        "dry_run": args.get("dry_run").cloned().unwrap_or(Value::Null),
+                        "dry_run": dry_run,
                     }))
                     .send()
                     .await?;
                 let body = Self::parse_response(r).await?;
-                if body["dry_run"].as_bool() == Some(true) {
+                // The caller's request decides which contract applies; trusting the response
+                // flag would let a backend that ignores the preview option report a real
+                // mutation as a preview.
+                if preview_requested != (body["dry_run"].as_bool() == Some(true)) {
+                    return Err(Self::pick_mode_mismatch(preview_requested));
+                }
+                if preview_requested {
                     // A preview is only trustworthy with the full envelope; the flag alone
                     // cannot tell a real preview from a truncated mutation acknowledgement.
                     Self::require_str(&body, "memory_pick", "result")?;
@@ -921,6 +974,7 @@ impl RemoteClient {
                     .send()
                     .await?;
                 let body = Self::parse_response(r).await?;
+                Self::require_apply_result(&body)?;
                 Ok(Self::mcp_json(&body))
             }
 
@@ -1313,6 +1367,30 @@ mod tests {
                 json!({}),
                 "Reflection complete",
             ),
+            (
+                "/v1/branches/:name/merge",
+                StatusCode::OK,
+                "{}",
+                "memory_merge",
+                json!({"source": "topic"}),
+                "{}",
+            ),
+            (
+                "/v1/branches/:source/apply",
+                StatusCode::OK,
+                "{}",
+                "memory_apply",
+                json!({"source": "topic", "adds": ["m1"]}),
+                "{}",
+            ),
+            (
+                "/v1/branches/:source/apply",
+                StatusCode::OK,
+                r#"{"applied_adds":["m1"],"applied_updates":[],"applied_removes":[],"applied_conflicts":[]}"#,
+                "memory_apply",
+                json!({"source": "topic", "adds": ["m1"]}),
+                "applied_adds",
+            ),
         ];
         for (path, status, body, tool, args, forbidden) in failures {
             let (base, server) = stub(path, status, body).await;
@@ -1431,6 +1509,51 @@ mod tests {
             "{text}"
         );
         server.abort();
+
+        let (base, server) = stub(
+            "/v1/branches/:name/merge",
+            StatusCode::OK,
+            r#"{"result":"Merged 2 memories from 'topic' into main."}"#,
+        )
+        .await;
+        let text = tool_text(&base, "memory_merge", json!({"source": "topic"}))
+            .await
+            .expect("merge result text");
+        assert!(text.contains("Merged 2 memories"), "{text}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_pick_requires_the_mode_the_caller_asked_for() {
+        use axum::http::StatusCode;
+        let args = json!({"source": "topic", "target": "main", "selector": {"type": "key_list", "keys": ["m1"]}});
+        let execution_body = r#"{"result":"Picked 1 memory from branch 'topic' into 'main'."}"#;
+        let preview_body = r#"{"dry_run":true,"result":"Previewed 1 candidate change(s).","summary":{"candidate_count":1},"page":{"limit":20,"offset":0}}"#;
+
+        // A backend that ignores the preview option may already have changed the target
+        // branch, so a preview request answered with an execution result must not succeed.
+        let (base, server) = stub("/v1/branches/:name/pick", StatusCode::OK, execution_body).await;
+        let mut preview_args = args.clone();
+        preview_args["dry_run"] = json!({});
+        let text = tool_text(&base, "memory_pick", preview_args)
+            .await
+            .expect_err("an execution result cannot answer a preview request");
+        assert!(!text.contains("Picked 1 memory"), "{text}");
+        assert!(
+            text.contains("ignored the requested memory_pick dry-run"),
+            "{text}"
+        );
+        assert!(text.contains("write may"), "{text}");
+        server.abort();
+
+        // The opposite swap applied nothing at all.
+        let (base, server) = stub("/v1/branches/:name/pick", StatusCode::OK, preview_body).await;
+        let text = tool_text(&base, "memory_pick", args)
+            .await
+            .expect_err("a preview cannot answer an execution request");
+        assert!(!text.contains("Previewed"), "{text}");
+        assert!(text.contains("nothing is confirmed as applied"), "{text}");
+        server.abort();
     }
 
     #[derive(Clone)]
@@ -1457,9 +1580,13 @@ mod tests {
                         *capture.body.lock().unwrap() = Some(payload);
                         Json(json!({
                             "applied_adds": ["new-id"],
+                            "skipped_adds": [],
                             "applied_updates": [],
+                            "skipped_updates": [],
                             "applied_removes": [],
-                            "applied_conflicts": []
+                            "skipped_removes": [],
+                            "applied_conflicts": [],
+                            "skipped_conflicts": []
                         }))
                     },
                 ),
@@ -1535,9 +1662,13 @@ mod tests {
                         *capture.body.lock().unwrap() = Some(payload);
                         Json(json!({
                             "applied_adds": [],
+                            "skipped_adds": [],
                             "applied_updates": [],
+                            "skipped_updates": [],
                             "applied_removes": [],
-                            "applied_conflicts": []
+                            "skipped_removes": [],
+                            "applied_conflicts": [],
+                            "skipped_conflicts": []
                         }))
                     },
                 ),
