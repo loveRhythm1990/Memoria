@@ -6,7 +6,7 @@
 
 ## 当前是否完善
 
-当前版本可以交给同事 review：核心 Add/Search、MatrixOne 持久化、幂等、用户隔离已实现，公共 LoCoMo 写入、检索、回答与评分流程已跑通。当前含来源上下文补全的固定 150 题已完成；最新完整回归套件尚未重跑。
+当前版本可以交给同事 review：核心 Add/Search、MatrixOne 持久化、幂等、用户隔离已实现，公共 LoCoMo 写入、检索、回答与评分流程已跑通。当前含来源上下文补全的固定 150 题已完成；同步 main 后已有 307/307 最小测试断言通过，完整回归套件尚未重跑。
 
 **尚不能作为已完成正式参评准备的版本。** 物理清理、部署容量验证、正式模型配置核对及官方 Smoke 尚待完成。检索质量优化需根据评测定位，不应把参考原型的全部算法自动视为必需迁移项。
 
@@ -26,7 +26,7 @@
 - 分支：`feat/aml-text-adapter`。
 - 实现及现有运行证据基线：`689f3f9badf0ae1eba3652ab91a8a329dc08701b`，v0.5.2；PR 分支已同步目标 `origin/main` 的 `e180dff`。
 - GitHub 审查仓库：`loveRhythm1990/Memoria`（本机 remote 名为 `origin`）；审查分支为 `feat/aml-text-adapter`，PR 目标为该仓库的 `main`。代码作为分支提交交付，尚未合并；审查应注明具体 commit。
-- 目标 main 比运行基线新增 4 个提交，已合入审查分支。`store.rs` 候选合并冲突已整合为 main 的合并函数与 AML 独立向量分数映射；已有运行证据不覆盖同步后的完整版本，同步后 API／CLI `cargo check` 通过；评测及完整回归尚未重跑。
+- 目标 main 比运行基线新增 4 个提交，已合入审查分支。`store.rs` 候选合并冲突已整合为 main 的合并函数与 AML 独立向量分数映射；已有运行证据不覆盖同步后的完整版本，同步后 API／CLI 编译、Docker release 和真实接口最小测试通过；LoCoMo 及完整回归尚未重跑。
 
 建议按下面顺序阅读：
 
@@ -41,6 +41,7 @@
 | `memoria/crates/memoria-storage/src/graph/retriever.rs`、`graph/store.rs` | 图路径来源策略查询、降级与有界主键读取 |
 | `memoria/crates/memoria-storage/src/store.rs` | 来源请求表、幂等查询、事务、并发重试、通用 insert 重构 |
 | `memoria/crates/memoria-api/tests/aml_adapter.rs` | 真实 MatrixOne/HTTP 测试的断言与边界 |
+| `scripts/aml_minimal_test.py`、`docs/aml-test-results.md`、`docs/evaluation/` | 可复跑的最小脚本、实际断言与证据位置、历史 LoCoMo 汇总及结果边界 |
 | `.env.example`、`docker-compose.yml`、`docs/aml-text-adapter.md` | 部署与公开容量说明 |
 
 ## 交接原型的功能对应关系
@@ -78,6 +79,7 @@
 |---|---|---|
 | 本轮排序与来源策略编译／部署 | API/CLI `cargo check`、Docker release 构建通过；API 已重建并重启，健康接口 HTTP 200 | 两组质量小集已完成；最新优化的单元／独立数据库集成套件尚未重跑 |
 | 批次内来源上下文补全 | 已通过编译和 release 部署；本地 ±2／5／20，实际主键读、幂等及用户隔离检查通过；四个目标回复确认被补齐 | 默认仍关闭；完整分支／停用／治理边界套件未重跑，旧数据不补链接；前位排序、时间题与时延代价见统一设计文档 |
+| AML 合成最小测试 | 8 个中英文场景、40 道主问题；307/307 协议／行为断言通过，Top 100／10 各 40/40 预期片段完整覆盖 | 同步 main 后的实际服务；无 Answer/Judge，小场景不代表官方质量。脚本与结果见 [测试结果](aml-test-results.md) |
 | API 单元测试 | 实现时 103 项通过 | 本文整理未重新运行 |
 | Clippy | 实现时相关 API/lib/test 范围通过 `-D warnings` | 本文整理未重新运行 |
 | 真实 MatrixOne + HTTP 集成测试 | 实现时 3 项通过 | 默认 ignore，需显式数据库；不是 3 个简单接口用例 |
@@ -118,7 +120,7 @@
 
 - 已有 20 题完成 Qwen3-14B refined judge；结合人工复核区分召回、回答与裁判问题。
 - 跨对话固定抽样、调度和汇总已实现；冻结 150 题开发／50 题保留验证，完整运行与质量结论以设计文档为准。
-- 本阶段限定 AML 文本参评：先建立只走 Add/Search 的 AML 能力小集，再做固定 LoCoMo 的输出排序对照，补全预算另行实验；不扩展为全产品评测。50 题保留集与 861 题全集只验证 LoCoMo 范围。具体工作及官方契约核对见设计文档“AML 文本参评：下一步执行顺序”。
+- 本阶段限定 AML 文本参评：基础 Add/Search 小集已完成，继续扩展难例／回答验收，再做固定 LoCoMo 的输出排序对照，补全预算另行实验；不扩展为全产品评测。50 题保留集与 861 题全集只验证 LoCoMo 范围。具体工作及官方契约核对见设计文档“AML 文本参评：下一步执行顺序”。
 - 七能力覆盖单独规划，不把公共 LoCoMo 或原有 core-v1 当作完整官方套件。
 
 ## 本地客户端审查路径
@@ -139,4 +141,4 @@
 
 旧目录 `~/runtime-agent/aml-review-package` 不是当前实现快照，请使用上述本地快照，GitHub 审查以分支 commit 为准。快照不包含私有 `.env`、模型 Key、数据库、评测正文／预测日志或上游数据集；仅包含密钥占位用的 `.env.example`。个人本机 `AGENTS.md` 不作为产品补丁交付。上游来源与固定 commit 在客户端文档中保留；同事原型使用已有原始审查快照，其 README 性能声明未重新测量。
 
-补丁以指定基线生成，包含新增文件；在干净的同版本 checkout 中先执行 `git apply --check memoria.patch`，确认后再 apply。不要在已有本次修改的 worktree 再次 apply。本地包记录提交前的快照，包含的“未提交”状态仅描述打包时刻。当前 GitHub 审查以分支及 PR 的具体 commit 为准；使用本地包时注明基线和补丁 SHA256。
+补丁以指定基线生成，包含新增文件；在干净的同版本 checkout 中先执行 `git apply --check memoria.patch`，确认后再 apply。不要在已有本次修改的 worktree 再次 apply。本地包不包含同步 main 及本轮最小测试；它记录提交前的快照，包含的“未提交”状态仅描述打包时刻。当前 GitHub 审查以分支及 PR 的具体 commit 为准；使用本地包时注明基线和补丁 SHA256。

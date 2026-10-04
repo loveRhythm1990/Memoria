@@ -1,0 +1,490 @@
+{
+  "baseline_suite": "stratified-0c424dce4e884c73b00cb90cd00a90c1",
+  "context_suite": "stratified-b52e2c7003d14d8ba6811f0ed88d6e8d",
+  "baseline_summary": {
+    "count": 150,
+    "metrics": {
+      "llm_score": {
+        "count": 150,
+        "missing_count": 0,
+        "mean": 0.7866666666666666,
+        "min": 0.0,
+        "max": 1.0
+      },
+      "f1_score": {
+        "count": 150,
+        "missing_count": 0,
+        "mean": 0.4246457442383333,
+        "min": 0.0,
+        "max": 1.0
+      },
+      "bleu_score": {
+        "count": 150,
+        "missing_count": 0,
+        "mean": 0.3333621319245489,
+        "min": 0.0,
+        "max": 1.0
+      }
+    },
+    "llm_score": 0.7866666666666666,
+    "f1_score": 0.4246457442383333,
+    "bleu_score": 0.3333621319245489
+  },
+  "context_summary": {
+    "count": 150,
+    "metrics": {
+      "llm_score": {
+        "count": 150,
+        "missing_count": 0,
+        "mean": 0.8466666666666667,
+        "min": 0.0,
+        "max": 1.0
+      },
+      "f1_score": {
+        "count": 150,
+        "missing_count": 0,
+        "mean": 0.42037993136905777,
+        "min": 0.0,
+        "max": 1.0
+      },
+      "bleu_score": {
+        "count": 150,
+        "missing_count": 0,
+        "mean": 0.31846080329733584,
+        "min": 0.0,
+        "max": 1.0
+      }
+    },
+    "llm_score": 0.8466666666666667,
+    "f1_score": 0.42037993136905777,
+    "bleu_score": 0.31846080329733584
+  },
+  "baseline_lexical": {
+    "count": 150,
+    "metrics": {
+      "f1_score": {
+        "count": 150,
+        "missing_count": 0,
+        "mean": 0.4265505061430952,
+        "min": 0.0,
+        "max": 1.0
+      },
+      "bleu_score": {
+        "count": 150,
+        "missing_count": 0,
+        "mean": 0.33469546525788224,
+        "min": 0.0,
+        "max": 1.0
+      }
+    },
+    "f1_score": 0.4265505061430952,
+    "bleu_score": 0.33469546525788224
+  },
+  "context_lexical": {
+    "count": 150,
+    "metrics": {
+      "f1_score": {
+        "count": 150,
+        "missing_count": 0,
+        "mean": 0.4222846932738197,
+        "min": 0.0,
+        "max": 1.0
+      },
+      "bleu_score": {
+        "count": 150,
+        "missing_count": 0,
+        "mean": 0.3197941366306692,
+        "min": 0.0,
+        "max": 1.0
+      }
+    },
+    "f1_score": 0.4222846932738197,
+    "bleu_score": 0.3197941366306692
+  },
+  "baseline_categories": {
+    "1": {
+      "count": 14,
+      "metrics": {
+        "llm_score": {
+          "count": 14,
+          "missing_count": 0,
+          "mean": 0.6428571428571429,
+          "min": 0.0,
+          "max": 1.0
+        },
+        "f1_score": {
+          "count": 14,
+          "missing_count": 0,
+          "mean": 0.34673091206179446,
+          "min": 0.0,
+          "max": 0.6666666666666666
+        },
+        "bleu_score": {
+          "count": 14,
+          "missing_count": 0,
+          "mean": 0.22212137795615297,
+          "min": 0.0,
+          "max": 0.5
+        }
+      },
+      "llm_score": 0.6428571428571429,
+      "f1_score": 0.34673091206179446,
+      "bleu_score": 0.22212137795615297
+    },
+    "2": {
+      "count": 27,
+      "metrics": {
+        "llm_score": {
+          "count": 27,
+          "missing_count": 0,
+          "mean": 0.5555555555555556,
+          "min": 0.0,
+          "max": 1.0
+        },
+        "f1_score": {
+          "count": 27,
+          "missing_count": 0,
+          "mean": 0.3813868925755526,
+          "min": 0.0,
+          "max": 1.0
+        },
+        "bleu_score": {
+          "count": 27,
+          "missing_count": 0,
+          "mean": 0.29478261988688825,
+          "min": 0.0,
+          "max": 1.0
+        }
+      },
+      "llm_score": 0.5555555555555556,
+      "f1_score": 0.3813868925755526,
+      "bleu_score": 0.29478261988688825
+    },
+    "3": {
+      "count": 7,
+      "metrics": {
+        "llm_score": {
+          "count": 7,
+          "missing_count": 0,
+          "mean": 0.8571428571428571,
+          "min": 0.0,
+          "max": 1.0
+        },
+        "f1_score": {
+          "count": 7,
+          "missing_count": 0,
+          "mean": 0.33402144468542855,
+          "min": 0.0,
+          "max": 0.8571428571428571
+        },
+        "bleu_score": {
+          "count": 7,
+          "missing_count": 0,
+          "mean": 0.25476190476190474,
+          "min": 0.0,
+          "max": 0.75
+        }
+      },
+      "llm_score": 0.8571428571428571,
+      "f1_score": 0.33402144468542855,
+      "bleu_score": 0.25476190476190474
+    },
+    "4": {
+      "count": 102,
+      "metrics": {
+        "llm_score": {
+          "count": 102,
+          "missing_count": 0,
+          "mean": 0.8627450980392157,
+          "min": 0.0,
+          "max": 1.0
+        },
+        "f1_score": {
+          "count": 102,
+          "missing_count": 0,
+          "mean": 0.4530101240641858,
+          "min": 0.0,
+          "max": 1.0
+        },
+        "bleu_score": {
+          "count": 102,
+          "missing_count": 0,
+          "mean": 0.36423682771585175,
+          "min": 0.0,
+          "max": 1.0
+        }
+      },
+      "llm_score": 0.8627450980392157,
+      "f1_score": 0.4530101240641858,
+      "bleu_score": 0.36423682771585175
+    }
+  },
+  "context_categories": {
+    "1": {
+      "count": 14,
+      "metrics": {
+        "llm_score": {
+          "count": 14,
+          "missing_count": 0,
+          "mean": 0.8571428571428571,
+          "min": 0.0,
+          "max": 1.0
+        },
+        "f1_score": {
+          "count": 14,
+          "missing_count": 0,
+          "mean": 0.4223127513249733,
+          "min": 0.03225806451612903,
+          "max": 0.8571428571428571
+        },
+        "bleu_score": {
+          "count": 14,
+          "missing_count": 0,
+          "mean": 0.28802960619347623,
+          "min": 0.01639344262295082,
+          "max": 0.75
+        }
+      },
+      "llm_score": 0.8571428571428571,
+      "f1_score": 0.4223127513249733,
+      "bleu_score": 0.28802960619347623
+    },
+    "2": {
+      "count": 27,
+      "metrics": {
+        "llm_score": {
+          "count": 27,
+          "missing_count": 0,
+          "mean": 0.48148148148148145,
+          "min": 0.0,
+          "max": 1.0
+        },
+        "f1_score": {
+          "count": 27,
+          "missing_count": 0,
+          "mean": 0.3088570480937794,
+          "min": 0.0,
+          "max": 0.7692307692307692
+        },
+        "bleu_score": {
+          "count": 27,
+          "missing_count": 0,
+          "mean": 0.21977527183695073,
+          "min": 0.0,
+          "max": 0.7142857142857143
+        }
+      },
+      "llm_score": 0.48148148148148145,
+      "f1_score": 0.3088570480937794,
+      "bleu_score": 0.21977527183695073
+    },
+    "3": {
+      "count": 7,
+      "metrics": {
+        "llm_score": {
+          "count": 7,
+          "missing_count": 0,
+          "mean": 0.8571428571428571,
+          "min": 0.0,
+          "max": 1.0
+        },
+        "f1_score": {
+          "count": 7,
+          "missing_count": 0,
+          "mean": 0.22447066924239234,
+          "min": 0.0,
+          "max": 0.8571428571428571
+        },
+        "bleu_score": {
+          "count": 7,
+          "missing_count": 0,
+          "mean": 0.16853281853281854,
+          "min": 0.0,
+          "max": 0.75
+        }
+      },
+      "llm_score": 0.8571428571428571,
+      "f1_score": 0.22447066924239234,
+      "bleu_score": 0.16853281853281854
+    },
+    "4": {
+      "count": 102,
+      "metrics": {
+        "llm_score": {
+          "count": 102,
+          "missing_count": 0,
+          "mean": 0.9411764705882353,
+          "min": 0.0,
+          "max": 1.0
+        },
+        "f1_score": {
+          "count": 102,
+          "missing_count": 0,
+          "mean": 0.46308015885862996,
+          "min": 0.0,
+          "max": 1.0
+        },
+        "bleu_score": {
+          "count": 102,
+          "missing_count": 0,
+          "mean": 0.35904945037808145,
+          "min": 0.0,
+          "max": 1.0
+        }
+      },
+      "llm_score": 0.9411764705882353,
+      "f1_score": 0.46308015885862996,
+      "bleu_score": 0.35904945037808145
+    }
+  },
+  "baseline_coverage": {
+    "1": {
+      "annotated_questions": 149,
+      "questions_any_hit": 59,
+      "questions_all_hit": 52,
+      "evidence_hits": 59,
+      "evidence_total": 185
+    },
+    "5": {
+      "annotated_questions": 149,
+      "questions_any_hit": 103,
+      "questions_all_hit": 90,
+      "evidence_hits": 109,
+      "evidence_total": 185
+    },
+    "20": {
+      "annotated_questions": 149,
+      "questions_any_hit": 116,
+      "questions_all_hit": 104,
+      "evidence_hits": 127,
+      "evidence_total": 185
+    },
+    "100": {
+      "annotated_questions": 149,
+      "questions_any_hit": 132,
+      "questions_all_hit": 121,
+      "evidence_hits": 152,
+      "evidence_total": 185
+    }
+  },
+  "context_coverage": {
+    "1": {
+      "annotated_questions": 149,
+      "questions_any_hit": 13,
+      "questions_all_hit": 12,
+      "evidence_hits": 13,
+      "evidence_total": 185
+    },
+    "5": {
+      "annotated_questions": 149,
+      "questions_any_hit": 100,
+      "questions_all_hit": 91,
+      "evidence_hits": 106,
+      "evidence_total": 185
+    },
+    "20": {
+      "annotated_questions": 149,
+      "questions_any_hit": 129,
+      "questions_all_hit": 123,
+      "evidence_hits": 147,
+      "evidence_total": 185
+    },
+    "100": {
+      "annotated_questions": 149,
+      "questions_any_hit": 142,
+      "questions_all_hit": 136,
+      "evidence_hits": 167,
+      "evidence_total": 185
+    }
+  },
+  "baseline_latency": {
+    "add": {
+      "attempt_count": 328,
+      "mean_ms": 331.8046036585366,
+      "p95_ms": 551.91,
+      "statuses": {
+        "200": 328
+      }
+    },
+    "search": {
+      "attempt_count": 150,
+      "mean_ms": 318.457,
+      "p95_ms": 511.41,
+      "statuses": {
+        "200": 150
+      }
+    },
+    "answer": {
+      "count": 150,
+      "mean_ms": 3693.830066666667,
+      "p95_ms": 3649.95
+    }
+  },
+  "context_latency": {
+    "add": {
+      "attempt_count": 328,
+      "mean_ms": 460.76262195121956,
+      "p95_ms": 802.27,
+      "statuses": {
+        "200": 328
+      }
+    },
+    "search": {
+      "attempt_count": 150,
+      "mean_ms": 468.3992666666667,
+      "p95_ms": 835.37,
+      "statuses": {
+        "200": 150
+      }
+    },
+    "answer": {
+      "count": 150,
+      "mean_ms": 2565.8917333333334,
+      "p95_ms": 3400.54
+    }
+  },
+  "baseline_budget": {
+    "mean_evidence_chars": 45346.246666666666,
+    "mean_prompt_tokens": 22730.573333333334,
+    "mean_candidates": 100,
+    "unscored_context_records": 0,
+    "queries_with_unscored_context": 0,
+    "answer_retries": 1
+  },
+  "context_budget": {
+    "mean_evidence_chars": 44976.64666666667,
+    "mean_prompt_tokens": 22376.753333333334,
+    "mean_candidates": 99.72666666666667,
+    "unscored_context_records": 1539,
+    "queries_with_unscored_context": 150,
+    "answer_retries": 0
+  },
+  "improved_count": 13,
+  "regressed_count": 4,
+  "same_prediction_judge_changes": 0,
+  "source_comparison_sha256": "12d54845fad9ee3d4dd460fc127cfb58db870c22fe9066d8bdce2d6292330174",
+  "scope": "Frozen LoCoMo-Refined 150-question development comparison; prior deployment before syncing origin/main; not rerun in this task.",
+  "conditions": {
+    "upstream_commit": "887091190789e8d6760e70b9edd696539923dc4f",
+    "seed": 20261004,
+    "top_k": 100,
+    "answer_model": "qwen-plus",
+    "judge_model": "qwen3-14b",
+    "embedding_model": "BAAI/bge-m3",
+    "embedding_dimensions": 1024,
+    "context_radius": 2,
+    "context_anchors": 5,
+    "context_max_records": 20,
+    "baseline_image": "sha256:d6ffe84a3d7756a2fb2da76979c1bd466da1f1aa5cbfe867b7ce7166e9f34a87",
+    "context_image": "sha256:22d375bd4007943fd79cb685a5d136da787ca06df3930dccfaddda546a4184fa"
+  },
+  "limits": [
+    "Local judge score is not human verified accuracy or official AML leaderboard score.",
+    "Time-category accuracy and early-rank evidence coverage declined; Search latency increased.",
+    "Lexical-only metrics differ from joint judge scoring metrics; both retained with explicit labels.",
+    "Known judge false positive retained in raw scoring.",
+    "No 50-question holdout, 861-question full set, official Smoke or Full run.",
+    "One baseline Answer timeout/retry prevents attribution of answer timing improvement.",
+    "No source conversations, questions, gold answers, predictions, raw requests or credentials included."
+  ]
+}
