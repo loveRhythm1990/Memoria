@@ -229,6 +229,7 @@ pub fn build_router(state: AppState) -> Router {
 
     // ── Read / ungrouped routes ──────────────────────────────────────────
     Router::new()
+        .merge(routes::aml::router(&state))
         // Streamable HTTP MCP endpoint
         .route("/mcp", post(routes::mcp::mcp_handler))
         // Health

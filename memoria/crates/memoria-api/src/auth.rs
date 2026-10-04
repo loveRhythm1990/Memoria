@@ -461,6 +461,11 @@ pub async fn actor_scope_layer(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    // AML uses its own explicit multi-sample credential and storage scopes.
+    if req.uri().path().starts_with("/aml/") {
+        return next.run(req).await;
+    }
+
     let token = req
         .headers()
         .get("Authorization")

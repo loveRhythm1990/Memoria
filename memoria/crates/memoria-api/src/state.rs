@@ -120,6 +120,10 @@ pub struct AppState {
     pub git: Arc<GitForDataService>,
     /// Master key for auth (empty = no auth)
     pub master_key: String,
+    /// Dedicated AML credential. None disables AML routes.
+    pub aml_api_key: Option<String>,
+    /// Optional bounded source context, selected by the AML adapter only.
+    pub aml_source_context: memoria_service::SourceContextOptions,
     /// Cross-instance async task store (DB-backed when sql_store is available)
     pub task_store: Option<Arc<dyn AsyncTaskStore>>,
     /// Instance identifier for distributed coordination
@@ -186,6 +190,32 @@ impl AppState {
             service,
             git,
             master_key,
+            aml_api_key: std::env::var("MEMORIA_AML_API_KEY")
+                .ok()
+                .filter(|key| !key.trim().is_empty()),
+            aml_source_context: {
+                let read = |name: &str, default: u64, minimum: u64, maximum: u64| {
+                    match std::env::var(name) {
+                        Ok(value) => match value.parse::<u64>() {
+                            Ok(value) if (minimum..=maximum).contains(&value) => value,
+                            _ => {
+                                warn!(
+                                    setting = name,
+                                    "invalid AML source context setting; using default"
+                                );
+                                default
+                            }
+                        },
+                        Err(_) => default,
+                    }
+                };
+                memoria_service::SourceContextOptions::new(
+                    read("MEMORIA_AML_CONTEXT_RADIUS", 0, 0, 2),
+                    read("MEMORIA_AML_CONTEXT_ANCHORS", 5, 1, 8) as usize,
+                    read("MEMORIA_AML_CONTEXT_MAX_RECORDS", 20, 1, 100) as usize,
+                )
+                .expect("environment values validated above")
+            },
             task_store,
             instance_id: "single".into(),
             api_key_cache: ApiKeyCache::new(Duration::from_secs(300)),

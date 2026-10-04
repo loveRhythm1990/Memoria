@@ -12,6 +12,93 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// SQL equivalent of Memory::is_source_evidence. The column expression is
+/// supplied by storage code, never by a caller. Missing/null markers keep the
+/// ordinary-memory policy without requiring a schema or legacy-data migration.
+pub(crate) fn source_evidence_predicate(metadata_column: &str) -> String {
+    format!(
+        "COALESCE(json_extract({metadata_column}, '$.{}') = CAST('\"{}\"' AS JSON), FALSE)",
+        memoria_core::types::MEMORY_RECORD_KIND_KEY,
+        memoria_core::types::SOURCE_EVIDENCE_RECORD_KIND,
+    )
+}
+
+async fn insert_memory<'e, E>(table: &str, memory: &Memory, executor: E) -> Result<(), MemoriaError>
+where
+    E: sqlx::Executor<'e, Database = MySql>,
+{
+    let now = Utc::now().naive_utc();
+    let observed_at = memory.observed_at.map(|dt| dt.naive_utc()).unwrap_or(now);
+    let created_at = memory.created_at.map(|dt| dt.naive_utc()).unwrap_or(now);
+    let source_event_ids = serde_json::to_string(&memory.source_event_ids)?;
+    // Workaround: MO#23859 — PREPARE/EXECUTE corrupts NULL JSON on 2nd+ execution.
+    let extra_metadata = memory
+        .extra_metadata
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?
+        .unwrap_or_else(|| "{}".to_string());
+    let embedding = memory
+        .embedding
+        .as_deref()
+        .filter(|v| !v.is_empty()) // Some([]) → None → SQL NULL
+        .map(vec_to_mo);
+
+    // MatrixOne 4.2 can retain a prepared parameter's NULL state across
+    // executions (matrixorigin/matrixone#26874). Keep nullable values out
+    // of bind parameters:
+    // each cached SQL shape then binds a value or contains a literal NULL,
+    // but never transitions the same parameter from NULL back to a value.
+    let nullable = |present| if present { "?" } else { "NULL" };
+    let session_id = nullable_str(&memory.session_id);
+    let superseded_by = nullable_str(&memory.superseded_by);
+    let author_param = nullable(memory.author_id.is_some());
+    let subject_param = nullable(memory.subject_id.is_some());
+    let embedding_param = nullable(embedding.is_some());
+    let session_param = nullable(session_id.is_some());
+    let superseded_param = nullable(superseded_by.is_some());
+    let sql = format!(
+        r#"INSERT INTO {table}
+               (memory_id, user_id, author_id, subject_id, memory_type, content, embedding,
+                session_id, source_event_ids, extra_metadata, is_active, superseded_by,
+                trust_tier, initial_confidence, observed_at, created_at, updated_at)
+               VALUES (?, ?, {author_param}, {subject_param}, ?, ?, {embedding_param},
+                       {session_param}, ?, ?, 1, {superseded_param}, ?, ?, ?, ?, ?)"#
+    );
+    let mut query = sqlx::query(&sql)
+        .bind(&memory.memory_id)
+        .bind(&memory.user_id);
+    if let Some(author_id) = memory.author_id.as_deref() {
+        query = query.bind(author_id);
+    }
+    if let Some(subject_id) = memory.subject_id.as_deref() {
+        query = query.bind(subject_id);
+    }
+    query = query
+        .bind(memory.memory_type.to_string())
+        .bind(&memory.content);
+    if let Some(embedding) = embedding {
+        query = query.bind(embedding);
+    }
+    if let Some(session_id) = session_id {
+        query = query.bind(session_id);
+    }
+    query = query.bind(source_event_ids).bind(extra_metadata);
+    if let Some(superseded_by) = superseded_by {
+        query = query.bind(superseded_by);
+    }
+    query
+        .bind(memory.trust_tier.to_string())
+        .bind(memory.initial_confidence as f32)
+        .bind(observed_at)
+        .bind(created_at)
+        .bind(now)
+        .execute(executor)
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
 pub const EXTRA_METADATA_FILTER_MAX_FIELDS: usize = 16;
 pub const EXTRA_METADATA_FILTER_MAX_KEY_BYTES: usize = 64;
 pub const EXTRA_METADATA_FILTER_MAX_VALUE_BYTES: usize = 1024;
@@ -92,8 +179,7 @@ fn is_empty_fulltext_pattern_error(error: &sqlx::Error) -> bool {
                 .downcast_ref::<MySqlDatabaseError>()
         })
         .is_some_and(|mysql_error| {
-            mysql_error.number() == 20101
-                && mysql_error.message().contains("empty pattern")
+            mysql_error.number() == 20101 && mysql_error.message().contains("empty pattern")
         })
 }
 
@@ -1353,6 +1439,18 @@ impl SqlMemoryStore {
         );
         sqlx::query(&sql).execute(pool).await.map_err(db_err)?;
 
+        // Source-ingestion receipts commit atomically with their memory rows.
+        // This table belongs to the user database in multi-DB mode.
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {} (
+             request_key VARCHAR(64) PRIMARY KEY, user_id VARCHAR(64) NOT NULL,
+             payload_hash VARCHAR(64) NOT NULL, created_at DATETIME(6) NOT NULL)",
+            self.t("mem_source_requests")
+        ))
+        .execute(pool)
+        .await
+        .map_err(db_err)?;
+
         sqlx::query(&format!(
             r#"CREATE TABLE IF NOT EXISTS {user_state_table} (
                 user_id       VARCHAR(64)  PRIMARY KEY,
@@ -1972,9 +2070,7 @@ impl SqlMemoryStore {
                      (column was added by a concurrent request): {e}"
                 ),
                 Err(e) => {
-                    tracing::error!(
-                        "migration: failed to add subject_id to {memories_table}: {e}"
-                    );
+                    tracing::error!("migration: failed to add subject_id to {memories_table}: {e}");
                     return Err(db_err(e));
                 }
             }
@@ -3519,6 +3615,7 @@ impl SqlMemoryStore {
     /// effective_confidence = initial_confidence * EXP(-age_days / half_life)
     pub async fn quarantine_low_confidence(&self, user_id: &str) -> Result<i64, MemoriaError> {
         let memories_table = self.t("mem_memories");
+        let source_evidence = source_evidence_predicate("extra_metadata");
         const THRESHOLD: f64 = 0.2;
         const BATCH: i64 = 500;
         let tiers: &[(&str, f64)] = &[("T1", 365.0), ("T2", 180.0), ("T3", 60.0), ("T4", 30.0)];
@@ -3528,6 +3625,7 @@ impl SqlMemoryStore {
                 let res = sqlx::query(&format!(
                     "DELETE FROM {memories_table} \
                      WHERE user_id = ? AND is_active = 1 AND trust_tier = ? \
+                        AND NOT ({source_evidence}) \
                         AND (initial_confidence * EXP(-TIMESTAMPDIFF(DAY, observed_at, NOW()) / {hl})) < {THRESHOLD} \
                       LIMIT {BATCH}"
                 ))
@@ -3603,11 +3701,13 @@ impl SqlMemoryStore {
     /// Delete expired tool_result memories (TTL = 72h by default).
     pub async fn cleanup_tool_results(&self, ttl_hours: i64) -> Result<i64, MemoriaError> {
         let memories_table = self.t("mem_memories");
+        let source_evidence = source_evidence_predicate("extra_metadata");
         let mut total = 0i64;
         loop {
             let res = sqlx::query(&format!(
                 "DELETE FROM {memories_table} \
                  WHERE memory_type = 'tool_result' \
+                   AND NOT ({source_evidence}) \
                    AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > ? \
                  LIMIT 5000"
             ))
@@ -3631,12 +3731,14 @@ impl SqlMemoryStore {
         stale_hours: i64,
     ) -> Result<Vec<(String, i64)>, MemoriaError> {
         let memories_table = self.t("mem_memories");
+        let source_evidence = source_evidence_predicate("extra_metadata");
         const BATCH: i64 = 500;
 
         // Collect affected users first (cheap DISTINCT query)
         let users: Vec<(String,)> = sqlx::query_as(&format!(
             "SELECT DISTINCT user_id FROM {memories_table} \
              WHERE memory_type = 'working' AND is_active = 1 \
+               AND NOT ({source_evidence}) \
                AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > ?"
         ))
         .bind(stale_hours)
@@ -3656,6 +3758,7 @@ impl SqlMemoryStore {
                 let res = sqlx::query(&format!(
                     "UPDATE {memories_table} SET is_active = 0, updated_at = NOW() \
                      WHERE user_id = ? AND memory_type = 'working' AND is_active = 1 \
+                       AND NOT ({source_evidence}) \
                        AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > ? \
                      LIMIT 500"
                 ))
@@ -3688,6 +3791,7 @@ impl SqlMemoryStore {
         max_pairs: usize,
     ) -> Result<i64, MemoriaError> {
         let memories_table = self.t("mem_memories");
+        let source_evidence = source_evidence_predicate("extra_metadata");
         // Cap the fetch at 5,000 rows to bound memory usage: each embedding can be
         // several KB, so loading unbounded rows risks exhausting heap for active users.
         // The max_pairs limit already caps pair-comparison work in the loop below.
@@ -3695,6 +3799,7 @@ impl SqlMemoryStore {
             "SELECT memory_id, memory_type, observed_at, embedding \
              FROM {memories_table} \
              WHERE user_id = ? AND is_active = 1 AND embedding IS NOT NULL \
+               AND NOT ({source_evidence}) \
                AND TIMESTAMPDIFF(DAY, observed_at, NOW()) <= ? \
                ORDER BY memory_type, observed_at DESC \
              LIMIT 5000"
@@ -5082,6 +5187,68 @@ impl SqlMemoryStore {
 
     // ── Table-aware CRUD ──────────────────────────────────────────────────────
 
+    /// Bounded primary-key read for source context. Scope is enforced in SQL,
+    /// including the selected branch; embeddings are not needed for expansion.
+    pub async fn get_source_context_from(
+        &self,
+        table: &str,
+        user_id: &str,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Memory>, MemoriaError> {
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        if ids.len() > memoria_core::source::SOURCE_CONTEXT_MAX_FETCH {
+            return Err(MemoriaError::Validation(
+                "source context read exceeds ID budget".into(),
+            ));
+        }
+        let table = self.t(table);
+        // table_for_branch returns an already qualified identifier for routed
+        // stores. Validate the physical name after removing only this store's
+        // exact database prefix; never accept an arbitrary cross-database name.
+        let database_prefix = self
+            .db_name
+            .as_ref()
+            .map(|db| format!("`{}`.", db.replace('`', "``")));
+        let physical = match database_prefix.as_deref() {
+            Some(prefix) => table.strip_prefix(prefix).unwrap_or(&table),
+            None => table.as_str(),
+        };
+        let physical = physical
+            .strip_prefix('`')
+            .and_then(|name| name.strip_suffix('`'))
+            .unwrap_or(physical);
+        if !memoria_core::is_safe_sql_identifier(physical) {
+            return Err(MemoriaError::Validation(
+                "invalid source context table".into(),
+            ));
+        }
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let source = source_evidence_predicate("extra_metadata");
+        let sql = format!(
+            "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \
+             NULL AS emb_str, session_id, \
+             CAST(source_event_ids AS CHAR) AS src_ids, \
+             CAST(extra_metadata AS CHAR) AS extra_meta, \
+             is_active, superseded_by, trust_tier, initial_confidence, \
+             observed_at, created_at, updated_at \
+             FROM {table} WHERE user_id = ? AND is_active = 1 \
+             AND ({source}) AND memory_id IN ({placeholders})"
+        );
+        let mut query = sqlx::query(&sql).bind(user_id);
+        for id in ids {
+            query = query.bind(id)
+        }
+        let rows = query.fetch_all(&self.pool).await.map_err(db_err)?;
+        rows.iter()
+            .map(|row| {
+                let memory = row_to_memory(row)?;
+                Ok((memory.memory_id.clone(), memory))
+            })
+            .collect()
+    }
+
     /// Find the nearest active memory by embedding distance.
     /// Returns (memory_id, content, l2_distance) if within threshold.
     ///
@@ -5106,10 +5273,7 @@ impl SqlMemoryStore {
         // None means the memory is not subject-scoped; only compare against
         // other unscoped rows (subject_id IS NULL).
         let subject_clause = match subject_id {
-            Some(sid) => format!(
-                " AND subject_id = '{}'",
-                sanitize_sql_literal(sid)
-            ),
+            Some(sid) => format!(" AND subject_id = '{}'", sanitize_sql_literal(sid)),
             None => " AND subject_id IS NULL".to_string(),
         };
         let sql = format!(
@@ -5312,76 +5476,84 @@ impl SqlMemoryStore {
 
     #[tracing::instrument(skip(self, memory), fields(memory_id = %memory.memory_id))]
     pub async fn insert_into(&self, table: &str, memory: &Memory) -> Result<(), MemoriaError> {
-        let now = Utc::now().naive_utc();
-        let observed_at = memory.observed_at.map(|dt| dt.naive_utc()).unwrap_or(now);
-        let created_at = memory.created_at.map(|dt| dt.naive_utc()).unwrap_or(now);
-        let source_event_ids = serde_json::to_string(&memory.source_event_ids)?;
-        // Workaround: MO#23859 — PREPARE/EXECUTE corrupts NULL JSON on 2nd+ execution.
-        let extra_metadata = memory
-            .extra_metadata
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?
-            .unwrap_or_else(|| "{}".to_string());
-        let embedding = memory
-            .embedding
-            .as_deref()
-            .filter(|v| !v.is_empty()) // Some([]) → None → SQL NULL
-            .map(vec_to_mo);
+        insert_memory(table, memory, &self.pool).await
+    }
 
-        // MatrixOne 4.2 can retain a prepared parameter's NULL state across
-        // executions (matrixorigin/matrixone#26874). Keep nullable values out
-        // of bind parameters:
-        // each cached SQL shape then binds a value or contains a literal NULL,
-        // but never transitions the same parameter from NULL back to a value.
-        let nullable = |present| if present { "?" } else { "NULL" };
-        let session_id = nullable_str(&memory.session_id);
-        let superseded_by = nullable_str(&memory.superseded_by);
-        let author_param = nullable(memory.author_id.is_some());
-        let subject_param = nullable(memory.subject_id.is_some());
-        let embedding_param = nullable(embedding.is_some());
-        let session_param = nullable(session_id.is_some());
-        let superseded_param = nullable(superseded_by.is_some());
-        let sql = format!(
-            r#"INSERT INTO {table}
-               (memory_id, user_id, author_id, subject_id, memory_type, content, embedding,
-                session_id, source_event_ids, extra_metadata, is_active, superseded_by,
-                trust_tier, initial_confidence, observed_at, created_at, updated_at)
-               VALUES (?, ?, {author_param}, {subject_param}, ?, ?, {embedding_param},
-                       {session_param}, ?, ?, 1, {superseded_param}, ?, ?, ?, ?, ?)"#
-        );
-        let mut query = sqlx::query(&sql)
-            .bind(&memory.memory_id)
-            .bind(&memory.user_id);
-        if let Some(author_id) = memory.author_id.as_deref() {
-            query = query.bind(author_id);
+    /// Return whether an immutable source batch has already committed.
+    /// A key may never be reused for a different payload.
+    pub async fn source_batch_committed(
+        &self,
+        user_id: &str,
+        request_key: &str,
+        payload_hash: &str,
+    ) -> Result<bool, MemoriaError> {
+        let stored: Option<String> = sqlx::query_scalar(&format!(
+            "SELECT payload_hash FROM {} WHERE request_key = ? AND user_id = ?",
+            self.t("mem_source_requests")
+        ))
+        .bind(request_key)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        match stored {
+            Some(hash) if hash != payload_hash => Err(MemoriaError::Validation(
+                "source request key reused with a different payload".into(),
+            )),
+            Some(_) => Ok(true),
+            None => Ok(false),
         }
-        if let Some(subject_id) = memory.subject_id.as_deref() {
-            query = query.bind(subject_id);
+    }
+
+    /// Commit receipt and all memory rows together. Concurrent retries contend
+    /// on the receipt primary key; a failed/partial batch leaves no receipt.
+    /// Returns true only for the writer, false for an identical replay.
+    pub async fn insert_source_batch(
+        &self,
+        user_id: &str,
+        request_key: &str,
+        payload_hash: &str,
+        memories: &[Memory],
+    ) -> Result<bool, MemoriaError> {
+        if self
+            .source_batch_committed(user_id, request_key, payload_hash)
+            .await?
+        {
+            return Ok(false);
         }
-        query = query
-            .bind(memory.memory_type.to_string())
-            .bind(&memory.content);
-        if let Some(embedding) = embedding {
-            query = query.bind(embedding);
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let receipt = sqlx::query(&format!(
+            "INSERT INTO {} (request_key, user_id, payload_hash, created_at) VALUES (?, ?, ?, ?)",
+            self.t("mem_source_requests")
+        ))
+        .bind(request_key)
+        .bind(user_id)
+        .bind(payload_hash)
+        .bind(Utc::now().naive_utc())
+        .execute(&mut *tx)
+        .await;
+        if let Err(error) = receipt {
+            tx.rollback().await.map_err(db_err)?;
+            // A racing identical writer may have committed while we waited.
+            if self
+                .source_batch_committed(user_id, request_key, payload_hash)
+                .await?
+            {
+                return Ok(false);
+            }
+            return Err(db_err(error));
         }
-        if let Some(session_id) = session_id {
-            query = query.bind(session_id);
+        let table = self.t("mem_memories");
+        for memory in memories {
+            if memory.user_id != user_id {
+                return Err(MemoriaError::Validation(
+                    "source batch scope mismatch".into(),
+                ));
+            }
+            insert_memory(&table, memory, &mut *tx).await?;
         }
-        query = query.bind(source_event_ids).bind(extra_metadata);
-        if let Some(superseded_by) = superseded_by {
-            query = query.bind(superseded_by);
-        }
-        query
-            .bind(memory.trust_tier.to_string())
-            .bind(memory.initial_confidence as f32)
-            .bind(observed_at)
-            .bind(created_at)
-            .bind(now)
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?;
-        Ok(())
+        tx.commit().await.map_err(db_err)?;
+        Ok(true)
     }
 
     /// Batch-insert multiple memories in a single multi-row INSERT statement.
@@ -5442,9 +5614,7 @@ impl SqlMemoryStore {
                 if let Some(subject_id) = &m.subject_id {
                     q = q.bind(subject_id.clone());
                 }
-                q = q
-                    .bind(m.memory_type.to_string())
-                    .bind(m.content.clone());
+                q = q.bind(m.memory_type.to_string()).bind(m.content.clone());
                 if let Some(embedding) = embedding {
                     q = q.bind(embedding);
                 }
@@ -5839,11 +6009,9 @@ impl SqlMemoryStore {
         extra_metadata_filter: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<Vec<Memory>, MemoriaError> {
         if !(1..=FULLTEXT_SEARCH_MAX_LIMIT).contains(&limit) {
-            return Err(MemoriaError::Validation(
-                format!(
-                    "fulltext search storage limit must be between 1 and {FULLTEXT_SEARCH_MAX_LIMIT}"
-                ),
-            ));
+            return Err(MemoriaError::Validation(format!(
+                "fulltext search storage limit must be between 1 and {FULLTEXT_SEARCH_MAX_LIMIT}"
+            )));
         }
         validate_fulltext_query(query)?;
         validate_extra_metadata_filter(extra_metadata_filter)?;
@@ -5949,7 +6117,14 @@ impl SqlMemoryStore {
         memory_type: Option<&str>,
     ) -> Result<Vec<Memory>, MemoriaError> {
         self.search_vector_from_filtered_scoped(
-            table, user_id, embedding, limit, memory_type, None, None, None,
+            table,
+            user_id,
+            embedding,
+            limit,
+            memory_type,
+            None,
+            None,
+            None,
         )
         .await
     }
@@ -6120,15 +6295,34 @@ impl SqlMemoryStore {
         let fetch_k = (limit * 3).max(20);
         let (vec_results, ft_results) = tokio::join!(
             self.search_vector_from_filtered_scoped(
-                table, user_id, embedding, fetch_k, None, session_id, subject_id, memory_types
+                table,
+                user_id,
+                embedding,
+                fetch_k,
+                None,
+                session_id,
+                subject_id,
+                memory_types
             ),
             self.search_fulltext_from_scoped(
-                table, user_id, query, fetch_k, session_id, subject_id, memory_types
+                table,
+                user_id,
+                query,
+                fetch_k,
+                session_id,
+                subject_id,
+                memory_types
             )
         );
         let vec_results = vec_results?;
         let ft_results = ft_results.unwrap_or_default();
 
+        // Keep each arm's score before merging. A fulltext-only record carries
+        // its keyword score in retrieval_score, never a vector similarity.
+        let vec_map: std::collections::HashMap<String, f64> = vec_results
+            .iter()
+            .filter_map(|m| m.retrieval_score.map(|s| (m.memory_id.clone(), s)))
+            .collect();
         let ft_map: std::collections::HashMap<String, f64> = ft_results
             .iter()
             .filter_map(|m| m.retrieval_score.map(|s| (m.memory_id.clone(), s)))
@@ -6162,14 +6356,18 @@ impl SqlMemoryStore {
         let (ac_map, fb_map) = self.get_stats_batch(&ac_ids).await.unwrap_or_default();
 
         for m in &mut candidates {
-            let vec_score = m.retrieval_score.unwrap_or(0.0);
+            let vec_score = vec_map.get(&m.memory_id).copied().unwrap_or(0.0);
             let raw_ft = ft_map.get(&m.memory_id).copied().unwrap_or(0.0);
             let kw_score = if raw_ft > 0.0 {
                 raw_ft / (raw_ft + 1.0)
             } else {
                 0.0
             };
-            let (time_score, conf_score) = if let Some(obs) = m.observed_at {
+            let (time_score, conf_score) = if m.is_source_evidence() {
+                // Ingestion order is not historical recency. Preserve source
+                // confidence without awarding an ingestion-time ranking boost.
+                (0.0, m.initial_confidence)
+            } else if let Some(obs) = m.observed_at {
                 let age_hours = (now - obs).num_seconds() as f64 / 3600.0;
                 let age_days = age_hours / 24.0;
                 let ts = (-age_hours / DECAY_HOURS).max(-500.0).exp();
@@ -6225,6 +6423,7 @@ impl SqlMemoryStore {
             b.retrieval_score
                 .partial_cmp(&a.retrieval_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.memory_id.cmp(&b.memory_id))
         });
         // Re-sort score_breakdown to match candidate order
         let order: std::collections::HashMap<String, usize> = candidates

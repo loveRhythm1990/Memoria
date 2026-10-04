@@ -9,6 +9,7 @@ pub mod rebuild_worker;
 pub mod scheduler;
 pub mod scoring;
 pub mod service;
+pub mod source_context;
 pub mod stats_reporter;
 pub mod strategy;
 pub mod strategy_domain;
@@ -47,9 +48,9 @@ pub use scoring::{
 pub use service::{
     CandidateScore, ExplainLevel, FulltextSearchOptions, InMemoryFlusher, ListActiveOptions,
     MemoryService, PurgeResult, RetrievalExplain, RetrieveOptions, SessionScope,
-    StructuredQueryOptions,
-    ENTITY_EXTRACTION_DROPS,
+    StructuredQueryOptions, ENTITY_EXTRACTION_DROPS,
 };
+pub use source_context::SourceContextOptions;
 pub use stats_reporter::StatsReporter;
 
 /// Wait for SIGTERM or Ctrl-C. Shared across CLI, MCP, and API servers.

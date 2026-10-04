@@ -15,6 +15,7 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::source_context::{self, SourceContextExplain, SourceContextOptions};
 use crate::stats_reporter::{StatsEvent, StatsReporter};
 
 /// Incremented when entity extraction jobs are dropped (queue full or channel closed).
@@ -101,6 +102,7 @@ pub struct RetrieveOptions {
     subject_id: Option<String>,
     /// Restrict results to these memory types. Empty/None means no type filter.
     memory_types: Option<Vec<MemoryType>>,
+    source_context: SourceContextOptions,
 }
 
 impl RetrieveOptions {
@@ -113,6 +115,7 @@ impl RetrieveOptions {
             session_scope: session_scope.unwrap_or(SessionScope::Prefer),
             subject_id: None,
             memory_types: None,
+            source_context: SourceContextOptions::default(),
         }
     }
 
@@ -123,6 +126,11 @@ impl RetrieveOptions {
 
     pub fn with_memory_types(mut self, memory_types: Option<Vec<MemoryType>>) -> Self {
         self.memory_types = memory_types.filter(|v| !v.is_empty());
+        self
+    }
+
+    pub fn with_source_context(mut self, policy: SourceContextOptions) -> Self {
+        self.source_context = policy;
         self
     }
 
@@ -236,6 +244,9 @@ pub struct RetrievalExplain {
     /// Per-candidate scores (Verbose/Analyze only)
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub candidate_scores: Vec<CandidateScore>,
+    /// Source context is an explicit selection stage, not a vector score.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_context: Option<SourceContextExplain>,
 }
 
 /// Result of a purge operation.
@@ -1483,8 +1494,12 @@ impl MemoryService {
                                 memory_type: memory.memory_type.to_string(),
                                 trust_tier: memory.trust_tier.to_string(),
                             });
-                            self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content)
-                                .await;
+                            self.enqueue_entity_extraction(
+                                user_id,
+                                &memory.memory_id,
+                                &memory.content,
+                            )
+                            .await;
                             return Ok(memory);
                         }
                     }
@@ -1548,6 +1563,69 @@ impl MemoryService {
             self.store.insert(&memory).await?;
         }
         Ok(memory)
+    }
+
+    /// Persist immutable source records with a durable idempotency receipt.
+    /// Unlike fact injection, source ingestion does not semantically deduplicate
+    /// distinct events. Embeddings and the regular retrieval engine are reused.
+    pub async fn ingest_source_batch(
+        &self,
+        user_id: &str,
+        request_key: &str,
+        payload_hash: &str,
+        mut memories: Vec<Memory>,
+    ) -> Result<(), MemoriaError> {
+        let sql = self.user_sql_store(user_id).await?;
+        if sql
+            .source_batch_committed(user_id, request_key, payload_hash)
+            .await?
+        {
+            return Ok(());
+        }
+        for memory in &mut memories {
+            if memory.user_id != user_id {
+                return Err(MemoriaError::Validation(
+                    "source batch scope mismatch".into(),
+                ));
+            }
+            memory.mark_source_evidence();
+            let sensitivity = check_sensitivity(&memory.content);
+            if sensitivity.blocked {
+                return Err(MemoriaError::Blocked(
+                    "Source memory rejected by sensitivity policy".into(),
+                ));
+            }
+            if let Some(redacted) = sensitivity.redacted_content {
+                memory.content = redacted;
+            }
+        }
+        source_context::attach_source_context(request_key, &mut memories)?;
+        let texts: Vec<String> = memories.iter().map(|m| m.content.clone()).collect();
+        if let Some(embeddings) = self.embed_batch(&texts).await? {
+            if embeddings.len() != memories.len() {
+                return Err(MemoriaError::Embedding(
+                    "batch embedding count mismatch".into(),
+                ));
+            }
+            for (memory, embedding) in memories.iter_mut().zip(embeddings) {
+                memory.embedding = Some(embedding);
+            }
+        }
+        if sql
+            .insert_source_batch(user_id, request_key, payload_hash, &memories)
+            .await?
+        {
+            for memory in &memories {
+                self.report(StatsEvent::MemoryStored {
+                    user_id: user_id.to_string(),
+                    memory_type: memory.memory_type.to_string(),
+                    trust_tier: memory.trust_tier.to_string(),
+                });
+                self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content)
+                    .await;
+            }
+        }
+        Ok(())
     }
 
     /// Validate candidate memories in a zero-copy branch before committing.
@@ -1733,8 +1811,106 @@ impl MemoryService {
         }
     }
 
-    #[tracing::instrument(skip(self), fields(user_id, top_k))]
     async fn retrieve_inner(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        query: &str,
+        top_k: i64,
+        level: ExplainLevel,
+        options: &RetrieveOptions,
+    ) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
+        // Pin checkout-based reads once when context is enabled so a concurrent
+        // branch switch cannot mix base retrieval with another branch's context.
+        let pinned_branch = if options.source_context.is_enabled()
+            && branch.is_none_or(|value| value.trim().is_empty())
+            && self.sql_store.is_some()
+        {
+            Some(
+                self.user_sql_store(user_id)
+                    .await?
+                    .active_branch_name(user_id)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let branch = pinned_branch.as_deref().or(branch);
+        let (base, mut explain) = self
+            .retrieve_base(user_id, branch, query, top_k, level, options)
+            .await?;
+        let policy = options.source_context;
+        if !policy.is_enabled() || top_k <= 0 || base.is_empty() || self.sql_store.is_none() {
+            return Ok((base, explain));
+        }
+        let started = std::time::Instant::now();
+        let candidates = source_context::candidates(&base, policy);
+        if candidates.is_empty() {
+            explain.total_ms += started.elapsed().as_secs_f64() * 1000.0;
+            return Ok((base, explain));
+        }
+        let ids: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| !base.iter().any(|m| m.memory_id == candidate.link.memory_id))
+            .map(|candidate| candidate.link.memory_id.clone())
+            .collect();
+        let read = async {
+            let sql = self.user_sql_store(user_id).await?;
+            let table = sql.table_for_branch(user_id, branch).await?;
+            sql.get_source_context_from(&table, user_id, &ids).await
+        }
+        .await;
+        match read {
+            Ok(neighbors) => {
+                let (memories, mut context) = source_context::compose(
+                    &base,
+                    &neighbors,
+                    &candidates,
+                    user_id,
+                    top_k as usize,
+                    options,
+                    policy,
+                );
+                context.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                explain.total_ms += context.elapsed_ms;
+                explain.result_count = memories.len();
+                if level.at_least(ExplainLevel::Verbose) {
+                    let ranks: HashMap<_, _> = memories
+                        .iter()
+                        .enumerate()
+                        .map(|(rank, memory)| (memory.memory_id.as_str(), rank + 1))
+                        .collect();
+                    explain
+                        .candidate_scores
+                        .retain(|score| ranks.contains_key(score.memory_id.as_str()));
+                    for score in &mut explain.candidate_scores {
+                        score.rank = ranks[score.memory_id.as_str()];
+                    }
+                    explain.candidate_scores.sort_by_key(|score| score.rank);
+                } else {
+                    context.records.clear();
+                }
+                explain.source_context = Some(context);
+                Ok((memories, explain))
+            }
+            Err(error) => {
+                warn!(error = %error, "source context read failed; returning base retrieval");
+                let context = SourceContextExplain {
+                    base_result_count: base.len(),
+                    candidate_count: candidates.len(),
+                    failed: true,
+                    elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+                    ..Default::default()
+                };
+                explain.total_ms += context.elapsed_ms;
+                explain.source_context = Some(context);
+                Ok((base, explain))
+            }
+        }
+    }
+
+    #[tracing::instrument(skip(self), fields(user_id, top_k))]
+    async fn retrieve_base(
         &self,
         user_id: &str,
         branch: Option<&str>,
@@ -1812,6 +1988,9 @@ impl MemoryService {
                                 if let Some(ref mid) = node.memory_id {
                                     if seen.insert(mid.clone()) {
                                         if let Some(mut mem) = tabular.get(mid).cloned() {
+                                            if mem.user_id != user_id || !mem.is_active {
+                                                continue;
+                                            }
                                             // Post-filter: apply subject_id / memory_types
                                             // constraints that the graph retriever doesn't know.
                                             if let Some(sid) = subject_id {
@@ -1882,6 +2061,7 @@ impl MemoryService {
                                 b.retrieval_score
                                     .partial_cmp(&a.retrieval_score)
                                     .unwrap_or(std::cmp::Ordering::Equal)
+                                    .then_with(|| a.memory_id.cmp(&b.memory_id))
                             });
                             graph_memories.truncate(top_k as usize);
 
@@ -2000,6 +2180,7 @@ impl MemoryService {
                         b.retrieval_score
                             .partial_cmp(&a.retrieval_score)
                             .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.memory_id.cmp(&b.memory_id))
                     });
                 }
             }
@@ -2562,10 +2743,10 @@ impl MemoryService {
         // Normalize all string filters once at the boundary so that both the SQL
         // path and the fallback path treat "  alice  " and "" identically.
         let memory_type = options.memory_type.map(str::trim).filter(|s| !s.is_empty());
-        let session_id  = options.session_id.map(str::trim).filter(|s| !s.is_empty());
-        let trust_tier  = options.trust_tier.map(str::trim).filter(|s| !s.is_empty());
-        let subject_id  = options.subject_id.map(str::trim).filter(|s| !s.is_empty());
-        let cursor      = options.cursor.map(str::trim).filter(|s| !s.is_empty());
+        let session_id = options.session_id.map(str::trim).filter(|s| !s.is_empty());
+        let trust_tier = options.trust_tier.map(str::trim).filter(|s| !s.is_empty());
+        let subject_id = options.subject_id.map(str::trim).filter(|s| !s.is_empty());
+        let cursor = options.cursor.map(str::trim).filter(|s| !s.is_empty());
 
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
@@ -3211,8 +3392,8 @@ mod tests {
 
     #[test]
     fn retrieve_options_with_subject_id_empty_becomes_none() {
-        let opts = RetrieveOptions::from_session_scope(None, None)
-            .with_subject_id(Some("  ".to_string()));
+        let opts =
+            RetrieveOptions::from_session_scope(None, None).with_subject_id(Some("  ".to_string()));
         assert_eq!(opts.subject_id(), None);
     }
 

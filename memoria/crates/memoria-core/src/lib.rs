@@ -1,6 +1,7 @@
 pub mod error;
 pub mod interfaces;
 pub mod sensitivity;
+pub mod source;
 pub mod types;
 
 pub use error::MemoriaError;

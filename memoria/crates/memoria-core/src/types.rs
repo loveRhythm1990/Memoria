@@ -32,6 +32,12 @@ impl MemoryType {
 /// and the `record_feedback` API in `memoria-service`.
 pub const FEEDBACK_SIGNALS: &[&str] = &["useful", "irrelevant", "outdated", "wrong"];
 
+/// Internal source-ingestion classification, persisted in existing metadata.
+/// Source evidence records preserve what was said; their age does not establish
+/// whether that historical statement is reliable or currently applicable.
+pub const MEMORY_RECORD_KIND_KEY: &str = "memoria_record_kind";
+pub const SOURCE_EVIDENCE_RECORD_KIND: &str = "source_evidence";
+
 impl std::fmt::Display for MemoryType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
@@ -150,8 +156,52 @@ pub struct Memory {
 }
 
 impl Memory {
+    pub fn source_position(&self) -> Option<crate::source::SourcePosition> {
+        serde_json::from_value(
+            self.extra_metadata
+                .as_ref()?
+                .get(crate::source::SOURCE_POSITION_KEY)?
+                .clone(),
+        )
+        .ok()
+    }
+
+    pub fn source_context(&self) -> Option<crate::source::SourceContext> {
+        let context: crate::source::SourceContext = serde_json::from_value(
+            self.extra_metadata
+                .as_ref()?
+                .get(crate::source::SOURCE_CONTEXT_KEY)?
+                .clone(),
+        )
+        .ok()?;
+        (context.version == crate::source::SOURCE_CONTEXT_VERSION
+            && context.links.len() <= crate::source::SOURCE_CONTEXT_MAX_LINKS)
+            .then_some(context)
+    }
+
+    pub fn is_source_evidence(&self) -> bool {
+        self.extra_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(MEMORY_RECORD_KIND_KEY))
+            .and_then(serde_json::Value::as_str)
+            == Some(SOURCE_EVIDENCE_RECORD_KIND)
+    }
+
+    /// Set by the source-ingestion service, independently of any API protocol.
+    pub fn mark_source_evidence(&mut self) {
+        self.extra_metadata.get_or_insert_with(HashMap::new).insert(
+            MEMORY_RECORD_KIND_KEY.into(),
+            serde_json::Value::String(SOURCE_EVIDENCE_RECORD_KIND.into()),
+        );
+    }
+
     /// Confidence decay: C(t) = C0 * exp(-age_days / half_life).
+    /// Immutable source evidence retains its assigned confidence until an
+    /// explicit correction or retention action; this is not a truth assertion.
     pub fn effective_confidence(&self, half_life_days: Option<f64>) -> f64 {
+        if self.is_source_evidence() {
+            return self.initial_confidence;
+        }
         let Some(observed_at) = self.observed_at else {
             return self.initial_confidence;
         };

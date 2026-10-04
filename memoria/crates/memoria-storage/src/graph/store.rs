@@ -2,7 +2,7 @@
 //! Mirrors Python's graph/graph_store.py core methods needed for consolidation.
 
 use crate::graph::types::{edge_type, GraphEdge, GraphNode, NodeType};
-use crate::store::{db_err, fulltext_rows_or_empty};
+use crate::store::{db_err, fulltext_rows_or_empty, source_evidence_predicate};
 use memoria_core::{nullable_str, nullable_str_from_row, MemoriaError};
 use sqlx::{MySqlPool, Row};
 use uuid::Uuid;
@@ -76,6 +76,33 @@ impl GraphStore {
             None => table.to_string(),
             Some(db) => format!("`{}`.{}", db.replace('`', "``"), table),
         }
+    }
+
+    /// Resolve the authoritative source policy for memory-backed graph nodes.
+    /// Graph retrieval is used on main; the policy stays in mem_memories so
+    /// existing graph nodes and explicit memory corrections do not drift from it.
+    pub async fn source_evidence_memory_ids(
+        &self,
+        user_id: &str,
+        memory_ids: &[&str],
+    ) -> Result<std::collections::HashSet<String>, MemoriaError> {
+        let mut found = std::collections::HashSet::new();
+        let table = self.t("mem_memories");
+        let source_evidence = source_evidence_predicate("extra_metadata");
+        for batch in memory_ids.chunks(256) {
+            let placeholders = vec!["?"; batch.len()].join(",");
+            let sql = format!(
+                "SELECT memory_id FROM {table} \
+                 WHERE user_id = ? AND is_active = 1 AND ({source_evidence}) \
+                   AND memory_id IN ({placeholders})"
+            );
+            let mut query = sqlx::query_scalar::<_, String>(&sql).bind(user_id);
+            for id in batch {
+                query = query.bind(*id);
+            }
+            found.extend(query.fetch_all(&self.pool).await.map_err(db_err)?);
+        }
+        Ok(found)
     }
 
     // ── DDL ──────────────────────────────────────────────────────────────────

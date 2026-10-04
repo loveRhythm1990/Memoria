@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod aml;
 pub mod auth;
 pub mod governance;
 pub mod groups;

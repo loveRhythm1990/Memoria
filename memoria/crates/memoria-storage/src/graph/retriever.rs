@@ -144,7 +144,11 @@ impl<'a> ActivationRetriever<'a> {
         let mut candidate_ids: HashSet<String> = anchors.keys().cloned().collect();
         let anchor_count = candidate_ids.len();
         let mut sorted_activated: Vec<_> = activation_map.iter().collect();
-        sorted_activated.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+        sorted_activated.sort_by(|a, b| {
+            b.1.partial_cmp(a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(b.0))
+        });
         for (nid, _) in sorted_activated.iter().take((top_k * 3) as usize) {
             candidate_ids.insert((*nid).clone());
         }
@@ -169,12 +173,35 @@ impl<'a> ActivationRetriever<'a> {
         let id_vec: Vec<String> = candidate_ids.into_iter().collect();
         let candidates = self.store.get_nodes_by_ids(&id_vec).await?;
 
+        let mut memory_ids: Vec<&str> = candidates
+            .iter()
+            .filter(|node| node.user_id == user_id && node.is_active)
+            .filter_map(|node| node.memory_id.as_deref())
+            .collect();
+        memory_ids.sort_unstable();
+        memory_ids.dedup();
+        let source_evidence_ids = self
+            .store
+            .source_evidence_memory_ids(user_id, &memory_ids)
+            .await?;
+
         // 6. Score
         let mut results: Vec<(GraphNode, f32)> = Vec::new();
         for node in candidates {
+            if node.user_id != user_id || !node.is_active {
+                continue;
+            }
+            let source_evidence = node
+                .memory_id
+                .as_ref()
+                .is_some_and(|id| source_evidence_ids.contains(id));
             let activation = activation_map.get(&node.node_id).copied().unwrap_or(0.0);
             let semantic = anchor_semantic.get(&node.node_id).copied().unwrap_or(0.0);
-            let confidence = effective_confidence(&node);
+            let confidence = if source_evidence {
+                node.confidence
+            } else {
+                effective_confidence(&node)
+            };
 
             let mut score = LAMBDA_SEMANTIC * semantic
                 + LAMBDA_ACTIVATION * activation
@@ -182,7 +209,7 @@ impl<'a> ActivationRetriever<'a> {
                 + LAMBDA_IMPORTANCE * node.importance;
 
             // Temporal recency decay
-            if let Some(created) = node.created_at {
+            if let Some(created) = node.created_at.filter(|_| !source_evidence) {
                 let now = chrono::Utc::now().naive_utc();
                 let age_hours = (now - created).num_seconds().max(0) as f64 / 3600.0;
                 score *= (-age_hours / TEMPORAL_DECAY_HOURS).exp() as f32;
@@ -208,7 +235,11 @@ impl<'a> ActivationRetriever<'a> {
             }
         }
 
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.node_id.cmp(&b.0.node_id))
+        });
         results.truncate(top_k as usize);
         Ok(results)
     }
