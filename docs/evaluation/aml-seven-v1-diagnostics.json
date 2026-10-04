@@ -1,0 +1,489 @@
+{
+  "suite": "aml-seven-v1",
+  "run_id": "aml-seven-af1c3041ade04934adff92d0fedcbf88",
+  "original_report_sha256": "63c8fe69a34e1db7326542156ba0a5ea882da2bc0c6399bc38f0516d9ec6f60e",
+  "checked_at": "2026-10-04T12:12:46.366489+00:00",
+  "observed_server_image": "sha256:f35700b9b517adbb867ac2c81f2aff2108ac3ffcda704691103fafc4761fe0fd",
+  "observed_service_config": {
+    "EMBEDDING_MODEL": "BAAI/bge-m3",
+    "EMBEDDING_DIM": "1024",
+    "LLM_MODEL": "qwen-plus",
+    "MEMORIA_AML_CONTEXT_RADIUS": "2",
+    "MEMORIA_AML_CONTEXT_ANCHORS": "5",
+    "MEMORIA_AML_CONTEXT_MAX_RECORDS": "20"
+  },
+  "method": "Post-run Search-only diagnostics; no Add, Answer regeneration, or score replacement.",
+  "failure_evidence": [
+    {
+      "case_id": "epistemic-02",
+      "checkpoint_id": "final",
+      "status": 200,
+      "same_response_sha256_as_original": true,
+      "all_authored_source_ranks": {
+        "s1": 1
+      },
+      "evidence": [
+        {
+          "id": "6ee6b3232317b62865f647bbe7c233fc",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nMira heard an unverified rumor that the exhibition might move to Bergen. No location has been confirmed.",
+          "score": 0.5998727159180209,
+          "created_at": "2026-10-04T12:11:23.594728Z"
+        },
+        {
+          "id": "7e3fa7e4866ed97c9110e81b88f0b95d",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-0 keeps a garden notebook on shelf 0, visited a museum on 2022-02-01, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-0.",
+          "score": 0.427751483524706,
+          "created_at": "2026-10-04T12:11:23.594728Z"
+        },
+        {
+          "id": "8d8470350cd87ddcdae2fb26a0edb23e",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-1 keeps a garden notebook on shelf 1, visited a museum on 2022-02-02, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-1.",
+          "score": 0.42811948473755224,
+          "created_at": "2026-10-04T12:11:23.594728Z"
+        },
+        {
+          "id": "35f231e1526cdd5ce9f6fca79d273c3d",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-5 keeps a garden notebook on shelf 5, visited a museum on 2022-02-06, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-5.",
+          "score": 0.42915431663955217,
+          "created_at": "2026-10-04T12:11:23.594728Z"
+        },
+        {
+          "id": "47020ae41efb01d14bc0c699adc8c2c4",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-6 keeps a garden notebook on shelf 6, visited a museum on 2022-02-07, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-6.",
+          "score": 0.42909927221073096,
+          "created_at": "2026-10-04T12:11:23.594728Z"
+        },
+        {
+          "id": "db95ac273f010f7a8d7ebbd9c52b3688",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-7 keeps a garden notebook on shelf 7, visited a museum on 2022-02-08, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-7.",
+          "score": 0.4294267186773548,
+          "created_at": "2026-10-04T12:11:23.594728Z"
+        },
+        {
+          "id": "6ab1d6d052197a78b2d3376fa7b8c4f5",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-8 keeps a garden notebook on shelf 0, visited a museum on 2022-02-09, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-8.",
+          "score": 0.428977675641282,
+          "created_at": "2026-10-04T12:11:23.594728Z"
+        },
+        {
+          "id": "ffa26ae9a706ad094a7ae7a0ee65edef",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-9 keeps a garden notebook on shelf 1, visited a museum on 2022-02-10, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-9.",
+          "score": 0.42873005826386446,
+          "created_at": "2026-10-04T12:11:23.594728Z"
+        },
+        {
+          "id": "bf3f7a70eeec10a79b4c64111f152f5e",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-10 keeps a garden notebook on shelf 2, visited a museum on 2022-02-11, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-10.",
+          "score": 0.42884780237500797,
+          "created_at": "2026-10-04T12:11:23.594728Z"
+        },
+        {
+          "id": "3dc29afe2647e6c18f3a15843ed8f82e",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-11 keeps a garden notebook on shelf 3, visited a museum on 2022-02-12, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-11.",
+          "score": 0.42920465937840596,
+          "created_at": "2026-10-04T12:11:23.594728Z"
+        },
+        {
+          "id": "5a59e5a51d3aac03b17155f2ca306408",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-3 keeps a garden notebook on shelf 3, visited a museum on 2022-02-04, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-3.",
+          "score": 0.4289159906030042,
+          "created_at": "2026-10-04T12:11:23.594728Z"
+        },
+        {
+          "id": "f1689eb946cf53f58ef0957cb5fdf24f",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-4 keeps a garden notebook on shelf 4, visited a museum on 2022-02-05, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-4.",
+          "score": 0.4287761339605463,
+          "created_at": "2026-10-04T12:11:23.594728Z"
+        },
+        {
+          "id": "7b16f6a1a3af65abdab35d023ef9a9d0",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-2 keeps a garden notebook on shelf 2, visited a museum on 2022-02-03, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-2.",
+          "score": 0.42884491787544604,
+          "created_at": "2026-10-04T12:11:23.594728Z"
+        }
+      ],
+      "elapsed_ms": 275.59
+    },
+    {
+      "case_id": "epistemic-03",
+      "checkpoint_id": "final",
+      "status": 200,
+      "same_response_sha256_as_original": true,
+      "all_authored_source_ranks": {
+        "s1": 5,
+        "s2": 3
+      },
+      "evidence": [
+        {
+          "id": "7296d7b58c1f62134870d79d437bd1f3",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-9 keeps a garden notebook on shelf 1, visited a museum on 2022-02-10, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-9.",
+          "score": 0.4301949017466049,
+          "created_at": "2026-10-04T12:11:26.141973Z"
+        },
+        {
+          "id": "99785d34d145973ed55220387760606f",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-10 keeps a garden notebook on shelf 2, visited a museum on 2022-02-11, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-10.",
+          "score": 0.4302409647295481,
+          "created_at": "2026-10-04T12:11:26.141973Z"
+        },
+        {
+          "id": "adbdecd8571b638eaef61f6c99a56664",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nAnother undated record for Nora says green gate. Neither has priority or confirmation.",
+          "score": 0.5694920083176613,
+          "created_at": "2026-10-04T12:11:26.141973Z"
+        },
+        {
+          "id": "62dc4dbdf8b5e6313afc569abe59120f",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-11 keeps a garden notebook on shelf 3, visited a museum on 2022-02-12, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-11.",
+          "score": 0.42976044441882943,
+          "created_at": "2026-10-04T12:11:26.141973Z"
+        },
+        {
+          "id": "a9a0475afe9b29caf8f8f7d23162a8a2",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nNora's pickup record says blue gate.",
+          "score": 0.5299129111318103,
+          "created_at": "2026-10-04T12:11:26.141973Z"
+        },
+        {
+          "id": "5ffc2de355b7916ef3974eea1d6f8c07",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-0 keeps a garden notebook on shelf 0, visited a museum on 2022-02-01, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-0.",
+          "score": 0.42973801758399366,
+          "created_at": "2026-10-04T12:11:26.141973Z"
+        },
+        {
+          "id": "f9e7ecb3a9e9fae8142c45c003163495",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-1 keeps a garden notebook on shelf 1, visited a museum on 2022-02-02, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-1.",
+          "score": 0.4297623471270414,
+          "created_at": "2026-10-04T12:11:26.141973Z"
+        },
+        {
+          "id": "9471373a41d3dbc8f538d8a36a260de3",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-2 keeps a garden notebook on shelf 2, visited a museum on 2022-02-03, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-2.",
+          "score": 0.4303845503861474,
+          "created_at": "2026-10-04T12:11:26.141973Z"
+        },
+        {
+          "id": "3d315151bef997d414ccfad12a2ee1ab",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-3 keeps a garden notebook on shelf 3, visited a museum on 2022-02-04, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-3.",
+          "score": 0.4298533586839439,
+          "created_at": "2026-10-04T12:11:26.141973Z"
+        },
+        {
+          "id": "05695e3b959e14ae2bf458caf654ff00",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-4 keeps a garden notebook on shelf 4, visited a museum on 2022-02-05, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-4.",
+          "score": 0.43059518907730004,
+          "created_at": "2026-10-04T12:11:26.141973Z"
+        },
+        {
+          "id": "c45defa17407376d17195524bdef5b09",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-5 keeps a garden notebook on shelf 5, visited a museum on 2022-02-06, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-5.",
+          "score": 0.43035839706910783,
+          "created_at": "2026-10-04T12:11:26.141973Z"
+        },
+        {
+          "id": "45947d1a4a6bb82e83b1e1affd0cdb8a",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-6 keeps a garden notebook on shelf 6, visited a museum on 2022-02-07, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-6.",
+          "score": 0.4303392554111308,
+          "created_at": "2026-10-04T12:11:26.141973Z"
+        },
+        {
+          "id": "b49a7db2b0cf25011c61cc9c07c54b1d",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-7 keeps a garden notebook on shelf 7, visited a museum on 2022-02-08, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-7.",
+          "score": 0.4303412726941247,
+          "created_at": "2026-10-04T12:11:26.141973Z"
+        },
+        {
+          "id": "6473a75019b59eafdf7a8e3d77d83b54",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\nUnrelated visitor Guest-8 keeps a garden notebook on shelf 0, visited a museum on 2022-02-09, prefers lengthy replies, and plans a parcel pickup at the red gate. Their club is Garden-8.",
+          "score": 0.43012805099402773,
+          "created_at": "2026-10-04T12:11:26.141973Z"
+        }
+      ],
+      "elapsed_ms": 123.23
+    },
+    {
+      "case_id": "epistemic-05",
+      "checkpoint_id": "final",
+      "status": 200,
+      "same_response_sha256_as_original": true,
+      "all_authored_source_ranks": {
+        "s1": 1,
+        "s2": 6
+      },
+      "evidence": [
+        {
+          "id": "d68fee8af7135f953167757ac2ef0a37",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n许青的私人称呼是SilverOrchid。",
+          "score": 0.46293351877591904,
+          "created_at": "2026-10-04T12:11:27.886576Z"
+        },
+        {
+          "id": "b33c5c77e29dc5376eddbff734bcce94",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客0把园艺笔记放在第0层书架，在2022年2月1日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园0社团。",
+          "score": 0.4257425570401697,
+          "created_at": "2026-10-04T12:11:27.886576Z"
+        },
+        {
+          "id": "a00753ffa234c8194389a3dd3e090d1d",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客1把园艺笔记放在第1层书架，在2022年2月2日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园1社团。",
+          "score": 0.4258906357243668,
+          "created_at": "2026-10-04T12:11:27.886576Z"
+        },
+        {
+          "id": "549a9be89332722e41ada5c09626f6ce",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客9把园艺笔记放在第1层书架，在2022年2月10日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园9社团。",
+          "score": 0.42684691757829774,
+          "created_at": "2026-10-04T12:11:27.886576Z"
+        },
+        {
+          "id": "e6d4a77f21554fdca8c130592977b619",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客10把园艺笔记放在第2层书架，在2022年2月11日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园10社团。",
+          "score": 0.42626655659990215,
+          "created_at": "2026-10-04T12:11:27.886576Z"
+        },
+        {
+          "id": "b37a2dba1846d9f3ffdab2a373cdb92c",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n许青允许在自己的私聊中使用这个称呼，但明确不允许向第三方透露。",
+          "score": 0.4537762570309519,
+          "created_at": "2026-10-04T12:11:27.886576Z"
+        },
+        {
+          "id": "ec9231cf2a45da56cdadea66bd249684",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客11把园艺笔记放在第3层书架，在2022年2月12日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园11社团。",
+          "score": 0.42594684258016535,
+          "created_at": "2026-10-04T12:11:27.886576Z"
+        },
+        {
+          "id": "a9831974a9e1ac866ba324e70fa210d1",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客7把园艺笔记放在第7层书架，在2022年2月8日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园7社团。",
+          "score": 0.4261591643988651,
+          "created_at": "2026-10-04T12:11:27.886576Z"
+        },
+        {
+          "id": "5d2d74aaadb165d9c0763a5d27f0314d",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客8把园艺笔记放在第0层书架，在2022年2月9日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园8社团。",
+          "score": 0.4259330767111694,
+          "created_at": "2026-10-04T12:11:27.886576Z"
+        },
+        {
+          "id": "d82d455e02ba1e2ecdda6083fb94f6d2",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客5把园艺笔记放在第5层书架，在2022年2月6日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园5社团。",
+          "score": 0.42560660369542336,
+          "created_at": "2026-10-04T12:11:27.886576Z"
+        },
+        {
+          "id": "4eac28f43ccf6ab382c96d2c214b9e82",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客6把园艺笔记放在第6层书架，在2022年2月7日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园6社团。",
+          "score": 0.4261323834093466,
+          "created_at": "2026-10-04T12:11:27.886576Z"
+        },
+        {
+          "id": "0a4f850f43267ea0c256f19b88aac888",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客3把园艺笔记放在第3层书架，在2022年2月4日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园3社团。",
+          "score": 0.4257910995900943,
+          "created_at": "2026-10-04T12:11:27.886576Z"
+        },
+        {
+          "id": "392c6eb79d424dd2113feefb41ece4a0",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客4把园艺笔记放在第4层书架，在2022年2月5日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园4社团。",
+          "score": 0.42575419947563564,
+          "created_at": "2026-10-04T12:11:27.886576Z"
+        },
+        {
+          "id": "cee3994bf113ac10a8f86f5df395696e",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客2把园艺笔记放在第2层书架，在2022年2月3日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园2社团。",
+          "score": 0.42539161624729505,
+          "created_at": "2026-10-04T12:11:27.886576Z"
+        }
+      ],
+      "elapsed_ms": 69.53
+    },
+    {
+      "case_id": "governance-05",
+      "checkpoint_id": "after-update",
+      "status": 200,
+      "same_response_sha256_as_original": true,
+      "all_authored_source_ranks": {
+        "s1": 1,
+        "u1": 4
+      },
+      "evidence": [
+        {
+          "id": "2033bf223bfcbbbcc514b94be9a37323",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n许青的项目代号为VioletLantern。",
+          "score": 0.5319760843554278,
+          "created_at": "2026-10-04T12:10:58.836675Z"
+        },
+        {
+          "id": "3d21093fa8dd8ccaefeac21b233edd8f",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客0把园艺笔记放在第0层书架，在2022年2月1日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园0社团。",
+          "score": 0.4263347628459717,
+          "created_at": "2026-10-04T12:10:58.836675Z"
+        },
+        {
+          "id": "3824d5df17733c7cb9facbd0b7c504b0",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客1把园艺笔记放在第1层书架，在2022年2月2日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园1社团。",
+          "score": 0.4263332626636258,
+          "created_at": "2026-10-04T12:10:58.836675Z"
+        },
+        {
+          "id": "23e34746803b7184f2d517179c689690",
+          "content": "[user at 2023-05-09T12:00:00+00:00]\nSource time refers to this message/session.\n许青撤回了未来回复中提及此前项目代号的许可，请不再引用那个代号。",
+          "score": 0.5284012959910991,
+          "created_at": "2026-10-04T12:11:00.922462Z"
+        },
+        {
+          "id": "9dca6ce3af65922c737de22cb106780c",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客8把园艺笔记放在第0层书架，在2022年2月9日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园8社团。",
+          "score": 0.42613745700509215,
+          "created_at": "2026-10-04T12:10:58.836675Z"
+        },
+        {
+          "id": "5021ad87900764d07efd0bcbce9b482a",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客9把园艺笔记放在第1层书架，在2022年2月10日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园9社团。",
+          "score": 0.4264966917561419,
+          "created_at": "2026-10-04T12:10:58.836675Z"
+        },
+        {
+          "id": "90810ed1591c4d07c0d686fd15e840c1",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客10把园艺笔记放在第2层书架，在2022年2月11日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园10社团。",
+          "score": 0.42650308051642216,
+          "created_at": "2026-10-04T12:10:58.836675Z"
+        },
+        {
+          "id": "990625445498a4b81576e2b7454d13ac",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客11把园艺笔记放在第3层书架，在2022年2月12日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园11社团。",
+          "score": 0.42625707307892613,
+          "created_at": "2026-10-04T12:10:58.836675Z"
+        },
+        {
+          "id": "284bb4ca826e5840e0545acaa3a8dee4",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客7把园艺笔记放在第7层书架，在2022年2月8日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园7社团。",
+          "score": 0.42612541077854077,
+          "created_at": "2026-10-04T12:10:58.836675Z"
+        },
+        {
+          "id": "1af7ad2d3d3d888663292b01d91a81f6",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客2把园艺笔记放在第2层书架，在2022年2月3日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园2社团。",
+          "score": 0.42603445775108534,
+          "created_at": "2026-10-04T12:10:58.836675Z"
+        },
+        {
+          "id": "6599c9fe5be34a90ef6f957fd8620561",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客4把园艺笔记放在第4层书架，在2022年2月5日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园4社团。",
+          "score": 0.42629078659262976,
+          "created_at": "2026-10-04T12:10:58.836675Z"
+        },
+        {
+          "id": "b8450a84bfb2b369c795cb85a70a55c0",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客6把园艺笔记放在第6层书架，在2022年2月7日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园6社团。",
+          "score": 0.42621169509180723,
+          "created_at": "2026-10-04T12:10:58.836675Z"
+        },
+        {
+          "id": "4cb0be99e5977c7aa3d04464cf7494a4",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客5把园艺笔记放在第5层书架，在2022年2月6日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园5社团。",
+          "score": 0.4261940748936394,
+          "created_at": "2026-10-04T12:10:58.836675Z"
+        },
+        {
+          "id": "8eae3d5ad2c995cca9430e4055e6e75b",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客3把园艺笔记放在第3层书架，在2022年2月4日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园3社团。",
+          "score": 0.4259925481260673,
+          "created_at": "2026-10-04T12:10:58.836675Z"
+        }
+      ],
+      "elapsed_ms": 76.36
+    },
+    {
+      "case_id": "temporal-05",
+      "checkpoint_id": "final",
+      "status": 200,
+      "same_response_sha256_as_original": true,
+      "all_authored_source_ranks": {
+        "s1": 1
+      },
+      "evidence": [
+        {
+          "id": "07dc1c1daf70b17bf9e1beb8f498a9d6",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n许青在2023年4月之前使用蓝色大门取货，自2023年4月1日起改为绿色大门。",
+          "score": 0.45144457229397006,
+          "created_at": "2026-10-04T12:10:45.692355Z"
+        },
+        {
+          "id": "fbf74420e481a1efb2a1e4e66af09922",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客0把园艺笔记放在第0层书架，在2022年2月1日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园0社团。",
+          "score": 0.43021103657907267,
+          "created_at": "2026-10-04T12:10:45.692355Z"
+        },
+        {
+          "id": "d63115ed9aeb7728aa289c43551b3b40",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客1把园艺笔记放在第1层书架，在2022年2月2日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园1社团。",
+          "score": 0.42925905508292816,
+          "created_at": "2026-10-04T12:10:45.692355Z"
+        },
+        {
+          "id": "0e86130855b7c8fc5d333eea18024c34",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客2把园艺笔记放在第2层书架，在2022年2月3日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园2社团。",
+          "score": 0.4294449427753589,
+          "created_at": "2026-10-04T12:10:45.692355Z"
+        },
+        {
+          "id": "534d8a4780dafc71474d2a49eb728324",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客3把园艺笔记放在第3层书架，在2022年2月4日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园3社团。",
+          "score": 0.4308889580662967,
+          "created_at": "2026-10-04T12:10:45.692355Z"
+        },
+        {
+          "id": "5b33fa0c089e7d02c8fc461444172c89",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客4把园艺笔记放在第4层书架，在2022年2月5日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园4社团。",
+          "score": 0.4296121531700066,
+          "created_at": "2026-10-04T12:10:45.692355Z"
+        },
+        {
+          "id": "1debaa5adf73ed31471bbd9a74a45243",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客5把园艺笔记放在第5层书架，在2022年2月6日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园5社团。",
+          "score": 0.4298660850188823,
+          "created_at": "2026-10-04T12:10:45.692355Z"
+        },
+        {
+          "id": "99d84cae44119ea6678b06fad0c22ac4",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客9把园艺笔记放在第1层书架，在2022年2月10日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园9社团。",
+          "score": 0.42999203234945693,
+          "created_at": "2026-10-04T12:10:45.692355Z"
+        },
+        {
+          "id": "82a10d47010bf3bae9eee08c7a0ab276",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客10把园艺笔记放在第2层书架，在2022年2月11日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园10社团。",
+          "score": 0.4301707870210924,
+          "created_at": "2026-10-04T12:10:45.692355Z"
+        },
+        {
+          "id": "158f5394dfbb5aa8eb3bfff6582c8fa7",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客11把园艺笔记放在第3层书架，在2022年2月12日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园11社团。",
+          "score": 0.43043511578901733,
+          "created_at": "2026-10-04T12:10:45.692355Z"
+        },
+        {
+          "id": "c0b1a8abeb877ed7eaf2005051afcbc2",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客8把园艺笔记放在第0层书架，在2022年2月9日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园8社团。",
+          "score": 0.42984155536398894,
+          "created_at": "2026-10-04T12:10:45.692355Z"
+        },
+        {
+          "id": "fc5a129a8f2160d925b4a39f0aa41192",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客7把园艺笔记放在第7层书架，在2022年2月8日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园7社团。",
+          "score": 0.4295739790258908,
+          "created_at": "2026-10-04T12:10:45.692355Z"
+        },
+        {
+          "id": "bb6b0ad1677451112f3ad7edf9f7c93d",
+          "content": "[user at 2023-05-08T12:00:00+00:00]\nSource time refers to this message/session.\n另一位访客访客6把园艺笔记放在第6层书架，在2022年2月7日参观了博物馆，喜欢长篇回复，计划在红色大门取包裹，加入的是花园6社团。",
+          "score": 0.42948431796243325,
+          "created_at": "2026-10-04T12:10:45.692355Z"
+        }
+      ],
+      "elapsed_ms": 65.34
+    }
+  ]
+}
