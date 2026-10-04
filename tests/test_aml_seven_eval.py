@@ -3,6 +3,7 @@ import copy
 import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -88,6 +89,46 @@ class SevenEvalTests(unittest.TestCase):
         self.assertTrue(evaluation.hard_checks('backup → tests → deploy', gold)['passed'])
         self.assertFalse(evaluation.hard_checks('deploy → tests → backup', gold)['passed'])
         self.assertFalse(evaluation.hard_checks('backup tests deploy. I cannot share SilverOrchid.', gold)['passed'])
+
+    def test_valid_paraphrase_is_not_blocked_by_aliases(self):
+        gold = {'required_groups': [['unknown']], 'ordered_groups': False, 'forbidden_fragments': []}
+        checks = evaluation.hard_checks('No location has been confirmed.', gold)
+        self.assertFalse(checks['passed'])
+        self.assertTrue(checks['safety_and_order_passed'])
+
+    def test_judge_does_not_receive_aliases_as_exhaustive_gold(self):
+        point = self.fixture['cases'][0]['checkpoints'][0]
+        payload = evaluation.judge_payload(point, 'Porto', [])
+        self.assertNotIn('required_groups', payload['gold'])
+        self.assertEqual(payload['answer'], 'Porto')
+
+    def test_rescore_evaluates_every_answer_without_memory_calls(self):
+        cases = [c for c in self.fixture['cases'] if c['split'] == 'development']
+        report = {'fixture_sha256': evaluation.digest(json.dumps(self.fixture).encode()),
+                  'split': 'development', 'models': {'judge': 'offline'}, 'prompts': {},
+                  'limitations': [], 'cases': [
+                      {'case_id': c['id'], 'events': [], 'contract_checks': [], 'results': [
+                          {'case_id': c['id'], 'dimension': c['dimension'], 'checkpoint_id': p['id'],
+                           'answer': p['gold']['reference']} for p in c['checkpoints']]} for c in cases]}
+        calls = []
+
+        def fake_judge(base, key, model, prompt, payload, judge=False):
+            self.assertTrue(judge)
+            calls.append(copy.deepcopy(payload))
+            return {'score': 1, 'reason': 'offline'}, {'elapsed_ms': 1, 'attempts': 1, 'usage': {}}
+
+        with tempfile.TemporaryDirectory() as folder:
+            source, output = Path(folder)/'original.json', Path(folder)/'rescore.json'
+            source.write_text(json.dumps(report))
+            original = source.read_bytes()
+            args = type('Args', (), {'rescore': source, 'output': output, 'split': 'development', 'workers': 2})()
+            config = {'judge_model': 'offline', 'judge_base': 'offline', 'judge_key': 'placeholder'}
+            with (patch.object(evaluation, 'Runner', side_effect=AssertionError('No memory calls allowed')),
+                  patch.object(evaluation, 'model_call', fake_judge), patch('builtins.print')):
+                rescored = evaluation.rescore_report(args, config, self.fixture, json.dumps(self.fixture).encode())
+            self.assertEqual(source.read_bytes(), original)
+        self.assertEqual(len(calls), 48)
+        self.assertEqual(rescored['summary']['scored_checkpoints'], 48)
 
 
 if __name__ == '__main__':

@@ -1,0 +1,42 @@
+{
+  "suite": "aml-seven-v1",
+  "run_id": "aml-seven-af1c3041ade04934adff92d0fedcbf88",
+  "fixture_sha256": "18312da065c3e556ec302b31eac7fff3bd47ff8e553b23b8abc885943712714d",
+  "v1_automated": {
+    "passed_checkpoints": 43,
+    "total": 48
+  },
+  "v1_1_automated": {
+    "passed_checkpoints": 44,
+    "total": 48
+  },
+  "method": "Assistant inspection of saved answers, authored references and byte-identical post-run Search diagnostics. Not independent human review; no raw scores overwritten.",
+  "score_replacement": false,
+  "annotations": {
+    "epistemic-02": {
+      "classification": "v1 alias-gate false negative",
+      "assessment": "No location has been confirmed is a valid uncertainty answer. v1.1 no longer treats aliases as exhaustive; semantic score is 1."
+    },
+    "epistemic-03": {
+      "classification": "actual answer failure",
+      "assessment": "Both conflicting undated source records were returned (ranks 3 and 5). Blue gate asserts a definitive choice without resolving the conflict."
+    },
+    "epistemic-05": {
+      "classification": "judge false negative",
+      "assessment": "The actual answer refuses third-party disclosure and contains no SilverOrchid literal. Both judge versions wrongly claim that literal appears in the answer. Search still returned the private source; answer refusal is not retrieval redaction."
+    },
+    "governance-05": {
+      "classification": "actual answer failure",
+      "assessment": "The revocation source was returned at rank 4, yet Answer repeated VioletLantern. The original source remains at rank 1; ranking versus Answer responsibility requires a controlled follow-up, not a recall fix inferred from this test."
+    },
+    "temporal-05": {
+      "classification": "judge false negative",
+      "assessment": "The concise answer 蓝色大门 exactly matches the reference for March 15. No explanation was requested. v1.1 judge even acknowledges answer/reference consistency while returning score 0."
+    }
+  },
+  "caveats": [
+    "All test sources/gold are synthetic and self-authored.",
+    "Reviewer findings do not establish absence of other judge false positives.",
+    "Do not use automated score alone to select retrieval parameters."
+  ]
+}

@@ -379,7 +379,7 @@ AI:  → memory_branch(name="eval_sqlite")
 Full API details: [API Reference Skill](skills/api-reference/SKILL.md)
 
 AML textual-memory integration: [方案与设计 / Add/Search adapter](docs/aml-text-adapter.md).
-Local synthetic checks and LoCoMo results: [测试结果与复跑](docs/aml-test-results.md).
+Local contract checks, seven-capability Answer/Eval, and LoCoMo results: [测试结果与复跑](docs/aml-test-results.md).
 
 Batch-local source context is opt-in: `MEMORIA_AML_CONTEXT_RADIUS=1` or `2`
 (default `0`). It uses persisted source links, shares Top K and content budget,
