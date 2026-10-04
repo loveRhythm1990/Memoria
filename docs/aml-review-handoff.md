@@ -24,9 +24,9 @@
 
 - Worktree：`/Users/lr90/runtime-agent/memoria-aml`。
 - 分支：`feat/aml-text-adapter`。
-- 基线：`689f3f9badf0ae1eba3652ab91a8a329dc08701b`，本机 main 的 v0.5.2。
+- 实现及现有运行证据基线：`689f3f9badf0ae1eba3652ab91a8a329dc08701b`，v0.5.2；PR 分支已同步目标 `origin/main` 的 `e180dff`。
 - GitHub 审查仓库：`loveRhythm1990/Memoria`（本机 remote 名为 `origin`）；审查分支为 `feat/aml-text-adapter`，PR 目标为该仓库的 `main`。代码作为分支提交交付，尚未合并；审查应注明具体 commit。
-- 创建 PR 前已拉取 `origin/main`；它比实现及运行基线新增 4 个提交。已有运行证据不覆盖这些新增 main 改动，合并前需检查兼容性。
+- 目标 main 比运行基线新增 4 个提交，已合入审查分支。`store.rs` 候选合并冲突已整合为 main 的合并函数与 AML 独立向量分数映射；已有运行证据不覆盖同步后的完整版本，同步后 API／CLI `cargo check` 通过；评测及完整回归尚未重跑。
 
 建议按下面顺序阅读：
 
@@ -137,6 +137,6 @@
 
 本地审查快照：`/Users/lr90/runtime-agent/aml-review-package-20261004-191613`。包含审查说明、统一设计文档、完整 Memoria 补丁、同事原型代码快照、当前本地客户端代码快照、汇总结果与文件哈希清单。补丁包含来源上下文补全、来源年龄策略及限定表名校验修正。
 
-旧目录 `~/runtime-agent/aml-review-package` 不是当前实现快照，请使用上述上述本地快照，GitHub 审查以分支 commit 为准。快照不包含私有 `.env`、模型 Key、数据库、评测正文／预测日志或上游数据集；仅包含密钥占位用的 `.env.example`。个人本机 `AGENTS.md` 不作为产品补丁交付。上游来源与固定 commit 在客户端文档中保留；同事原型使用已有原始审查快照，其 README 性能声明未重新测量。
+旧目录 `~/runtime-agent/aml-review-package` 不是当前实现快照，请使用上述本地快照，GitHub 审查以分支 commit 为准。快照不包含私有 `.env`、模型 Key、数据库、评测正文／预测日志或上游数据集；仅包含密钥占位用的 `.env.example`。个人本机 `AGENTS.md` 不作为产品补丁交付。上游来源与固定 commit 在客户端文档中保留；同事原型使用已有原始审查快照，其 README 性能声明未重新测量。
 
 补丁以指定基线生成，包含新增文件；在干净的同版本 checkout 中先执行 `git apply --check memoria.patch`，确认后再 apply。不要在已有本次修改的 worktree 再次 apply。本地包记录提交前的快照，包含的“未提交”状态仅描述打包时刻。当前 GitHub 审查以分支及 PR 的具体 commit 为准；使用本地包时注明基线和补丁 SHA256。

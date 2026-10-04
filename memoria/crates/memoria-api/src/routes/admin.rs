@@ -594,12 +594,12 @@ pub async fn user_call_stats(
     // Aggregate totals for the requested time window.
     // Error counting unifies HTTP errors (/v1/*) and JSON-RPC errors (/mcp/*):
     //   - /v1/* REST calls: HTTP status_code >= 400 signals an error
-    //   - /mcp/* JSON-RPC calls: HTTP is always 200; rpc_success = 0 signals an error
+    //   - /mcp/*: protocol and tool execution errors are independent dimensions
     let row = sqlx::query(&format!(
         "SELECT \
             CAST(COUNT(*) AS SIGNED) AS total, \
             CAST(COALESCE(AVG(latency_ms), 0) AS DOUBLE) AS avg_ms, \
-            CAST(SUM(CASE WHEN status_code >= 400 OR rpc_success = 0 THEN 1 ELSE 0 END) AS SIGNED) AS errors \
+            CAST(SUM(CASE WHEN status_code >= 400 OR rpc_success = 0 OR tool_success = 0 THEN 1 ELSE 0 END) AS SIGNED) AS errors \
          FROM {call_log} \
          WHERE user_id = ? AND called_at >= DATE_SUB(NOW(6), INTERVAL ? DAY)",
     ))
@@ -624,7 +624,11 @@ pub async fn user_call_stats(
             CAST(COALESCE(AVG(latency_ms), 0) AS DOUBLE) AS avg_ms, \
             CAST(COALESCE(MAX(latency_ms), 0) AS SIGNED) AS max_ms, \
             CAST(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS SIGNED) AS err_cnt, \
-            CAST(SUM(CASE WHEN rpc_success = 0 THEN 1 ELSE 0 END) AS SIGNED) AS rpc_err_cnt \
+            CAST(SUM(CASE WHEN rpc_success = 0 THEN 1 ELSE 0 END) AS SIGNED) AS rpc_err_cnt, \
+            CAST(SUM(CASE WHEN tool_success = 0 THEN 1 ELSE 0 END) AS SIGNED) AS tool_err_cnt, \
+            CAST(SUM(CASE WHEN tool_error_kind = 'input' THEN 1 ELSE 0 END) AS SIGNED) AS tool_input_cnt, \
+            CAST(SUM(CASE WHEN tool_error_kind = 'rejected' THEN 1 ELSE 0 END) AS SIGNED) AS tool_rejected_cnt, \
+            CAST(SUM(CASE WHEN tool_error_kind = 'backend' THEN 1 ELSE 0 END) AS SIGNED) AS tool_backend_cnt \
          FROM {call_log} \
          WHERE user_id = ? AND called_at >= DATE_SUB(NOW(6), INTERVAL ? DAY) \
          GROUP BY method, path \
@@ -647,8 +651,9 @@ pub async fn user_call_stats(
             let max_ms: i64 = r.try_get("max_ms").unwrap_or(0);
             let err_cnt: i64 = r.try_get("err_cnt").unwrap_or(0);
             let rpc_err_cnt: i64 = r.try_get("rpc_err_cnt").unwrap_or(0);
-            // Unified error count: HTTP errors for /v1/* + RPC errors for /mcp/*
-            let total_err = err_cnt + rpc_err_cnt;
+            // HTTP, protocol, and execution failures remain independently queryable.
+            let tool_err_cnt: i64 = r.try_get("tool_err_cnt").unwrap_or(0);
+            let total_err = err_cnt + rpc_err_cnt + tool_err_cnt;
             serde_json::json!({
                 "method": method,
                 "path": path,
@@ -657,6 +662,10 @@ pub async fn user_call_stats(
                 "max_ms": max_ms,
                 "error_count": total_err,
                 "rpc_error_count": rpc_err_cnt,
+                "tool_error_count": tool_err_cnt,
+                "tool_input_error_count": r.try_get::<i64, _>("tool_input_cnt").unwrap_or(0),
+                "tool_rejected_count": r.try_get::<i64, _>("tool_rejected_cnt").unwrap_or(0),
+                "tool_backend_error_count": r.try_get::<i64, _>("tool_backend_cnt").unwrap_or(0),
                 "error_rate": if cnt > 0 {
                     (total_err as f64 / cnt as f64 * 100.0).round() / 100.0
                 } else { 0.0 },
@@ -665,9 +674,9 @@ pub async fn user_call_stats(
         .collect();
 
     // Most recent 50 calls for the live "Recent Calls" feed.
-    // Include rpc_success so /mcp errors (HTTP 200 but RPC failure) show as "err".
+    // Include both protocol and tool outcomes for MCP responses with HTTP 200.
     let recent_rows = sqlx::query(&format!(
-        "SELECT method, path, status_code, latency_ms, called_at, rpc_success \
+        "SELECT method, path, status_code, latency_ms, called_at, rpc_success, tool_success, tool_error_kind \
          FROM {call_log} \
          WHERE user_id = ? \
          ORDER BY called_at DESC \
@@ -690,7 +699,9 @@ pub async fn user_call_stats(
                 .unwrap_or_else(|_| chrono::Utc::now());
             // rpc_success defaults to true (1) for /v1/* rows that predate the column.
             let rpc_success: i8 = r.try_get("rpc_success").unwrap_or(1);
-            let is_err = status_code >= 400 || rpc_success == 0;
+            let tool_success: Option<i8> = r.try_get("tool_success").unwrap_or(None);
+            let tool_error_kind: Option<String> = r.try_get("tool_error_kind").unwrap_or(None);
+            let is_err = status_code >= 400 || rpc_success == 0 || tool_success == Some(0);
             serde_json::json!({
                 "method": method,
                 "path": path,
@@ -699,6 +710,8 @@ pub async fn user_call_stats(
                 "called_at": called_at.to_rfc3339(),
                 // Unified status: HTTP error (/v1/*) OR JSON-RPC error (/mcp/*)
                 "status": if is_err { "err" } else { "ok" },
+                "tool_success": tool_success.map(|v| v != 0),
+                "tool_error_kind": tool_error_kind,
             })
         })
         .collect();

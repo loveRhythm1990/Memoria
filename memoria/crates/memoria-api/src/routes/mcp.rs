@@ -189,6 +189,26 @@ fn spawn_metrics_dirty_mark(
     });
 }
 
+fn result_outcome(method: &str, result: &serde_json::Value) -> RpcMeta {
+    let mut rpc = RpcMeta::ok();
+    if method == "tools/call" {
+        let kind = memoria_mcp::tool_result::error_kind(result);
+        rpc.tool_success = Some(kind.is_none());
+        rpc.tool_error_kind = kind.map(|kind| kind.as_str());
+    }
+    rpc
+}
+
+fn report_tool_outcome(tool: Option<&str>, rpc: &RpcMeta) {
+    if let Some(kind) = rpc.tool_error_kind {
+        if kind == "backend" {
+            tracing::warn!(tool, kind, "MCP tool backend failure");
+        } else {
+            tracing::debug!(tool, kind, "MCP tool input or operation rejected");
+        }
+    }
+}
+
 pub async fn mcp_handler(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -278,6 +298,15 @@ pub async fn mcp_handler(
         return Json(json!({"jsonrpc": "2.0", "id": id, "result": {}})).into_response();
     }
 
+    // Control notifications are not business calls. Authentication and request
+    // validation have already run; keep them out of usage/error statistics.
+    // This intentionally includes initialized and its agent-header usage marker;
+    // the initialize request remains an accounted handshake call.
+    // Do not bypass tool authorization for arbitrary id-less tools/call messages.
+    if memoria_mcp::accept_notification(&method, req.get("id")) {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
     let params = req.get("params").cloned();
     let track_path = tracking_path(&method, params.as_ref());
     let tracked_tool = if method == "tools/call" {
@@ -308,6 +337,17 @@ pub async fn mcp_handler(
         }
     };
     // Use the exact dispatch name, never a sanitized/truncated metrics label.
+    if method == "tools/call" {
+        if let Err(error) = memoria_mcp::validate_tool_call(params.as_ref()) {
+            report_stats(&track_path, false);
+            if req.get("id").is_none() {
+                return StatusCode::NO_CONTENT.into_response();
+            }
+            return Json(json!({"jsonrpc": "2.0", "id": req["id"],
+                "error": {"code": error.code, "message": error.message}}))
+            .into_response();
+        }
+    }
     let authorization_error = if method == "tools/call" {
         let name = params
             .as_ref()
@@ -446,17 +486,24 @@ pub async fn mcp_handler(
         )
         .await;
         let rpc = match &dispatch_result {
-            Ok(_) => RpcMeta::ok(),
+            Ok(result) => result_outcome(&method, result),
             Err(e) => RpcMeta::err(e.code),
         };
-        if dispatch_result.is_ok() {
+        let tool_success = dispatch_result
+            .as_ref()
+            .is_ok_and(|result| !memoria_mcp::tool_result::is_error(result));
+        if tool_success {
             if let Some(mask) = tracked_tool.as_deref().and_then(mcp_tool_dirty_mask) {
                 spawn_metrics_dirty_mark(state.clone(), scope_id.clone(), mask);
             }
         }
-        // Report accurate ops metrics using the real RPC path and success flag
-        // (JSON-RPC errors still return HTTP 200, so is_success must come from rpc.success).
-        report_stats(&track_path, rpc.success);
+        // Service health excludes expected input/rejection errors; call logs
+        // retain both protocol and tool outcomes.
+        report_tool_outcome(tracked_tool.as_deref(), &rpc);
+        report_stats(
+            &track_path,
+            rpc.success && rpc.tool_error_kind != Some("backend"),
+        );
         record_call(204, rpc);
         return StatusCode::NO_CONTENT.into_response();
     }
@@ -486,9 +533,9 @@ pub async fn mcp_handler(
         return err_body.into_response();
     }
 
-    // JSON-RPC spec: the HTTP response is always 200 OK, even for RPC errors.
-    // Business-level error tracking uses rpc_success / rpc_error_code in the call log.
-    let (response, rpc) = match memoria_mcp::dispatch_http(
+    // This endpoint returns HTTP 200 for dispatched JSON-RPC responses. Protocol
+    // and tool execution outcomes must be tracked separately.
+    let (response, rpc, tool_success) = match memoria_mcp::dispatch_http(
         method.clone(),
         params,
         state.service.clone(),
@@ -498,10 +545,13 @@ pub async fn mcp_handler(
     .await
     {
         Ok(v) => {
+            let tool_success = !memoria_mcp::tool_result::is_error(&v);
+            let rpc = result_outcome(&method, &v);
             let result = if v.is_null() { json!({}) } else { v };
             (
                 Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response(),
-                RpcMeta::ok(),
+                rpc,
+                tool_success,
             )
         }
         Err(e) => (
@@ -512,18 +562,23 @@ pub async fn mcp_handler(
             }))
             .into_response(),
             RpcMeta::err(e.code),
+            false,
         ),
     };
 
-    if rpc.success {
+    if tool_success {
         if let Some(mask) = tracked_tool.as_deref().and_then(mcp_tool_dirty_mask) {
             spawn_metrics_dirty_mark(state.clone(), scope_id.clone(), mask);
         }
     }
 
-    // Report accurate ops metrics using the real RPC path and success flag
-    // (JSON-RPC errors still return HTTP 200, so is_success must come from rpc.success).
-    report_stats(&track_path, rpc.success);
+    // Service health excludes input/rejection errors; the per-tool call log
+    // retains every execution failure and its classification separately.
+    report_tool_outcome(tracked_tool.as_deref(), &rpc);
+    report_stats(
+        &track_path,
+        rpc.success && rpc.tool_error_kind != Some("backend"),
+    );
     record_call(200, rpc);
 
     response
@@ -534,6 +589,205 @@ mod tests {
     use super::{mcp_tool_dirty_mask, mcp_tool_required_scope, tracking_path};
     use crate::auth::{SCOPE_MEMORY_READ, SCOPE_MEMORY_WRITE};
     use serde_json::json;
+
+    #[test]
+    fn protocol_and_tool_outcomes_remain_separate() {
+        use memoria_mcp::tool_result::{classified_error, ErrorKind};
+        for kind in [ErrorKind::Input, ErrorKind::Rejected, ErrorKind::Backend] {
+            let rpc = super::result_outcome("tools/call", &classified_error(kind, "failure"));
+            assert!(rpc.success);
+            assert_eq!(rpc.error_code, None);
+            assert_eq!(rpc.tool_success, Some(false));
+            assert_eq!(rpc.tool_error_kind, Some(kind.as_str()));
+        }
+        assert_eq!(
+            super::result_outcome("tools/call", &json!({"content":[]})).tool_success,
+            Some(true)
+        );
+        assert_eq!(
+            super::result_outcome("tools/list", &json!({"tools":[]})).tool_success,
+            None
+        );
+    }
+
+    fn test_state() -> crate::state::AppState {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://test:test@127.0.0.1/test")
+            .unwrap();
+        let store = std::sync::Arc::new(memoria_storage::SqlMemoryStore::new(
+            pool.clone(),
+            3,
+            "test".into(),
+        ));
+        let service = std::sync::Arc::new(memoria_service::MemoryService::new(store, None, None));
+        let git = std::sync::Arc::new(memoria_git::GitForDataService::new(pool, "test"));
+        crate::state::AppState::new(service, git, "test-master".into())
+    }
+
+    fn test_auth(scopes: Vec<String>) -> crate::auth::AuthUser {
+        crate::auth::AuthUser {
+            user_id: "test".into(),
+            scope_id: "test".into(),
+            group_id: None,
+            is_master: false,
+            key_id: None,
+            key_prefix: None,
+            scopes,
+        }
+    }
+
+    #[tokio::test]
+    async fn control_notifications_have_no_body_or_call_log() {
+        use axum::response::IntoResponse;
+        let state = test_state();
+        for method in [
+            "notifications/initialized",
+            "notifications/cancelled",
+            "notifications/roots/list_changed",
+            "notifications/trae/session_stop",
+        ] {
+            let response = super::mcp_handler(
+                axum::extract::State(state.clone()),
+                test_auth(vec![crate::auth::SCOPE_MEMORY_READ.into()]),
+                Default::default(),
+                json!({"jsonrpc":"2.0", "method":method, "params":{"requestId":42}}).to_string(),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), 204);
+            assert!(axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        assert!(state.call_log_batcher.pending_rpc_outcomes().is_empty());
+        // An id-less tool call is not a control notification and cannot bypass scopes.
+        use tracing::instrument::WithSubscriber;
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let capture = Capture(Default::default());
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let response = super::mcp_handler(
+            axum::extract::State(state.clone()),
+            test_auth(vec![]),
+            Default::default(),
+            json!({"jsonrpc":"2.0", "method":"tools/call",
+                "params":{"name":"memory_store", "arguments":{"content":"denied"}}})
+            .to_string(),
+        )
+        .with_subscriber(subscriber)
+        .await
+        .into_response();
+        assert_eq!(response.status(), 204);
+        assert!(axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap()
+            .is_empty());
+        let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("MCP scope admission denied"), "{logs}");
+        assert!(logs.contains("/mcp/memory_store"), "{logs}");
+        assert!(logs.contains("-32003"), "{logs}");
+        assert!(state.call_log_batcher.pending_rpc_outcomes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn notification_methods_with_ids_are_not_successful_calls() {
+        use axum::response::IntoResponse;
+        let state = test_state();
+        for id in [json!(7), json!("request"), serde_json::Value::Null] {
+            let response = super::mcp_handler(
+                axum::extract::State(state.clone()),
+                test_auth(vec![SCOPE_MEMORY_READ.into()]),
+                Default::default(),
+                json!({"jsonrpc":"2.0","id":id,"method":"notifications/cancelled"}).to_string(),
+            )
+            .await;
+            let body = axum::body::to_bytes(response.into_response().into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["id"], id);
+            assert_eq!(body["error"]["code"], -32601);
+            assert!(body.get("result").is_none());
+        }
+        assert_eq!(
+            state.call_log_batcher.pending_rpc_outcomes(),
+            vec![(false, Some(-32601)); 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn http_tool_errors_preserve_protocol_success_and_scope_denials() {
+        use axum::response::IntoResponse;
+        let state = test_state();
+        for (params, scopes, expected) in [
+            (
+                json!({"name":"memory_store","arguments":{"content":""}}),
+                vec![crate::auth::SCOPE_MEMORY_WRITE.into()],
+                None,
+            ),
+            (
+                json!({"name":"memory_future_tool"}),
+                vec![crate::auth::SCOPE_MEMORY_WRITE.into()],
+                Some(-32602),
+            ),
+            (
+                json!({"name":"memory_store","arguments":[]}),
+                vec![crate::auth::SCOPE_MEMORY_WRITE.into()],
+                Some(-32602),
+            ),
+            (
+                json!({"name":"memory_store","arguments":{"content":"denied"}}),
+                vec![],
+                Some(-32003),
+            ),
+        ] {
+            let response = super::mcp_handler(
+                axum::extract::State(state.clone()),
+                test_auth(scopes),
+                Default::default(),
+                json!({"jsonrpc":"2.0","id":"request","method":"tools/call","params":params})
+                    .to_string(),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), 200);
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["id"], "request");
+            if let Some(code) = expected {
+                assert_eq!(body["error"]["code"], code, "{body}");
+                assert!(body.get("result").is_none());
+            } else {
+                assert_eq!(body["result"]["isError"], true, "{body}");
+                assert!(body.get("error").is_none());
+            }
+        }
+        // Rejected protocol envelopes and scope denials do not provision per-user
+        // storage. The execution error is logged as a successful RPC exchange.
+        assert_eq!(
+            state.call_log_batcher.pending_rpc_outcomes(),
+            vec![(true, None)]
+        );
+    }
 
     // ── tools/call — happy path ───────────────────────────────────────────────
 
