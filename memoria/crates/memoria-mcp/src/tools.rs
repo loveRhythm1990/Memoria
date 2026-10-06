@@ -2,7 +2,8 @@
 //! Phase 4 will add 14 more (Git-for-Data, admin, graph).
 
 use crate::purge_args::parse_memory_purge_args;
-use anyhow::Result;
+use crate::tool_result::error as mcp_error;
+use anyhow::{Context, Result};
 use memoria_core::{MemoryType, TrustTier};
 use memoria_git::GitForDataService;
 use memoria_service::{
@@ -23,7 +24,7 @@ async fn user_sql_store(
     service
         .user_sql_store(user_id)
         .await
-        .map_err(|e| anyhow::anyhow!("{e}"))
+        .map_err(anyhow::Error::from)
 }
 
 fn git_for_store(sql: &Arc<SqlMemoryStore>) -> Option<GitForDataService> {
@@ -36,7 +37,7 @@ fn parse_session_scope_arg(args: &Value) -> Result<Option<memoria_service::Sessi
         .and_then(Value::as_str)
         .map(memoria_service::SessionScope::from_str)
         .transpose()
-        .map_err(|e| anyhow::anyhow!("{e}"))
+        .map_err(crate::tool_result::input_error)
 }
 
 fn parse_retrieve_options_arg(args: &Value) -> Result<memoria_service::RetrieveOptions> {
@@ -47,7 +48,9 @@ fn parse_retrieve_options_arg(args: &Value) -> Result<memoria_service::RetrieveO
         .filter(|id| !id.is_empty());
     let session_scope = parse_session_scope_arg(args)?;
     if session_scope.is_some() && session_id.is_none() {
-        anyhow::bail!("session_id is required when session_scope is set");
+        return Err(crate::tool_result::input_error(
+            "session_id is required when session_scope is set",
+        ));
     }
     let subject_id = args
         .get("subject_id")
@@ -58,14 +61,16 @@ fn parse_retrieve_options_arg(args: &Value) -> Result<memoria_service::RetrieveO
     let memory_types: Option<Vec<memoria_core::MemoryType>> = match args.get("memory_types") {
         None | Some(Value::Null) => None,
         Some(v) => {
-            let arr = v
-                .as_array()
-                .ok_or_else(|| anyhow::anyhow!("memory_types must be an array, got: {v}"))?;
+            let arr = v.as_array().ok_or_else(|| {
+                crate::tool_result::input_error(format!("memory_types must be an array, got: {v}"))
+            })?;
             let types = arr
                 .iter()
                 .map(|v| {
                     let s = v.as_str().ok_or_else(|| {
-                        anyhow::anyhow!("memory_types elements must be strings, got: {v}")
+                        crate::tool_result::input_error(format!(
+                            "memory_types elements must be strings, got: {v}"
+                        ))
                     })?;
                     let trimmed = s.trim();
                     if trimmed.is_empty() {
@@ -73,7 +78,11 @@ fn parse_retrieve_options_arg(args: &Value) -> Result<memoria_service::RetrieveO
                     }
                     memoria_core::MemoryType::from_str(trimmed)
                         .map(Some)
-                        .map_err(|_| anyhow::anyhow!("unknown memory_type: '{trimmed}'"))
+                        .map_err(|_| {
+                            crate::tool_result::input_error(format!(
+                                "unknown memory_type: '{trimmed}'"
+                            ))
+                        })
                 })
                 .filter_map(|r: Result<Option<_>, _>| r.transpose())
                 .collect::<Result<Vec<_>, _>>()?;
@@ -368,19 +377,8 @@ pub fn list() -> Value {
     ])
 }
 
-pub async fn call(
-    name: &str,
-    args: Value,
-    service: &Arc<MemoryService>,
-    user_id: &str,
-) -> Result<Value> {
-    tracing::debug!(tool = name, user_id, "MCP tool call");
-    // 与 remote 模式共享的参数校验（必填非空 + extra_metadata 类型）。失败返回软 tool result
-    // 文本（error=null），与既有 embedded 错误契约一致。
-    if let Err(e) = validate_tool_args(name, &args) {
-        return Ok(mcp_text(e));
-    }
-    let tool = match name {
+fn parse_tool_name(name: &str) -> ToolCallName {
+    match name {
         "memory_store" => ToolCallName::MemoryStore,
         "memory_retrieve" => ToolCallName::MemoryRetrieve,
         "memory_search" => ToolCallName::MemorySearch,
@@ -400,20 +398,36 @@ pub async fn call(
         "memory_tune_params" => ToolCallName::MemoryTuneParams,
         "memory_observe" => ToolCallName::MemoryObserve,
         _ => ToolCallName::Unknown(name.to_string()),
-    };
+    }
+}
+
+pub(crate) fn is_known_tool(name: &str) -> bool {
+    !matches!(parse_tool_name(name), ToolCallName::Unknown(_))
+}
+
+pub async fn call(
+    name: &str,
+    args: Value,
+    service: &Arc<MemoryService>,
+    user_id: &str,
+) -> Result<Value> {
+    tracing::debug!(tool = name, user_id, "MCP tool call");
+    if let Err(e) = validate_tool_args(name, &args) {
+        return Ok(mcp_error(e));
+    }
+    let tool = parse_tool_name(name);
     match tool {
         ToolCallName::MemoryStore => {
             let content = match parse_store_content(&args) {
                 Ok(content) => content,
-                Err(msg) => return Ok(mcp_text(msg)),
+                Err(msg) => return Ok(mcp_error(msg)),
             };
             let memory_type = args["memory_type"].as_str().unwrap_or("semantic");
             let session_id = args["session_id"].as_str().map(String::from);
             let trust_tier = args["trust_tier"]
                 .as_str()
                 .map(TrustTier::from_str)
-                .transpose()
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                .transpose()?;
             let mt = MemoryType::from_str(memory_type).unwrap_or(MemoryType::Semantic);
             let subject_id = args["subject_id"]
                 .as_str()
@@ -507,7 +521,7 @@ pub async fn call(
         ToolCallName::MemoryRetrieve | ToolCallName::MemorySearch => {
             let query = match parse_retrieve_query(&args) {
                 Ok(query) => query,
-                Err(msg) => return Ok(mcp_text(msg)),
+                Err(msg) => return Ok(mcp_error(msg)),
             };
             let top_k = if matches!(tool, ToolCallName::MemorySearch) {
                 args["top_k"].as_i64().unwrap_or(10)
@@ -574,7 +588,7 @@ pub async fn call(
         ToolCallName::MemoryCorrect => {
             let new_content = match parse_required_str(&args, "new_content", "new_content is required") {
                 Ok(s) => s,
-                Err(msg) => return Ok(mcp_text(msg)),
+                Err(msg) => return Ok(mcp_error(msg)),
             };
             let memory_id = args["memory_id"].as_str().unwrap_or("");
             let query = args["query"].as_str().unwrap_or("");
@@ -595,10 +609,10 @@ pub async fn call(
                     .await?;
                 match results.into_iter().next() {
                     Some(found) => found.memory_id,
-                    None => return Ok(mcp_text("No matching memory found for query")),
+                    None => return Ok(mcp_error("No matching memory found for query; provide an existing memory_id or refine the query.")),
                 }
             } else {
-                return Ok(mcp_text("Provide memory_id or query"));
+                return Ok(mcp_error("Provide memory_id or query"));
             };
 
             let m = service
@@ -653,7 +667,7 @@ pub async fn call(
                     &result,
                 )))
             } else {
-                Ok(mcp_text("Provide memory_id, topic, or session_id"))
+                Ok(mcp_error("Provide memory_id, topic, or session_id"))
             }
         }
 
@@ -798,7 +812,7 @@ pub async fn call(
         ToolCallName::MemoryRebuildIndex => {
             let table = args["table"].as_str().unwrap_or("mem_memories");
             if !["mem_memories", "memory_graph_nodes"].contains(&table) {
-                return Ok(mcp_text(&format!(
+                return Ok(mcp_error(format!(
                     "Invalid table '{table}'. Use mem_memories or memory_graph_nodes"
                 )));
             }
@@ -806,7 +820,7 @@ pub async fn call(
             let total_rows = sql
                 .rebuild_vector_index(table)
                 .await
-                .map_err(|e| anyhow::anyhow!("rebuild index failed: {e}"))?;
+                .context("rebuild index failed")?;
             Ok(mcp_text(&format!(
                 "Rebuilt IVF index for {table}: rows={total_rows}"
             )))
@@ -854,7 +868,7 @@ pub async fn call(
             let sql = user_sql_store(service, user_id).await?;
 
             if mode == "internal" && service.llm.is_none() {
-                return Ok(mcp_text(
+                return Ok(mcp_error(
                     "Reflection with internal LLM requires LLM_API_KEY to be set.",
                 ));
             }
@@ -915,8 +929,7 @@ pub async fn call(
             let existing_rows = sqlx::query(&existing_sql)
                 .bind(user_id)
                 .fetch_all(sql.pool())
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                .await?;
             let existing_knowledge = existing_rows
                 .iter()
                 .filter_map(|r| r.try_get::<String, _>("content").ok())
@@ -993,7 +1006,7 @@ pub async fn call(
             let sql = user_sql_store(service, user_id).await?;
 
             if mode == "internal" && service.llm.is_none() {
-                return Ok(mcp_text(
+                return Ok(mcp_error(
                     "LLM entity extraction requires LLM_API_KEY to be set.",
                 ));
             }
@@ -1098,7 +1111,7 @@ pub async fn call(
             let parsed: Vec<serde_json::Value> = match serde_json::from_str(entities_str) {
                 Ok(v) => v,
                 Err(_) => {
-                    return Ok(mcp_text(&serde_json::to_string(&json!({
+                    return Ok(mcp_error(&serde_json::to_string(&json!({
                         "status": "error",
                         "error": "Invalid JSON",
                         "expected_format": [{"memory_id": "...", "entities": [{"name": "...", "type": "..."}]}]
@@ -1168,10 +1181,10 @@ pub async fn call(
         ToolCallName::MemoryFeedback => {
             let memory_id = args["memory_id"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("memory_id is required"))?;
+                .ok_or_else(|| crate::tool_result::input_error("memory_id is required"))?;
             let signal = args["signal"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("signal is required"))?;
+                .ok_or_else(|| crate::tool_result::input_error("signal is required"))?;
             let context = args["context"].as_str();
 
             let feedback_id = service
@@ -1496,6 +1509,26 @@ pub fn entity_extract_prompt(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_session_id_preserves_message_and_input_classification() {
+        for args in [
+            json!({"session_scope":"only"}),
+            json!({"session_scope":"only", "session_id":"  "}),
+        ] {
+            let error = parse_retrieve_options_arg(&args)
+                .err()
+                .expect("missing session id");
+            let message = "session_id is required when session_scope is set";
+            assert_eq!(error.to_string(), message);
+            let result = crate::tool_result::execution_error("memory_search", error);
+            assert_eq!(
+                crate::tool_result::error_kind(&result),
+                Some(crate::tool_result::ErrorKind::Input)
+            );
+            assert_eq!(result["content"][0]["text"], message);
+        }
+    }
 
     #[test]
     fn parse_required_str_rejects_missing_and_blank() {

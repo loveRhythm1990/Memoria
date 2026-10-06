@@ -1500,6 +1500,7 @@ async fn test_delete_nonexistent_branch() {
     )
     .await;
     assert!(text(&r).contains("not found"), "got: {}", text(&r));
+    assert_eq!(r["isError"], true);
     println!("✅ delete nonexistent: {}", text(&r));
 }
 
@@ -1561,6 +1562,7 @@ async fn test_duplicate_branch_name_rejected() {
     // Same name again → rejected
     let r = gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
     assert!(text(&r).contains("already exists"), "got: {}", text(&r));
+    assert_eq!(r["isError"], true);
     println!("✅ duplicate rejected: {}", text(&r));
 
     // Delete then try same name → allowed again
