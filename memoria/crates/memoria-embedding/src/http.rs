@@ -106,7 +106,13 @@ impl HttpEmbedder {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    last_err = e.to_string();
+                    // Reqwest errors can include URLs. Keep diagnostics independent
+                    // of provider credentials, request inputs and upstream bodies.
+                    last_err = if e.is_timeout() {
+                        "embedding request timed out".into()
+                    } else {
+                        "embedding request failed".into()
+                    };
                     continue;
                 }
             };
@@ -118,16 +124,30 @@ impl HttpEmbedder {
             }
             if !resp.status().is_success() {
                 let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                return Err(MemoriaError::Embedding(format!("HTTP {status}: {body}")));
+                return Err(MemoriaError::Embedding(format!("HTTP {status}")));
             }
-            return resp
-                .json::<EmbedResponse>()
-                .await
-                .map_err(|e| MemoriaError::Embedding(e.to_string()));
+            // Read separately from JSON parsing: response-body transport failures
+            // (including truncation/timeouts after headers) can be transient.
+            // Retrying the embedding computation happens before memory persistence.
+            let bytes = match resp.bytes().await {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    last_err = "embedding response body could not be read".into();
+                    continue;
+                }
+            };
+            // A fully received but incompatible response should fail promptly.
+            // Serde error text can echo unexpected values, so expose only its class.
+            return serde_json::from_slice::<EmbedResponse>(&bytes).map_err(|error| {
+                let reason = match error.classify() {
+                    serde_json::error::Category::Data => "invalid embedding response schema",
+                    _ => "invalid embedding response JSON",
+                };
+                MemoriaError::Embedding(reason.into())
+            });
         }
         Err(MemoriaError::Embedding(format!(
-            "failed after {} retries: {last_err}",
+            "failed after {} attempts: {last_err}",
             MAX_RETRIES + 1
         )))
     }
@@ -167,5 +187,213 @@ impl EmbeddingProvider for HttpEmbedder {
 
     fn dimension(&self) -> usize {
         self.dimension
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
+
+    const VECTOR: &str = r#"{"data":[{"embedding":[0.1,0.2,0.3]}]}"#;
+    const BATCH: &str = r#"{"data":[{"embedding":[0.1,0.2,0.3]},{"embedding":[0.4,0.5,0.6]}]}"#;
+
+    #[derive(Clone, Copy)]
+    struct Reply {
+        status: &'static str,
+        body: &'static str,
+        extra_length: usize,
+    }
+
+    impl Reply {
+        fn ok(body: &'static str) -> Self {
+            Self {
+                status: "200 OK",
+                body,
+                extra_length: 0,
+            }
+        }
+
+        fn truncated() -> Self {
+            Self {
+                extra_length: 100,
+                ..Self::ok("{\"data\":[")
+            }
+        }
+    }
+
+    struct Server {
+        url: String,
+        calls: Arc<AtomicUsize>,
+        task: JoinHandle<()>,
+    }
+
+    impl Server {
+        async fn start(replies: Vec<Reply>) -> Self {
+            assert!(!replies.is_empty());
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/v1", listener.local_addr().unwrap());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let count = calls.clone();
+            let task = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    // Consume the entire request before closing the connection;
+                    // otherwise unread input can cause an unrelated TCP reset.
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        let mut request = Vec::new();
+                        let mut buffer = [0u8; 4096];
+                        loop {
+                            let n = socket.read(&mut buffer).await.unwrap();
+                            assert!(n > 0);
+                            request.extend_from_slice(&buffer[..n]);
+                            assert!(request.len() < 65_536);
+                            if let Some(end) = request.windows(4).position(|s| s == b"\r\n\r\n") {
+                                let headers = String::from_utf8_lossy(&request[..end]);
+                                let length: usize = headers.lines().find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse().unwrap())
+                                }).unwrap_or(0);
+                                if request.len() >= end + 4 + length {
+                                    break;
+                                }
+                            }
+                        }
+                        let index = count.fetch_add(1, Ordering::SeqCst);
+                        let reply = replies[index.min(replies.len() - 1)];
+                        let response = format!(
+                            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            reply.status, reply.body.len() + reply.extra_length, reply.body,
+                        );
+                        socket.write_all(response.as_bytes()).await.unwrap();
+                        socket.shutdown().await.unwrap();
+                    }).await.unwrap();
+                }
+            });
+            Self { url, calls, task }
+        }
+
+        fn embedder(&self) -> HttpEmbedder {
+            HttpEmbedder::new(&self.url, "synthetic-key", "synthetic-model", 3)
+        }
+
+        fn requests(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_response_retries_before_returning_single_embedding() {
+        let server = Server::start(vec![Reply::truncated(), Reply::ok(VECTOR)]).await;
+        let result = server.embedder().embed("original fact").await.unwrap();
+        assert_eq!(result, vec![0.1, 0.2, 0.3]);
+        assert_eq!(server.requests(), 2);
+    }
+
+    #[tokio::test]
+    async fn truncated_response_retries_before_returning_batch_embeddings() {
+        let server = Server::start(vec![Reply::truncated(), Reply::ok(BATCH)]).await;
+        let result = server
+            .embedder()
+            .embed_batch(&["first".into(), "second".into()])
+            .await
+            .unwrap();
+        assert_eq!(result, vec![vec![0.1, 0.2, 0.3], vec![0.4, 0.5, 0.6]]);
+        assert_eq!(server.requests(), 2);
+    }
+
+    #[tokio::test]
+    async fn persistent_body_failure_exhausts_the_existing_retry_budget() {
+        let server = Server::start(vec![Reply::truncated()]).await;
+        let result = server.embedder().embed("original fact").await.unwrap_err();
+        assert_eq!(server.requests(), (MAX_RETRIES + 1) as usize);
+        assert!(result.to_string().contains("failed after 3 attempts"));
+        assert!(result
+            .to_string()
+            .contains("embedding response body could not be read"));
+    }
+
+    #[tokio::test]
+    async fn received_invalid_json_is_not_retried() {
+        let server = Server::start(vec![
+            Reply::ok("not JSON synthetic-secret"),
+            Reply::ok(VECTOR),
+        ])
+        .await;
+        let error = server.embedder().embed("original fact").await.unwrap_err();
+        assert_eq!(server.requests(), 1);
+        assert!(error
+            .to_string()
+            .contains("invalid embedding response JSON"));
+        assert!(!error.to_string().contains("synthetic-secret"));
+    }
+
+    #[tokio::test]
+    async fn received_invalid_schema_is_not_retried_or_echoed() {
+        let invalid = r#"{"data":[{"embedding":["synthetic-secret"]}]}"#;
+        let server = Server::start(vec![Reply::ok(invalid), Reply::ok(VECTOR)]).await;
+        let error = server.embedder().embed("original fact").await.unwrap_err();
+        assert_eq!(server.requests(), 1);
+        assert!(error
+            .to_string()
+            .contains("invalid embedding response schema"));
+        assert!(!error.to_string().contains("synthetic-secret"));
+    }
+
+    #[tokio::test]
+    async fn authentication_failures_are_not_retried_or_echoed() {
+        let server = Server::start(vec![
+            Reply {
+                status: "401 Unauthorized",
+                body: "synthetic-secret",
+                extra_length: 0,
+            },
+            Reply::ok(VECTOR),
+        ])
+        .await;
+        let error = server.embedder().embed("original fact").await.unwrap_err();
+        assert_eq!(server.requests(), 1);
+        assert!(error.to_string().contains("HTTP 401"));
+        assert!(!error.to_string().contains("synthetic-secret"));
+    }
+
+    #[tokio::test]
+    async fn server_errors_and_rate_limits_still_retry() {
+        for status in ["503 Service Unavailable", "429 Too Many Requests"] {
+            let server = Server::start(vec![
+                Reply {
+                    status,
+                    body: "retry later",
+                    extra_length: 0,
+                },
+                Reply::ok(VECTOR),
+            ])
+            .await;
+            assert_eq!(
+                server.embedder().embed("original fact").await.unwrap(),
+                vec![0.1, 0.2, 0.3]
+            );
+            assert_eq!(server.requests(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_response_is_not_retried() {
+        let server = Server::start(vec![Reply::ok(VECTOR)]).await;
+        assert_eq!(
+            server.embedder().embed("original fact").await.unwrap(),
+            vec![0.1, 0.2, 0.3]
+        );
+        assert_eq!(server.requests(), 1);
     }
 }
