@@ -209,6 +209,12 @@ function parseMemoryTextList(text: string): MemoriaMemoryRecord[] {
   return memories;
 }
 
+/** Reads the transport's `has_more` flag; undefined when the payload does not carry one. */
+function parseListHasMore(text: string): boolean | undefined {
+  const record = asRecord(tryParseJson(text.trim()));
+  return typeof record?.has_more === "boolean" ? record.has_more : undefined;
+}
+
 function parseStoredMemory(text: string, fallback: {
   content: string;
   memoryType: MemoriaMemoryType;
@@ -401,14 +407,16 @@ export class MemoriaClient {
       return cached;
     }
 
-    const scanLimit = Math.min(2000, Math.max(200, this.config.maxListPages * 50));
-    const listed = await this.listMemories({
-      userId: params.userId,
-      limit: scanLimit,
+    const text = await this.callToolText(params.userId, "memory_get", {
+      memory_id: params.memoryId,
     });
-    return (
-      listed.items.find((memory) => memory.memory_id === params.memoryId) ?? null
-    );
+    const record = asRecord(tryParseJson(text));
+    if (!record) {
+      return null;
+    }
+    const memory = normalizeMemoryRecord(record);
+    this.cacheMemories(params.userId, [memory]);
+    return memory;
   }
 
   async listMemories(params: {
@@ -427,6 +435,7 @@ export class MemoriaClient {
       limit: scanLimit,
     });
     let items = parseMemoryTextList(text);
+    const hasMore = parseListHasMore(text) ?? items.length >= scanLimit;
     this.cacheMemories(params.userId, items);
 
     const limitations: string[] = [];
@@ -441,7 +450,7 @@ export class MemoriaClient {
       limitations.push("Rust Memoria MCP only lists active memories.");
     }
 
-    const partial = limitations.length > 0 || items.length >= scanLimit;
+    const partial = limitations.length > 0 || hasMore;
 
     return {
       items: items.slice(0, params.limit),
