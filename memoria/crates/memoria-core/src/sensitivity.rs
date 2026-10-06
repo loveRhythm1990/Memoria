@@ -54,7 +54,15 @@ static PATTERNS: &[Pattern] = &[
     Pattern {
         label: "password_assign",
         tier: SensitivityTier::High,
-        regex: r"(?i)(?:password|passwd|secret)\s*[:=]\s*\S+",
+        // Passwords and explicit credential keys remain blocked anywhere.
+        // Bare `secret = value` is an assignment, but `share a secret: ...`
+        // is ordinary prose. For bare `secret: value`, require a field boundary
+        // (line start or JSON/object separator), including quoted field names.
+        regex: concat!(
+            r#"(?im)(?:\b(?:(?:[a-z][a-z0-9_-]*[_-])?(?:password|passwd)|(?:api|client|auth)[ _-]secret|secret[_-]key|aws_secret_access_key)\b["']?\s*[:=]\s*\S+"#,
+            r#"|\bsecret\b["']?\s*=\s*\S+"#,
+            r#"|(?:^|[{\[,])[\t ]*["']?secret["']?[\t ]*:[\t ]*\S+)"#,
+        ),
         replacement: "",
     },
     // MEDIUM — redact
@@ -158,6 +166,92 @@ mod tests {
         let r = check_sensitivity("password=supersecret123");
         assert!(r.blocked);
         assert_eq!(r.matched_labels, vec!["password_assign"]);
+    }
+
+    #[test]
+    fn ordinary_secret_prose_is_not_a_credential_assignment() {
+        for text in [
+            "The secret: practice every day.",
+            "Since you mentioned the ribs, I'll share a secret: **dry brining**.",
+            "She shared her SECRET: patience and kindness.",
+            "A business secret: listen to your customers.",
+        ] {
+            let result = check_sensitivity(text);
+            assert!(!result.blocked, "ordinary prose rejected: {text}");
+            assert!(result.redacted_content.is_none());
+        }
+    }
+
+    #[test]
+    fn explicit_credential_assignments_remain_blocked() {
+        for text in [
+            "password=synthetic-test-value",
+            "My PASSWORD : synthetic-test-value",
+            "passwd = synthetic-test-value",
+            "db_password: synthetic-test-value",
+            "export SECRET=synthetic-test-value",
+            "client_secret: synthetic-test-value",
+            "api-secret = synthetic-test-value",
+            "API secret: synthetic-test-value",
+            "secret_key: synthetic-test-value",
+            "aws_secret_access_key=synthetic-test-value",
+            r#"{"password": "synthetic-test-value"}"#,
+            r#"{"client_secret": "synthetic-test-value"}"#,
+        ] {
+            let result = check_sensitivity(text);
+            assert!(result.blocked, "credential assignment allowed: {text}");
+            assert_eq!(result.matched_labels, vec!["password_assign"]);
+        }
+    }
+
+    #[test]
+    fn bare_secret_fields_remain_blocked_at_structured_boundaries() {
+        for text in [
+            "secret: synthetic-test-value",
+            "config:\n  SECRET : synthetic-test-value",
+            r#"{"secret": "synthetic-test-value"}"#,
+            r#"{"name": "test", "secret": "synthetic-test-value"}"#,
+            "{'secret': 'synthetic-test-value'}",
+            "const config = {secret: 'synthetic-test-value'};",
+        ] {
+            let result = check_sensitivity(text);
+            assert!(result.blocked, "secret field allowed: {text}");
+            assert_eq!(result.matched_labels, vec!["password_assign"]);
+        }
+    }
+
+    #[test]
+    fn embedded_words_are_not_credential_field_names() {
+        for text in [
+            "notsecret: ordinary text",
+            "notpassword=ordinary-text",
+            "compassword: ordinary-text",
+        ] {
+            assert!(
+                !check_sensitivity(text).blocked,
+                "embedded word rejected: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn benign_prose_does_not_bypass_other_credentials_or_redaction() {
+        for credential in [
+            "password=synthetic-test-value",
+            "Bearer synthetic-test-token",
+            "AKIAIOSFODNN7EXAMPLE",
+            "-----BEGIN RSA PRIVATE KEY-----",
+        ] {
+            let text = format!("The secret: practice every day.\n{credential}");
+            assert!(check_sensitivity(&text).blocked);
+        }
+        let result = check_sensitivity("The secret: ask alice@example.com for advice.");
+        assert!(!result.blocked);
+        assert_eq!(result.matched_labels, vec!["email"]);
+        assert_eq!(
+            result.redacted_content.as_deref(),
+            Some("The secret: ask [email] for advice.")
+        );
     }
 
     #[test]
