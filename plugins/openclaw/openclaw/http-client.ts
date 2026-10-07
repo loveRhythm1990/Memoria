@@ -155,13 +155,16 @@ export class MemoriaHttpTransport {
       const data = await this.get(`/v1/memories?${query}`);
       const rec = this.asRecord(data);
       const pageItems = Array.isArray(rec?.items) ? rec!.items : Array.isArray(data) ? data : [];
-      items.push(...pageItems);
       const next = typeof rec?.next_cursor === "string" && rec.next_cursor ? rec.next_cursor : null;
-      const stalled = next === cursor || pageItems.length === 0;
+      // A cursor that does not advance means the server repeated a page: drop it
+      // so rows are not counted twice, and stop so a misbehaving server cannot
+      // loop us. The leftover cursor still marks the result as incomplete.
+      if (next !== null && next === cursor) {
+        break;
+      }
+      items.push(...pageItems);
       cursor = next;
-      // Stop on a non-advancing cursor so a misbehaving server cannot loop us;
-      // the leftover cursor still marks the result as incomplete.
-      if (!next || stalled) {
+      if (!next || pageItems.length === 0) {
         break;
       }
     }

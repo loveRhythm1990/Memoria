@@ -411,7 +411,9 @@ export class MemoriaClient {
       memory_id: params.memoryId,
     });
     const record = asRecord(tryParseJson(text));
-    if (!record) {
+    // Reject payloads that are not the requested memory (e.g. an empty-body
+    // `{ ok: true }`) so they are never cached under a bogus ID.
+    if (!record || record.memory_id !== params.memoryId) {
       return null;
     }
     const memory = normalizeMemoryRecord(record);

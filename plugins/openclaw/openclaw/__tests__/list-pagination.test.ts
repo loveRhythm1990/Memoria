@@ -18,7 +18,11 @@ function memoryId(i: number) {
   return i.toString(16).padStart(32, "0");
 }
 
-/** Emulates list_memories: keyset pagination over `total` rows, page size clamped to 500. */
+/**
+ * Emulates the REST routes the client touches: list_memories (keyset pagination
+ * over `total` rows, page size clamped to 500), get_memory, and empty
+ * snapshot/branch listings. Any other path fails the test.
+ */
 function serveMemories(f: ReturnType<typeof mockFetch>, total: number) {
   f.respondWithHandler((url) => {
     const parsed = new URL(url);
@@ -30,6 +34,18 @@ function serveMemories(f: ReturnType<typeof mockFetch>, total: number) {
         status: 200,
         body: found ? { memory_id: single[1], content: `m${index}`, memory_type: "semantic" } : null,
       };
+    }
+    if (parsed.pathname === "/v1/snapshots") {
+      return { status: 200, body: { snapshots: [], total: 0, limit: 0, offset: 0 } };
+    }
+    if (parsed.pathname === "/v1/branches") {
+      return {
+        status: 200,
+        body: { branches: [{ name: "main", active: true }], result: "Branches:\nmain ← active" },
+      };
+    }
+    if (parsed.pathname !== "/v1/memories") {
+      throw new Error(`unexpected request: ${parsed.pathname}`);
     }
     const limit = Math.min(Number(parsed.searchParams.get("limit") ?? 100), SERVER_PAGE_MAX);
     const cursor = parsed.searchParams.get("cursor");
@@ -128,6 +144,9 @@ describe("listMemories cursor pagination", () => {
     const client = new MemoriaClient(buildApiConfig());
     const result = await client.listMemories({ userId: "u", limit: 1000 });
     expect(f.calls).toHaveLength(2);
+    // the repeated page is dropped, so its row is not counted twice
+    expect(result.items.map((m) => m.memory_id)).toEqual([memoryId(0)]);
+    expect(result.count).toBe(1);
     expect(result.partial).toBe(true);
     client.close();
   });
@@ -136,9 +155,11 @@ describe("listMemories cursor pagination", () => {
     const f = mockFetch();
     serveMemories(f, 800);
     const client = new MemoriaClient(buildApiConfig());
-    // stats also lists snapshots/branches; the handler answers those with empty pages
+    // stats also lists snapshots and branches; the handler answers with none and main only
     const stats = await client.stats("u");
     expect(stats.activeMemoryCount).toBe(800);
+    expect(stats.snapshotCount).toBe(0);
+    expect(stats.branchCount).toBe(1);
     client.close();
   });
 });
@@ -168,6 +189,17 @@ describe("getMemory", () => {
     f.respondWith(500, { error: "boom" });
     const client = new MemoriaClient(buildApiConfig());
     await expect(client.getMemory({ userId: "u", memoryId: memoryId(1) })).rejects.toThrow(/500/);
+    client.close();
+  });
+
+  it("ignores a payload that is not the requested memory", async () => {
+    const f = mockFetch();
+    f.respondWith(200, "");
+    const client = new MemoriaClient(buildApiConfig());
+    expect(await client.getMemory({ userId: "u", memoryId: memoryId(1) })).toBeNull();
+    // nothing bogus was cached: the next lookup goes back to the API
+    expect(await client.getMemory({ userId: "u", memoryId: memoryId(1) })).toBeNull();
+    expect(f.calls).toHaveLength(2);
     client.close();
   });
 
