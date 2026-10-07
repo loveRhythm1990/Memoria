@@ -54,14 +54,16 @@ static PATTERNS: &[Pattern] = &[
     Pattern {
         label: "password_assign",
         tier: SensitivityTier::High,
-        // Passwords and explicit credential keys remain blocked anywhere.
+        // Keep legacy password/passwd detection and secret suffixes in arbitrary
+        // identifiers (env vars, camelCase, snake_case and hyphenated names).
         // Bare `secret = value` is an assignment, but `share a secret: ...`
         // is ordinary prose. For bare `secret: value`, require a field boundary
-        // (line start or JSON/object separator), including quoted field names.
+        // (line start or JSON/object separator), including YAML list markers
+        // and quoted field names.
         regex: concat!(
-            r#"(?im)(?:\b(?:(?:[a-z][a-z0-9_-]*[_-])?(?:password|passwd)|(?:api|client|auth)[ _-]secret|secret[_-]key|aws_secret_access_key)\b["']?\s*[:=]\s*\S+"#,
+            r#"(?im)(?:(?:password|passwd|[\w-]secret|(?:api|client|auth)[ _-]secret|secret[_-]key|aws_secret_access_key)["']?\s*[:=]\s*\S+"#,
             r#"|\bsecret\b["']?\s*=\s*\S+"#,
-            r#"|(?:^|[{\[,])[\t ]*["']?secret["']?[\t ]*:[\t ]*\S+)"#,
+            r#"|(?:^|[{\[,])[\t ]*(?:-[\t ]+)?["']?secret["']?[\t ]*:[\t ]*\S+)"#,
         ),
         replacement: "",
     },
@@ -213,6 +215,9 @@ mod tests {
             r#"{"name": "test", "secret": "synthetic-test-value"}"#,
             "{'secret': 'synthetic-test-value'}",
             "const config = {secret: 'synthetic-test-value'};",
+            "- secret: synthetic-test-value",
+            "config:\n  - secret: synthetic-test-value",
+            "- 'SECRET': synthetic-test-value",
         ] {
             let result = check_sensitivity(text);
             assert!(result.blocked, "secret field allowed: {text}");
@@ -221,16 +226,24 @@ mod tests {
     }
 
     #[test]
-    fn embedded_words_are_not_credential_field_names() {
+    fn credential_identifiers_keep_legacy_protection() {
         for text in [
-            "notsecret: ordinary text",
-            "notpassword=ordinary-text",
-            "compassword: ordinary-text",
+            "GITHUB_CLIENT_SECRET=ghs_synthetic_test_value",
+            "JWT_SECRET=synthetic-test-value",
+            "app_secret: synthetic-test-value",
+            "webhook_secret = synthetic-test-value",
+            "clientSecret: synthetic-test-value",
+            "userPassword=synthetic-test-value",
+            "dbPassword: synthetic-test-value",
+            "rootpassword=synthetic-test-value",
+            "dbpasswd=synthetic-test-value",
+            "APP-SECRET: synthetic-test-value",
+            "密钥secret: synthetic-test-value",
+            r#"{"clientSecret": "synthetic-test-value"}"#,
         ] {
-            assert!(
-                !check_sensitivity(text).blocked,
-                "embedded word rejected: {text}"
-            );
+            let result = check_sensitivity(text);
+            assert!(result.blocked, "credential identifier allowed: {text}");
+            assert_eq!(result.matched_labels, vec!["password_assign"]);
         }
     }
 
