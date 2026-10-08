@@ -223,6 +223,69 @@ def test_bad_history_items_do_not_prevent_capture(factory):
     eventually(lambda: p._outbox.counts(p._binding) == {"done": 1})
 
 
+@pytest.mark.parametrize("content", ["x" * 32000, '"\\\n' * 10000], ids=["ascii", "escaped"])
+def test_search_preserves_oversized_first_hit_and_later_match(factory, content):
+    make, server = factory
+    p = make()
+    rows = [
+        {
+            "memory_id": f"{i:032x}",
+            "memory_type": "semantic",
+            "subject_id": p._subject,
+            "content": text,
+        }
+        for i, text in enumerate([content, "A short useful match"], 1)
+    ]
+    server.retrieve_handler = lambda r, b: httpx.Response(200, json=rows)
+    raw = p.handle_tool_call("memoria_search", {"query": "matching fact"})
+    response = json.loads(raw)
+    assert response["success"] and response["truncated"]
+    assert len(raw) <= 30000
+    assert [row["memory_id"] for row in response["result"]] == [row["memory_id"] for row in rows]
+    first, second = response["result"]
+    assert first["memory_type"] == "semantic"
+    assert first["content"] and content.startswith(first["content"])
+    assert first["content_truncated"]
+    assert second == rows[1]
+
+
+@pytest.mark.parametrize("large_field", ["content", "extra_metadata"])
+def test_search_budget_keeps_all_hit_ids(factory, large_field):
+    make, server = factory
+    p = make()
+    rows = [
+        {
+            "memory_id": f"{i:032x}",
+            "memory_type": "semantic",
+            "subject_id": p._subject,
+            "content": "x" * 32000 if large_field == "content" else "A short fact",
+            "extra_metadata": {"large": "x" * 32000} if large_field == "extra_metadata" else {},
+        }
+        for i in range(20)
+    ]
+    server.retrieve_handler = lambda r, b: httpx.Response(200, json=rows)
+    raw = p.handle_tool_call("memoria_search", {"query": "matching fact", "top_k": 20})
+    response = json.loads(raw)
+    assert response["success"] and response["truncated"]
+    assert len(raw) <= 30000
+    assert [row["memory_id"] for row in response["result"]] == [row["memory_id"] for row in rows]
+    assert all(row["truncated"] for row in response["result"])
+    if large_field == "extra_metadata":
+        assert all(row["content"] == "A short fact" for row in response["result"])
+        assert not any(row["content_truncated"] for row in response["result"])
+    else:
+        assert all(row["content"] and row["content_truncated"] for row in response["result"])
+
+
+def test_search_within_budget_preserves_full_rows(factory):
+    make, server = factory
+    p = make()
+    rows = [{"memory_id": "a" * 32, "subject_id": p._subject, "content": "完整记录"}]
+    server.retrieve_handler = lambda r, b: httpx.Response(200, json=rows)
+    response = call(p, "search", query="matching fact")
+    assert response == {"success": True, "result": rows}
+
+
 def test_profile_pages_after_output_budget_truncation(factory):
     make, server = factory
     p = make()

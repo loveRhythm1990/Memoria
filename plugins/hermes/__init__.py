@@ -69,6 +69,40 @@ def _context(rows: list, budget: int) -> tuple[str, int]:
     )
 
 
+def _search_json(rows: list) -> str:
+    """Bound search hits independently so one large record cannot hide later IDs."""
+
+    def encode(value, **extra):
+        return json.dumps({"success": True, "result": value, **extra}, ensure_ascii=False)
+
+    encoded = encode(rows)
+    if len(encoded) <= 30000:
+        return encoded
+    # Reserve an equal serialized share for every hit, including JSON separators.
+    # This keeps all valid top_k hits discoverable even when several are oversized.
+    row_budget = (30000 - len(encode([], truncated=True))) // len(rows) - 2
+    reduced = []
+    for row in rows:
+        if len(json.dumps(row, ensure_ascii=False)) <= row_budget:
+            reduced.append(row)
+            continue
+        content = str(row.get("content", ""))
+        slim = {
+            "memory_id": row.get("memory_id"),
+            "memory_type": row.get("memory_type"),
+            "content": content[:6000],
+            "content_truncated": len(content) > 6000,
+            "truncated": True,
+        }
+        while len(json.dumps(slim, ensure_ascii=False)) > row_budget:
+            if not slim["content"]:
+                raise APIError("invalid_response")
+            slim["content"] = slim["content"][: len(slim["content"]) // 2]
+            slim["content_truncated"] = True
+        reduced.append(slim)
+    return encode(reduced, truncated=True)
+
+
 def _profile_json(page: dict) -> str:
     """Keep a usable page and cursor when metadata/content exceeds the tool budget."""
     if any(
@@ -515,22 +549,11 @@ class MemoriaMemoryProvider(MemoryProvider):
                 self._invalidate_cache()
             if tool_name == "memoria_profile":
                 return _profile_json(result)
+            if tool_name == "memoria_search":
+                return _search_json(result)
             # Bound tool output too; don't emit a truncated, invalid JSON document.
             encoded = json.dumps({"success": True, "result": result}, ensure_ascii=False)
             if len(encoded) > 30000:
-                if isinstance(result, list):
-                    reduced = []
-                    for row in result:
-                        candidate = json.dumps(
-                            {"success": True, "result": reduced + [row], "truncated": True},
-                            ensure_ascii=False,
-                        )
-                        if len(candidate) > 30000:
-                            break
-                        reduced.append(row)
-                    return json.dumps(
-                        {"success": True, "result": reduced, "truncated": True}, ensure_ascii=False
-                    )
                 return json.dumps({"success": True, "result_omitted": "response_too_large"})
             return encoded
         except APIError as exc:

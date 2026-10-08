@@ -115,7 +115,11 @@ total wall-clock deadlines: a stalled/slowly streaming request can outlive the
 host wait, and the host suppresses overlapping prefetch until it returns.
 
 Recalled content is untrusted data, JSON encoded and bounded by `context_chars`.
-Explicit tool arguments/results are bounded too. Hermes performs its provider
+Explicit tool arguments/results are bounded too.
+Search results exceeding the 30,000-character tool budget are bounded per hit,
+retaining each ID and a marked content excerpt when needed, so an oversized
+leading record cannot hide later matches. Within-budget responses keep full records.
+Hermes performs its provider
 egress secret redaction before invoking the plugin. Auto capture strips this
 provider's recalled-context wrapper and skips compaction summary messages. It
 does not upload images, tool calls, tool results or system messages. Oversized
