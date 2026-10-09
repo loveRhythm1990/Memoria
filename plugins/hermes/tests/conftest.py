@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import sqlite3
 import sys
 import threading
 import time
@@ -35,8 +36,15 @@ from agent.context_compressor import is_compaction_summary_message  # noqa: F401
 def eventually(check, timeout=5):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
-        if check():
-            return
+        try:
+            if check():
+                return
+        except sqlite3.OperationalError as exc:
+            # Polling a rollback-journal DB can race the worker's commit lock.
+            # Retry only lock contention, never hide SQL/schema errors.
+            code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
+            if code not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                raise
         threading.Event().wait(0.01)
     assert check(), "condition did not become true"
 
