@@ -4,9 +4,10 @@ Native Hermes memory provider, using the free Memoria Cloud by default. Users do
 need to deploy a database, embedding model, extraction model or local Memoria server.
 Self-hosted users can change the API origin in the same plugin.
 
-**Development preview, version 0.1.0.** Source is ready for local installation and
+**Development preview, version 0.1.1.** Source is ready for local installation and
 testing; this directory has not yet been published or accepted into the Hermes
-catalog. Live Cloud API acceptance passed on October 8, 2026; see
+catalog. The 0.1.0 Cloud API acceptance passed on October 8, 2026; the new
+deduplicated-capture route requires server deployment and a fresh live check. See
 [CLOUD_ACCEPTANCE.md](CLOUD_ACCEPTANCE.md) for the tested scope and results.
 
 ## Install the current checkout
@@ -130,17 +131,70 @@ the plugin cannot change the host wrapper and does not promise injection immunit
 
 ## Capture failure recovery
 
+### Explicit writes and automatic capture
+
+When the completed turn includes successful `memoria_store` or `memoria_update`
+tool results, capture forwards only their memory IDs as `exclude_memory_ids` to
+`POST /v1/observe/deduplicated`. Tool output text is not uploaded. The server
+resolves those IDs within the authenticated account, branch and subject, and tells
+the extraction LLM to omit already-saved facts, including translations and
+paraphrases, while retaining other new facts from the same turn. Exact repeated
+content is also filtered in code, including matches after sensitivity redaction.
+Skipped exact duplicates are omitted from the observe response's `memories` list
+rather than returning an unpersisted candidate ID. Semantic exclusions depend on
+the extraction model following the prompt; this is not a general exactly-once guarantee.
+Excluded IDs also protect their original records during vector deduplication:
+if the nearest record is excluded and its final content differs, capture inserts the candidate without
+superseding that record or searching for another record to supersede. This keeps
+distinct new facts, but can retain a duplicate if the model emits a paraphrase
+despite the exclusion prompt. Successful store/update tools always return compact
+receipts with the memory ID, subject and validated memory type (when provided),
+without echoing content or metadata. These stay below the tested host's preview
+size and per-result budget. If aggregate budget enforcement still persists a
+receipt, capture accepts its complete JSON in the tested Hermes
+`<persisted-output>` preview. Truncated previews are ignored, and capture never
+opens the referenced file. Current-turn call correlation and subject checks
+still apply to these receipts.
+Inactive records still supply exclusion content after correction or deletion,
+including when capture was queued before that change. Missing or out-of-scope
+IDs are ignored without exposing their content or rejecting the whole turn.
+
+This requires the matching Memoria API update: **deploy the server first, then
+update this plugin**. A 404 without the new route's response marker produces
+`capture_dedup_endpoint_unavailable`; check the deployed API version and proxy
+routing, then manually retry the failed queue record. A marked business 404
+(for example, a deleted branch) remains `not_found`. The plugin never retries
+that turn against the old
+plain observe route. With exclusions, a missing/failing LLM is an error rather
+than a fallback to raw-message storage. Ordinary turns without successful explicit
+writes continue to use `/v1/observe` with its existing behavior.
+The old route intentionally also accepts exclusions, but retains its original
+500 mapping for service errors. The dedicated route returns typed business errors
+and marks handler responses with `X-Memoria-Observe-Deduplicated: 1`.
+Extraction failures before any persistence return 503 with the additional
+`X-Memoria-Observe-Error: extraction_unavailable` marker. Only this marked failure
+is safe for automatic replay; other 5xx responses can have unknown write outcomes.
+
+The host must include tool calls and results in its completed-turn `messages`
+snapshot in OpenAI `tool_calls`/`tool` format (as the tested Hermes build does).
+Anthropic `tool_result` blocks and synthetic user messages inserted within a turn
+are not supported for exclusion detection. With no such transcript, the plugin
+cannot infer whether an explicit write occurred. Earlier-turn results do not
+exclude facts in later turns. Existing duplicates and old queued payloads are not
+rewritten or deleted by this update.
+
 State lives in `$HERMES_HOME/plugin-data/memoria/outbox.sqlite3`, outside the plugin
 install directory, with private file/directory permissions. Pending/failed/uncertain
 records contain the submitted text. Completed records retain only a fingerprint,
 state and timestamps, not the text. Receipts persist to suppress historical replay;
 back up and remove this state deliberately when removing a profile.
 
-Connection establishment failures and HTTP 429 stay `pending` with persisted
+Connection establishment failures, HTTP 429 and marked pre-write extraction
+failures stay `pending` with persisted
 exponential backoff (1, 2, 4… seconds, capped at 300 seconds), without an attempt
 limit. `Retry-After` can extend that delay, bounded to 24 hours. Due tasks resume
 after restart. Authentication failures and other definite HTTP rejections
-remain `failed` for inspection. Timeouts after sending, HTTP 5xx, malformed success
+remain `failed` for inspection. Timeouts after sending, other HTTP 5xx, malformed success
 responses and interrupted inflight submissions become `uncertain` and are **never
 automatically replayed**. A crashed inflight submission is marked uncertain after
 its 120-second lease expires. Unsent pending records resume with the same binding

@@ -5321,6 +5321,28 @@ impl SqlMemoryStore {
         row.map(|r| row_to_memory(&r)).transpose()
     }
 
+    /// Internal observe lookup: inactive facts still need to be excluded after
+    /// correction/deletion. Scope predicates apply before content leaves storage.
+    pub async fn observe_exclusion_content_from(
+        &self,
+        table: &str,
+        user_id: &str,
+        subject_id: Option<&str>,
+        memory_id: &str,
+    ) -> Result<Option<String>, MemoriaError> {
+        sqlx::query_scalar(&format!(
+            "SELECT content FROM {table} WHERE memory_id = ? AND user_id = ? \
+             AND (subject_id = ? OR (subject_id IS NULL AND ? IS NULL))"
+        ))
+        .bind(memory_id)
+        .bind(user_id)
+        .bind(subject_id)
+        .bind(subject_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)
+    }
+
     pub async fn supersede_memory(
         &self,
         table: &str,
@@ -6881,6 +6903,26 @@ impl MemoryStore for SqlMemoryStore {
              is_active, superseded_by, trust_tier, initial_confidence, \
              observed_at, created_at, updated_at \
              FROM {table} WHERE memory_id = ? AND is_active = 1"
+        ))
+        .bind(memory_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| row_to_memory(&r)).transpose()
+    }
+
+    /// Reads inactive history from main (`mem_memories`) only. For branch-scoped
+    /// observe exclusions, use `observe_exclusion_content_from` with that table.
+    async fn get_including_inactive(&self, memory_id: &str) -> Result<Option<Memory>, MemoriaError> {
+        let table = self.t("mem_memories");
+        let row = sqlx::query(&format!(
+            "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \
+             embedding AS emb_str, session_id, \
+             CAST(source_event_ids AS CHAR) AS src_ids, \
+             CAST(extra_metadata AS CHAR) AS extra_meta, \
+             is_active, superseded_by, trust_tier, initial_confidence, \
+             observed_at, created_at, updated_at \
+             FROM {table} WHERE memory_id = ?"
         ))
         .bind(memory_id)
         .fetch_optional(&self.pool)

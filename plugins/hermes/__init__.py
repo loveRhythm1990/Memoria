@@ -25,7 +25,7 @@ from agent.memory_provider import (
 from .client import APIError, Client
 from .config import Config, api_key, home_path, writes_blocked
 from .outbox import Outbox, digest
-from .tools import SCHEMAS, validate
+from .tools import SCHEMAS, TYPES, validate
 
 log = logging.getLogger(__name__)
 _LOCAL_PLATFORMS = {"cli", "local", "desktop"}
@@ -44,6 +44,69 @@ def _direct_text(text: str) -> str:
     if is_compaction_summary_message({"role": "user", "content": text}):
         return ""
     return text
+
+
+def _write_response(content):
+    """Decode JSON or a complete compact receipt in the tested host's preview.
+
+    Aggregate budget enforcement can spill even a small result. Never follow
+    the preview's file path or infer success from a truncated JSON prefix.
+    """
+    if isinstance(content, str) and content.startswith("<persisted-output>\n"):
+        match = re.fullmatch(
+            r"<persisted-output>\n.*?\nPreview \(first ([0-9]{1,6}) chars\):\n(.*)\n</persisted-output>",
+            content,
+            re.DOTALL,
+        )
+        if match and len(match[2]) == int(match[1]) and len(match[2]) <= 1024:
+            content = match[2]
+    return json.loads(content)
+
+
+def _turn_saved_ids(messages, subject):
+    """Read successful memory writes from this turn, not earlier transcript history."""
+    turn = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "user":
+            turn = []
+        turn.append(message)
+    writes, saved = set(), []
+    for message in turn:
+        if message.get("role") == "assistant":
+            calls = message.get("tool_calls")
+            for call in calls if isinstance(calls, list) else []:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function")
+                if isinstance(function, dict) and function.get("name") in {
+                    "memoria_store",
+                    "memoria_update",
+                }:
+                    call_id = call.get("id")
+                    if isinstance(call_id, str):
+                        writes.add(call_id)
+        call_id = message.get("tool_call_id")
+        if message.get("role") != "tool" or not isinstance(call_id, str) or call_id not in writes:
+            continue
+        try:
+            response = _write_response(message.get("content", ""))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(response, dict) or response.get("success") is not True:
+            continue
+        result = response.get("result")
+        if not isinstance(result, dict) or result.get("subject_id") != subject:
+            continue
+        memory_id = result.get("memory_id")
+        if (
+            isinstance(memory_id, str)
+            and re.fullmatch(r"[A-Za-z0-9_-]{1,200}", memory_id)
+            and memory_id not in saved
+        ):
+            saved.append(memory_id)
+    return saved
 
 
 def _context(rows: list, budget: int) -> tuple[str, int]:
@@ -373,9 +436,14 @@ class MemoriaMemoryProvider(MemoryProvider):
                 if text:
                     history.append({"role": message["role"], "content": text})
         try:
+            saved_ids = _turn_saved_ids(messages, self._subject)
             self._outbox.enqueue(
                 self._binding,
-                {"messages": pair, **self._scope(session_id)},
+                {
+                    "messages": pair,
+                    **self._scope(session_id),
+                    **({"exclude_memory_ids": saved_ids} if saved_ids else {}),
+                },
                 digest(history or pair),
             )
             self._wake.set()
@@ -415,7 +483,14 @@ class MemoriaMemoryProvider(MemoryProvider):
                 completion = {"event": row["id"], "claim_token": row["claim_token"]}
                 try:
                     payload = json.loads(row["payload"])
-                    result = self._writer.request("POST", "/v1/observe", json=payload)
+                    # Old servers must reject this route rather than silently ignoring
+                    # the exclusions and storing the same fact a second time.
+                    path = (
+                        "/v1/observe/deduplicated"
+                        if payload.get("exclude_memory_ids")
+                        else "/v1/observe"
+                    )
+                    result = self._writer.request("POST", path, json=payload)
                     if not isinstance(result, dict) or not isinstance(result.get("memories"), list):
                         raise APIError("invalid_observe_response", uncertain=True)
                     warning = "observe_raw_fallback" if result.get("warning") else ""
@@ -541,7 +616,8 @@ class MemoriaMemoryProvider(MemoryProvider):
                     )
             if tool_name in {"memoria_store", "memoria_update"} and (
                 not isinstance(result, dict)
-                or not result.get("memory_id")
+                or not isinstance(result.get("memory_id"), str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", result["memory_id"])
                 or result.get("subject_id") != self._subject
             ):
                 raise APIError("invalid_mutation_response", uncertain=True)
@@ -551,6 +627,14 @@ class MemoriaMemoryProvider(MemoryProvider):
                 return _profile_json(result)
             if tool_name == "memoria_search":
                 return _search_json(result)
+            if tool_name in {"memoria_store", "memoria_update"}:
+                # Always return a bounded receipt, below the tested host's
+                # 1,500-char preview as well as its 8,000-char per-result floor.
+                # Do not echo content/metadata that could hide the successful ID.
+                receipt = {"memory_id": result["memory_id"], "subject_id": self._subject}
+                if result.get("memory_type") in TYPES:
+                    receipt["memory_type"] = result["memory_type"]
+                return json.dumps({"success": True, "result": receipt}, ensure_ascii=False)
             # Bound tool output too; don't emit a truncated, invalid JSON document.
             encoded = json.dumps({"success": True, "result": result}, ensure_ascii=False)
             if len(encoded) > 30000:

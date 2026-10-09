@@ -9,6 +9,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import quote
 
 
 def run(key_file: Path, report_file: Path):
@@ -113,16 +114,28 @@ def run(key_file: Path, report_file: Path):
                 reset_hermes_home_override(other_home_token)
             feedback = call(p, "feedback", memory_id=row["memory_id"], signal="useful")
             check("feedback", bool(feedback.get("feedback_id")))
+            updated_content = f"For the disposable {marker} test user, the preferred tea is oolong."
             corrected = call(
                 p,
                 "update",
                 memory_id=row["memory_id"],
-                new_content=(
-                    f"For the disposable {marker} test user, the preferred tea is oolong."
-                ),
+                new_content=updated_content,
             )
             known_ids.add(corrected["memory_id"])
-            check("update", "oolong" in corrected.get("content", ""))
+            # Write tools return compact receipts, not record content. Verify the
+            # returned ID against the persisted record in the same branch/subject.
+            corrected_record = p._read.request(
+                "GET",
+                "/v1/memories/" + quote(corrected["memory_id"], safe=""),
+                params={"branch": p._cfg.branch},
+            )
+            check(
+                "update",
+                isinstance(corrected_record, dict)
+                and corrected_record.get("memory_id") == corrected["memory_id"]
+                and corrected_record.get("subject_id") == p._subject
+                and corrected_record.get("content") == updated_content,
+            )
             call(p, "forget", memory_id=corrected["memory_id"])
             rows = call(p, "search", query=marker)
             check(

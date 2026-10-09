@@ -45,6 +45,89 @@ def test_close_waits_for_inflight_request_without_blocking():
 
 
 @pytest.mark.parametrize(
+    "path,status,headers,code,retryable,uncertain",
+    [
+        ("/v1/observe/deduplicated", 404, {}, "capture_dedup_endpoint_unavailable", False, False),
+        (
+            "/v1/observe/deduplicated",
+            404,
+            {"X-Memoria-Observe-Deduplicated": "1"},
+            "not_found",
+            False,
+            False,
+        ),
+        (
+            "/v1/observe/deduplicated",
+            503,
+            {
+                "X-Memoria-Observe-Deduplicated": "1",
+                "X-Memoria-Observe-Error": "extraction_unavailable",
+            },
+            "observe_extraction_unavailable",
+            True,
+            False,
+        ),
+        ("/v1/observe/deduplicated", 503, {}, "http_503", False, True),
+        (
+            "/v1/observe/deduplicated",
+            503,
+            {"X-Memoria-Observe-Error": "extraction_unavailable"},
+            "http_503",
+            False,
+            True,
+        ),
+        (
+            "/v1/observe/deduplicated",
+            503,
+            {"X-Memoria-Observe-Deduplicated": "1"},
+            "http_503",
+            False,
+            True,
+        ),
+        (
+            "/v1/observe/deduplicated",
+            500,
+            {
+                "X-Memoria-Observe-Deduplicated": "1",
+                "X-Memoria-Observe-Error": "extraction_unavailable",
+            },
+            "http_500",
+            False,
+            True,
+        ),
+        (
+            "/v1/observe",
+            503,
+            {
+                "X-Memoria-Observe-Deduplicated": "1",
+                "X-Memoria-Observe-Error": "extraction_unavailable",
+            },
+            "http_503",
+            False,
+            True,
+        ),
+    ],
+)
+def test_deduplicated_error_markers_are_route_and_status_specific(
+    path, status, headers, code, retryable, uncertain
+):
+    client = Client(
+        "https://example.test",
+        "key",
+        1,
+        transport=httpx.MockTransport(lambda r: httpx.Response(status, headers=headers)),
+    )
+    try:
+        with pytest.raises(APIError) as caught:
+            client.request("POST", path, json={})
+        assert caught.value.code == code
+        assert caught.value.retryable is retryable
+        assert caught.value.uncertain is uncertain
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(
     "values",
     [
         {"api_url": "https://secret:password@example.test"},

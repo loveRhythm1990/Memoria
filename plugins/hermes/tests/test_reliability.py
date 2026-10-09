@@ -17,6 +17,50 @@ def start_capture(p):
     p._worker.start()
 
 
+def test_eventually_retries_a_real_sqlite_read_lock(tmp_path):
+    box = Outbox(tmp_path / "outbox")
+    box.enqueue("binding", {"messages": []}, "history")
+    locked, release, saw_busy = threading.Event(), threading.Event(), threading.Event()
+
+    def hold_lock():
+        connection = sqlite3.connect(box.path)
+        try:
+            connection.execute("BEGIN EXCLUSIVE")
+            locked.set()
+            release.wait(10)
+        finally:
+            connection.rollback()
+            connection.close()
+
+    holder = threading.Thread(target=hold_lock, daemon=True)
+    holder.start()
+    try:
+        assert locked.wait(5)
+
+        def completed():
+            try:
+                return box.counts("binding") == {"pending": 1}
+            except sqlite3.OperationalError:
+                saw_busy.set()
+                release.set()
+                raise
+
+        eventually(completed)
+        assert saw_busy.is_set(), "must exercise an actual locked SELECT before recovery"
+    finally:
+        release.set()
+        holder.join(timeout=5)
+    assert not holder.is_alive()
+
+
+def test_eventually_does_not_hide_non_lock_sqlite_errors(tmp_path):
+    box = Outbox(tmp_path / "outbox")
+    with box.db() as db:
+        db.execute("DROP TABLE events")
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        eventually(lambda: box.counts("binding"))
+
+
 def test_real_sqlite_lock_does_not_kill_claim_worker(factory):
     make, server = factory
     p = make()
