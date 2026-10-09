@@ -1,6 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::Deserialize;
@@ -815,6 +816,14 @@ pub async fn observe_turn(
     if !req.exclude_memory_ids.is_empty() {
         auth.require_scope(crate::auth::SCOPE_MEMORY_READ)?;
     }
+    observe_result(&state, &auth, req).await.map_err(api_err)
+}
+
+async fn observe_result(
+    state: &AppState,
+    auth: &AuthUser,
+    req: ObserveRequest,
+) -> Result<Json<serde_json::Value>, memoria_core::MemoriaError> {
     let (memories, has_llm) = state
         .service
         .observe_turn_excluding_on_branch(
@@ -825,8 +834,7 @@ pub async fn observe_turn(
             req.subject_id,
             &req.exclude_memory_ids,
         )
-        .await
-        .map_err(api_err_typed)?;
+        .await?;
 
     let stored: Vec<_> = memories
         .iter()
@@ -852,14 +860,43 @@ pub async fn observe_turn_deduplicated(
     State(state): State<AppState>,
     auth: AuthUser,
     Json(req): Json<ObserveRequest>,
-) -> ApiResult<serde_json::Value> {
+) -> Response {
     if req.exclude_memory_ids.is_empty() {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "exclude_memory_ids is required".into(),
-        ));
+        return deduplicated_response(
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "exclude_memory_ids is required",
+            )
+                .into_response(),
+        );
     }
-    observe_turn(State(state), auth, Json(req)).await
+    if let Err(error) = auth.require_scope(crate::auth::SCOPE_MEMORY_READ) {
+        return deduplicated_response(error.into_response());
+    }
+    let response = match observe_result(&state, &auth, req).await {
+        Ok(result) => result.into_response(),
+        Err(memoria_core::MemoriaError::ObserveExtractionUnavailable(error)) => {
+            tracing::warn!(error, "observe extraction failed before persistence");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("x-memoria-observe-error", "extraction_unavailable")],
+                Json(serde_json::json!({"error": "observe_extraction_unavailable"})),
+            )
+                .into_response()
+        }
+        Err(error) => api_err_typed(error).into_response(),
+    };
+    deduplicated_response(response)
+}
+
+fn deduplicated_response(mut response: Response) -> Response {
+    // Route-generated responses distinguish missing resources from an old server's
+    // missing route. The extraction_unavailable marker alone certifies no writes.
+    response.headers_mut().insert(
+        "x-memoria-observe-deduplicated",
+        axum::http::HeaderValue::from_static("1"),
+    );
+    response
 }
 
 /// GET /v1/memories/:id/history — version chain via superseded_by links.

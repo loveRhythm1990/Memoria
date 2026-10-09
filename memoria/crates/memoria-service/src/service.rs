@@ -2247,6 +2247,7 @@ impl MemoryService {
             self.store.insert(&new_mem).await?;
             self.store.soft_delete(memory_id).await?;
             let mut old_updated = old;
+            old_updated.is_active = false;
             old_updated.superseded_by = Some(new_mem.memory_id.clone());
             self.store.update(&old_updated).await?;
             Ok(new_mem)
@@ -2921,6 +2922,7 @@ impl MemoryService {
         // filters on (avoids trailing-space mismatches).
         let subject_id = normalize_opt_string(subject_id);
         let has_llm = self.llm.is_some();
+        let exclusion_mode = !exclude_memory_ids.is_empty();
         if exclude_memory_ids.len() > 100
             || exclude_memory_ids.iter().any(|id| {
                 id.is_empty()
@@ -2941,21 +2943,34 @@ impl MemoryService {
         }
         let mut excluded = Vec::new();
         let mut excluded_bytes = 0;
+        let sql_scope = if exclusion_mode && self.sql_store.is_some() {
+            let sql = self.user_sql_store(user_id).await?;
+            let table = sql.table_for_branch(user_id, branch).await?;
+            Some((sql, table))
+        } else {
+            None
+        };
         for id in exclude_memory_ids {
-            let memory = self
-                .get_for_user_on_branch(user_id, branch, id)
-                .await?
-                .filter(|m| m.user_id == user_id && m.subject_id == subject_id)
-                .ok_or_else(|| {
-                    MemoriaError::Validation("observe exclusion not in current scope".into())
-                })?;
-            excluded_bytes += memory.content.len();
+            let content = if let Some((sql, table)) = &sql_scope {
+                sql.observe_exclusion_content_from(table, user_id, subject_id.as_deref(), id)
+                    .await?
+            } else {
+                self.store
+                    .get_including_inactive(id)
+                    .await?
+                    .filter(|m| m.user_id == user_id && m.subject_id == subject_id)
+                    .map(|m| m.content)
+            };
+            // Missing/purged or out-of-scope hints must not reject unrelated facts.
+            // Never pass another user's/subject's content to the extraction model.
+            let Some(content) = content else { continue };
+            excluded_bytes += content.len();
             if excluded_bytes > 65536 {
                 return Err(MemoriaError::Validation(
                     "observe exclusions exceed content budget".into(),
                 ));
             }
-            excluded.push(memory.content);
+            excluded.push(content);
         }
 
         let candidates = if let Some(llm) = &self.llm {
@@ -2977,7 +2992,9 @@ impl MemoryService {
                         .await
                 }
                 Ok(_) => vec![],
-                Err(e) if !excluded.is_empty() => return Err(e),
+                Err(e) if exclusion_mode => {
+                    return Err(MemoriaError::ObserveExtractionUnavailable(e.to_string()));
+                }
                 Err(e) => {
                     warn!(error = %e, "LLM extraction failed, falling back to raw storage");
                     self.raw_candidates(user_id, messages, session_id.clone(), subject_id.clone())

@@ -482,8 +482,6 @@ class MemoriaMemoryProvider(MemoryProvider):
                         self._notice(warning)
                     self._invalidate_cache()
                 except APIError as exc:
-                    if payload.get("exclude_memory_ids") and exc.code == "not_found":
-                        exc = APIError("capture_dedup_requires_server_upgrade")
                     state = (
                         "uncertain" if exc.uncertain else "pending" if exc.retryable else "failed"
                     )

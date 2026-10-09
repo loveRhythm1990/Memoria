@@ -13,6 +13,11 @@ Repeat live acceptance for a turn that explicitly saves one fact and contains a
 second unsaved fact: the explicit record should remain active at T1, the second
 fact should be captured, and no translated/paraphrased copy of the first should
 appear. The October 8 Cloud report covers 0.1.0, not this new route.
+Also verify same-turn store→correct and store→forget, recovery after a pre-write
+extraction failure, and a missing branch without an erroneous upgrade diagnosis.
+The API/proxy must preserve `X-Memoria-Observe-Deduplicated` and
+`X-Memoria-Observe-Error`; without these markers the plugin conservatively treats
+503 as uncertain and unmarked 404 as an unavailable endpoint.
 
 1. Keep the Cloud acceptance current and validate on the final
    supported Hermes build. Test installing/updating/removing the directory in a

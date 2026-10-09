@@ -70,6 +70,22 @@ class Client:
                         404: "not_found",
                         429: "rate_limited",
                     }.get(r.status_code, f"http_{r.status_code}")
+                    deduplicated = (
+                        method == "POST"
+                        and path == "/v1/observe/deduplicated"
+                        and r.headers.get("X-Memoria-Observe-Deduplicated") == "1"
+                    )
+                    if method == "POST" and path == "/v1/observe/deduplicated":
+                        if r.status_code == 404 and not deduplicated:
+                            code = "capture_dedup_endpoint_unavailable"
+                        elif (
+                            r.status_code == 503
+                            and deduplicated
+                            and r.headers.get("X-Memoria-Observe-Error") == "extraction_unavailable"
+                        ):
+                            # This route-specific server marker certifies extraction
+                            # failed before any persistence. Generic 503s remain unknown.
+                            raise APIError("observe_extraction_unavailable", retryable=True)
                     retry_after = 0
                     if r.status_code == 429:
                         value = r.headers.get("Retry-After", "")

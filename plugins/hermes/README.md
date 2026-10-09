@@ -141,17 +141,30 @@ the extraction LLM to omit already-saved facts, including translations and
 paraphrases, while retaining other new facts from the same turn. Exact repeated
 content is also filtered in code. Semantic exclusions depend on the extraction
 model following the prompt; this is not a general exactly-once guarantee.
+Inactive records still supply exclusion content after correction or deletion,
+including when capture was queued before that change. Missing or out-of-scope
+IDs are ignored without exposing their content or rejecting the whole turn.
 
 This requires the matching Memoria API update: **deploy the server first, then
-update this plugin**. An old server's 404 produces
-`capture_dedup_requires_server_upgrade` and keeps a failed queue record for safe
-manual retry after upgrade. The plugin never retries that turn against the old
+update this plugin**. A 404 without the new route's response marker produces
+`capture_dedup_endpoint_unavailable`; check the deployed API version and proxy
+routing, then manually retry the failed queue record. A marked business 404
+(for example, a deleted branch) remains `not_found`. The plugin never retries
+that turn against the old
 plain observe route. With exclusions, a missing/failing LLM is an error rather
 than a fallback to raw-message storage. Ordinary turns without successful explicit
 writes continue to use `/v1/observe` with its existing behavior.
+The old route intentionally also accepts exclusions, but retains its original
+500 mapping for service errors. The dedicated route returns typed business errors
+and marks handler responses with `X-Memoria-Observe-Deduplicated: 1`.
+Extraction failures before any persistence return 503 with the additional
+`X-Memoria-Observe-Error: extraction_unavailable` marker. Only this marked failure
+is safe for automatic replay; other 5xx responses can have unknown write outcomes.
 
 The host must include tool calls and results in its completed-turn `messages`
-snapshot (as the tested Hermes build does). With no such transcript, the plugin
+snapshot in OpenAI `tool_calls`/`tool` format (as the tested Hermes build does).
+Anthropic `tool_result` blocks and synthetic user messages inserted within a turn
+are not supported for exclusion detection. With no such transcript, the plugin
 cannot infer whether an explicit write occurred. Earlier-turn results do not
 exclude facts in later turns. Existing duplicates and old queued payloads are not
 rewritten or deleted by this update.
@@ -162,11 +175,12 @@ records contain the submitted text. Completed records retain only a fingerprint,
 state and timestamps, not the text. Receipts persist to suppress historical replay;
 back up and remove this state deliberately when removing a profile.
 
-Connection establishment failures and HTTP 429 stay `pending` with persisted
+Connection establishment failures, HTTP 429 and marked pre-write extraction
+failures stay `pending` with persisted
 exponential backoff (1, 2, 4… seconds, capped at 300 seconds), without an attempt
 limit. `Retry-After` can extend that delay, bounded to 24 hours. Due tasks resume
 after restart. Authentication failures and other definite HTTP rejections
-remain `failed` for inspection. Timeouts after sending, HTTP 5xx, malformed success
+remain `failed` for inspection. Timeouts after sending, other HTTP 5xx, malformed success
 responses and interrupted inflight submissions become `uncertain` and are **never
 automatically replayed**. A crashed inflight submission is marked uncertain after
 its 120-second lease expires. Unsent pending records resume with the same binding
