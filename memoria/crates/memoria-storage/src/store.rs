@@ -1720,24 +1720,8 @@ impl SqlMemoryStore {
             }
         }
 
-        // Nullable fields distinguish historical/non-tool calls from actual tool
-        // success. Keep additive migrations compatible with older writers.
-        for column in [
-            "tool_success TINYINT(1) NULL",
-            "tool_error_kind VARCHAR(32) NULL",
-        ] {
-            if let Err(error) = sqlx::query(&format!(
-                "ALTER TABLE {api_call_log_table} ADD COLUMN {column}"
-            ))
-            .execute(pool)
-            .await
-            {
-                if !is_duplicate_column(&error) {
-                    tracing::error!(%error, column, "Cannot migrate tool outcome call-log columns");
-                    return Err(db_err(error));
-                }
-            }
-        }
+        self.ensure_call_log_tool_outcome_columns(pool, schema_name)
+            .await?;
 
         let has_feedback_memory_user_idx = info_schema_index_exists(
             pool,
@@ -2264,6 +2248,44 @@ impl SqlMemoryStore {
         }
     }
 
+    /// Tool outcomes were added after schema version 2. Repair just these
+    /// additive columns on current-version databases, without replaying historical
+    /// memory/branch migrations or changing the version marker during a rollout.
+    async fn ensure_call_log_tool_outcome_columns(
+        &self,
+        pool: &MySqlPool,
+        schema_name: &str,
+    ) -> Result<(), MemoriaError> {
+        let table = self.t("mem_api_call_log");
+        // NULL preserves historical/non-tool outcomes and permits older API
+        // instances to continue inserting their original column list.
+        for (name, definition) in [
+            ("tool_success", "tool_success TINYINT(1) NULL"),
+            ("tool_error_kind", "tool_error_kind VARCHAR(32) NULL"),
+        ] {
+            if info_schema_column_exists(pool, schema_name, "mem_api_call_log", name).await {
+                continue;
+            }
+            if let Err(error) = sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {definition}"))
+                .execute(pool)
+                .await
+            {
+                // Another instance can win between the metadata read and ALTER.
+                // MatrixOne may also report a stale secondary-index table; accept
+                // that race only when the requested column actually exists.
+                let repaired_by_other_instance = is_duplicate_column(&error)
+                    || (is_mo_concurrent_ddl_race(&error)
+                        && info_schema_column_exists(pool, schema_name, "mem_api_call_log", name)
+                            .await);
+                if !repaired_by_other_instance {
+                    tracing::error!(%error, column = name, "Cannot migrate tool outcome call-log columns");
+                    return Err(db_err(error));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn migrate_user(&self) -> Result<(), MemoriaError> {
         let pool = &self.pool;
         let meta_table = self.t("mem_schema_meta");
@@ -2293,6 +2315,8 @@ impl SqlMemoryStore {
         if load_user_schema_version(pool, &meta_table).await? == Some(CURRENT_USER_SCHEMA_VERSION)
             && info_schema_table_exists(pool, schema_name, "mem_memories").await
         {
+            self.ensure_call_log_tool_outcome_columns(pool, schema_name)
+                .await?;
             return Ok(());
         }
 
