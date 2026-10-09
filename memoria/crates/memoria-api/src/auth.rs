@@ -1047,6 +1047,10 @@ impl CallLogBatcher {
                         continue;
                     }
                 };
+                if let Err(e) = user_store.ensure_call_log_tool_outcome_schema().await {
+                    warn!("call_log schema repair failed for user {user_id}: {e}");
+                    continue;
+                }
                 let table = user_store.t("mem_api_call_log");
                 if let Err(e) = flush_call_log_chunked(user_store.pool(), &table, &entries).await {
                     warn!("call_log batch flush failed for user {user_id}: {e}");
@@ -1057,6 +1061,10 @@ impl CallLogBatcher {
                     pending.extend(retry_entries);
                 }
             }
+            return;
+        }
+        if let Err(e) = sql.ensure_call_log_tool_outcome_schema().await {
+            warn!("call_log schema repair failed: {e}");
             return;
         }
         if let Err(e) = flush_call_log_chunked(sql.pool(), "mem_api_call_log", &entries).await {

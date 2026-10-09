@@ -8,7 +8,7 @@ use memoria_core::{
 use sqlx::{mysql::MySqlPool, MySql, QueryBuilder, Row};
 use std::borrow::Cow;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -900,6 +900,8 @@ fn mo_to_vec(s: &str) -> Result<Vec<f32>, MemoriaError> {
 pub struct SqlMemoryStore {
     pool: MySqlPool,
     branch_alter_capability: Arc<crate::branch_capability::BranchAlterCapability>,
+    /// Successful optional log-schema checks are shared by clones of this store.
+    call_log_tool_outcomes_ready: Arc<AtomicBool>,
     embedding_dim: usize,
     instance_id: String,
     database_url: Option<String>,
@@ -998,6 +1000,7 @@ impl SqlMemoryStore {
             branch_alter_capability: Arc::new(
                 crate::branch_capability::BranchAlterCapability::default(),
             ),
+            call_log_tool_outcomes_ready: Arc::new(AtomicBool::new(false)),
             embedding_dim,
             instance_id,
             database_url: None,
@@ -1090,12 +1093,14 @@ impl SqlMemoryStore {
     pub fn set_db_name(&mut self, name: String) {
         self.branch_alter_capability =
             Arc::new(crate::branch_capability::BranchAlterCapability::default());
+        self.call_log_tool_outcomes_ready = Arc::new(AtomicBool::new(false));
         self.db_name = Some(name);
     }
 
     pub fn set_database_url(&mut self, url: String) {
         self.branch_alter_capability =
             Arc::new(crate::branch_capability::BranchAlterCapability::default());
+        self.call_log_tool_outcomes_ready = Arc::new(AtomicBool::new(false));
         self.database_url = Some(url);
     }
 
@@ -2248,14 +2253,29 @@ impl SqlMemoryStore {
         }
     }
 
-    /// Tool outcomes were added after schema version 2. Repair just these
-    /// additive columns on current-version databases, without replaying historical
+    /// Retry optional call-log repairs from the background writer, even when the
+    /// router has already cached an otherwise usable user schema. Failed checks
+    /// are not cached; successful checks avoid metadata queries on later batches.
+    pub async fn ensure_call_log_tool_outcome_schema(&self) -> Result<(), MemoriaError> {
+        if self.call_log_tool_outcomes_ready.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let schema_name = self.current_schema_name().await?;
+        self.ensure_call_log_tool_outcome_columns(&self.pool, schema_name.as_ref())
+            .await
+    }
+
+    /// Tool outcomes were added after version 2 was introduced, without a version
+    /// bump. Repair just these additive columns, without replaying historical
     /// memory/branch migrations or changing the version marker during a rollout.
     async fn ensure_call_log_tool_outcome_columns(
         &self,
         pool: &MySqlPool,
         schema_name: &str,
     ) -> Result<(), MemoriaError> {
+        if self.call_log_tool_outcomes_ready.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let table = self.t("mem_api_call_log");
         // NULL preserves historical/non-tool outcomes and permits older API
         // instances to continue inserting their original column list.
@@ -2266,10 +2286,8 @@ impl SqlMemoryStore {
             if info_schema_column_exists(pool, schema_name, "mem_api_call_log", name).await {
                 continue;
             }
-            if let Err(error) = sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {definition}"))
-                .execute(pool)
-                .await
-            {
+            let sql = format!("ALTER TABLE {table} ADD COLUMN {definition}");
+            if let Err(error) = exec_ddl_with_retry(pool, &sql).await {
                 // Another instance can win between the metadata read and ALTER.
                 // MatrixOne may also report a stale secondary-index table; accept
                 // that race only when the requested column actually exists.
@@ -2283,6 +2301,8 @@ impl SqlMemoryStore {
                 }
             }
         }
+        self.call_log_tool_outcomes_ready
+            .store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -2315,8 +2335,14 @@ impl SqlMemoryStore {
         if load_user_schema_version(pool, &meta_table).await? == Some(CURRENT_USER_SCHEMA_VERSION)
             && info_schema_table_exists(pool, schema_name, "mem_memories").await
         {
-            self.ensure_call_log_tool_outcome_columns(pool, schema_name)
-                .await?;
+            // Monitoring failures must not make an existing user's memories
+            // unavailable. The background log writer retries this optional repair.
+            if let Err(error) = self
+                .ensure_call_log_tool_outcome_columns(pool, schema_name)
+                .await
+            {
+                tracing::warn!(%error, schema_name, "Optional call-log schema repair deferred to background writer");
+            }
             return Ok(());
         }
 

@@ -1,3 +1,4 @@
+use memoria_core::interfaces::MemoryStore;
 use memoria_storage::store::CURRENT_USER_SCHEMA_VERSION;
 use memoria_storage::{DbRouter, SqlMemoryStore};
 use sqlx::{mysql::MySqlPoolOptions, MySqlPool, Row};
@@ -8,13 +9,32 @@ struct LegacyFixture {
     pool: MySqlPool,
     user: String,
     user_url: String,
+    shared_db: String,
+    user_db: String,
+}
+
+impl LegacyFixture {
+    async fn cleanup(self) {
+        self.router.invalidate_user(&self.user).await;
+        self.pool.close().await;
+        // Only databases owned by this fixture are removed.
+        for db in [&self.user_db, &self.shared_db] {
+            sqlx::query(&format!("DROP DATABASE IF EXISTS `{db}`"))
+                .execute(self.router.global_user_pool())
+                .await
+                .expect("clean up fixture database");
+        }
+        self.router.global_user_pool().close().await;
+        self.router.shared_pool().close().await;
+    }
 }
 
 async fn legacy_fixture(version: i64, partial: bool) -> LegacyFixture {
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria_test".into());
     let (base, _) = url.rsplit_once('/').expect("database URL");
-    let shared_url = format!("{base}/call_log_upgrade_{}", Uuid::new_v4().simple());
+    let shared_db = format!("call_log_upgrade_{}", Uuid::new_v4().simple());
+    let shared_url = format!("{base}/{shared_db}");
     let router = DbRouter::connect(&shared_url, 1024, Uuid::new_v4().to_string())
         .await
         .expect("connect router");
@@ -93,6 +113,8 @@ async fn legacy_fixture(version: i64, partial: bool) -> LegacyFixture {
         pool,
         user,
         user_url,
+        shared_db,
+        user_db: db,
     }
 }
 
@@ -198,6 +220,7 @@ async fn routed_upgrade(version: i64, partial: bool) {
         .await
         .unwrap();
     assert_eq!(count, 3);
+    f.cleanup().await;
 }
 
 #[tokio::test]
@@ -228,24 +251,45 @@ async fn two_instances_can_repair_version_2_tool_outcomes() {
     a_result.expect("first instance migration");
     b_result.expect("second instance migration");
     verify_usable_history(&f, false).await;
+    a.pool().close().await;
+    b.pool().close().await;
+    f.cleanup().await;
 }
 
 #[tokio::test]
-async fn failed_log_repair_does_not_mark_user_schema_ready() {
+async fn failed_log_repair_keeps_memories_available_and_retries_on_cached_store() {
     let f = legacy_fixture(2, false).await;
     sqlx::query("ALTER TABLE mem_api_call_log RENAME TO saved_call_log")
         .execute(&f.pool)
         .await
         .unwrap();
-    assert!(f.router.user_store(&f.user).await.is_err());
+    let store = f
+        .router
+        .user_store(&f.user)
+        .await
+        .expect("memory store stays available");
+    let memory = store
+        .get("preserved-memory")
+        .await
+        .unwrap()
+        .expect("existing memory");
+    assert_eq!(memory.content, "Keep existing memory content");
+    assert!(store.ensure_call_log_tool_outcome_schema().await.is_err());
     sqlx::query("ALTER TABLE saved_call_log RENAME TO mem_api_call_log")
         .execute(&f.pool)
         .await
         .unwrap();
-    // Retry on the same router: failed initialization must not cache readiness.
-    f.router
+    // Retry through the same cached store without invalidating the router.
+    let cached = f
+        .router
         .user_store(&f.user)
         .await
-        .expect("retry repairs the restored legacy log table");
+        .expect("cached user remains available");
+    assert!(std::sync::Arc::ptr_eq(&store, &cached));
+    cached
+        .ensure_call_log_tool_outcome_schema()
+        .await
+        .expect("retry repairs the restored log table");
     verify_usable_history(&f, false).await;
+    f.cleanup().await;
 }
