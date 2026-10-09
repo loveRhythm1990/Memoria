@@ -6911,6 +6911,8 @@ impl MemoryStore for SqlMemoryStore {
         row.map(|r| row_to_memory(&r)).transpose()
     }
 
+    /// Reads inactive history from main (`mem_memories`) only. For branch-scoped
+    /// observe exclusions, use `observe_exclusion_content_from` with that table.
     async fn get_including_inactive(&self, memory_id: &str) -> Result<Option<Memory>, MemoriaError> {
         let table = self.t("mem_memories");
         let row = sqlx::query(&format!(

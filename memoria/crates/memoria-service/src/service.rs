@@ -3010,7 +3010,8 @@ impl MemoryService {
                 .persist_with_dedup(user_id, branch, mem, exclude_memory_ids)
                 .await
             {
-                Ok(m) => stored.push(m),
+                Ok(Some(m)) => stored.push(m),
+                Ok(None) => continue,
                 Err(MemoriaError::Blocked(_)) => continue,
                 Err(e) => return Err(e),
             }
@@ -3128,13 +3129,14 @@ impl MemoryService {
     }
 
     /// Persist a memory with dedup (near-duplicate detection + supersede).
+    /// Exact duplicates return None: no new record or receipt was created.
     async fn persist_with_dedup(
         &self,
         user_id: &str,
         branch: Option<&str>,
         mut mem: Memory,
         protected_ids: &[String],
-    ) -> Result<Memory, MemoriaError> {
+    ) -> Result<Option<Memory>, MemoriaError> {
         let sensitivity = check_sensitivity(&mem.content);
         if sensitivity.blocked {
             return Err(MemoriaError::Blocked(
@@ -3166,21 +3168,24 @@ impl MemoryService {
                     )
                     .await
                 {
+                    // Compare the final, redacted content before considering
+                    // protection. Never insert or return a phantom candidate ID
+                    // for an exact duplicate, including a protected neighbor.
+                    if old_content.trim() == mem.content.trim() {
+                        return Ok(None);
+                    }
                     // Keep the original nearest-neighbor query: excluding protected
                     // IDs in SQL could supersede the next-nearest record instead.
                     // Similarity alone cannot distinguish a paraphrase from a new
                     // fact, so preserve both when the nearest record is protected.
                     if !protected_ids.contains(&old_id) {
-                        if old_content.trim() != mem.content.trim() {
-                            sql.insert_into(&table, &mem).await?;
-                            sql.supersede_memory(&table, &old_id, &mem.memory_id)
-                                .await?;
-                            info!(old_id, new_id = %mem.memory_id, "superseded near-duplicate");
-                            self.enqueue_entity_extraction(user_id, &mem.memory_id, &mem.content)
-                                .await;
-                            return Ok(mem);
-                        }
-                        return Ok(mem); // exact dup — skip
+                        sql.insert_into(&table, &mem).await?;
+                        sql.supersede_memory(&table, &old_id, &mem.memory_id)
+                            .await?;
+                        info!(old_id, new_id = %mem.memory_id, "superseded near-duplicate");
+                        self.enqueue_entity_extraction(user_id, &mem.memory_id, &mem.content)
+                            .await;
+                        return Ok(Some(mem));
                     }
                 }
             }
@@ -3190,7 +3195,7 @@ impl MemoryService {
         } else {
             self.store.insert(&mem).await?;
         }
-        Ok(mem)
+        Ok(Some(mem))
     }
 
     const MAX_EXTRACT_MESSAGES: usize = 20;

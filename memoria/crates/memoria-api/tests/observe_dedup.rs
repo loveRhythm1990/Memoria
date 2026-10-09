@@ -153,6 +153,90 @@ async fn excluded_nearest_record_is_preserved_without_superseding_second_nearest
 }
 
 #[tokio::test]
+async fn exact_duplicates_after_redaction_are_not_inserted_or_reported_as_new() {
+    let (llm, _shutdown) = memoria_test_utils::spawn_fake_llm(vec![(
+        "capture-redacted",
+        json!([{"type": "profile", "content": "Contact me at bob@example.com please"}]),
+    )])
+    .await;
+    let server = support::multi_db::spawn_api_server(
+        "observe_redacted",
+        4,
+        MASTER_KEY.into(),
+        Some(Arc::new(CloseFacts)),
+        Some(llm),
+        None,
+        false,
+    )
+    .await;
+    let service = server.service();
+    for protected in [true, false] {
+        let user = format!("observe_user_{}", uuid::Uuid::new_v4().simple());
+        let saved = service
+            .store_memory(
+                &user,
+                "Contact me at alice@example.com please",
+                MemoryType::Profile,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("subject".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.content, "Contact me at [email] please");
+        let mut payload = json!({
+            "messages": [{"role": "user", "content": "capture-redacted"}],
+            "subject_id": "subject", "branch": "main",
+        });
+        let route = if protected {
+            payload["exclude_memory_ids"] = json!([saved.memory_id]);
+            "/v1/observe/deduplicated"
+        } else {
+            "/v1/observe"
+        };
+        // The raw LLM content differs from the exclusion. Only final-content
+        // dedup catches the match after build_candidates redacts the email.
+        let response = server
+            .client
+            .post(format!("{}{route}", server.base))
+            .bearer_auth(MASTER_KEY)
+            .header("X-User-Id", &user)
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(
+            body["memories"],
+            json!([]),
+            "no unpersisted candidate ID in the receipt"
+        );
+        let active = service.list_active(&user, 20).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].memory_id, saved.memory_id);
+        assert_eq!(active[0].content, saved.content);
+        assert_eq!(active[0].trust_tier, TrustTier::T1Verified);
+        assert!(active[0].superseded_by.is_none());
+        let pool = server.user_db_pool(&user).await;
+        let table = server.user_table(&user, "mem_memories").await;
+        let count: i64 =
+            sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE user_id = ?"))
+                .bind(&user)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            count, 1,
+            "no duplicate row, active or inactive, was inserted"
+        );
+    }
+}
+
+#[tokio::test]
 async fn inactive_exclusions_survive_same_turn_correction_and_forget_in_sql() {
     for corrected in [true, false] {
         let user = format!("observe_user_{}", uuid::Uuid::new_v4().simple());
