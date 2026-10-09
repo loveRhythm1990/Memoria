@@ -46,6 +46,52 @@ def _direct_text(text: str) -> str:
     return text
 
 
+def _turn_saved_ids(messages, subject):
+    """Read successful memory writes from this turn, not earlier transcript history."""
+    turn = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "user":
+            turn = []
+        turn.append(message)
+    writes, saved = set(), []
+    for message in turn:
+        if message.get("role") == "assistant":
+            calls = message.get("tool_calls")
+            for call in calls if isinstance(calls, list) else []:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function")
+                if isinstance(function, dict) and function.get("name") in {
+                    "memoria_store",
+                    "memoria_update",
+                }:
+                    call_id = call.get("id")
+                    if isinstance(call_id, str):
+                        writes.add(call_id)
+        call_id = message.get("tool_call_id")
+        if message.get("role") != "tool" or not isinstance(call_id, str) or call_id not in writes:
+            continue
+        try:
+            response = json.loads(message.get("content", ""))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(response, dict) or response.get("success") is not True:
+            continue
+        result = response.get("result")
+        if not isinstance(result, dict) or result.get("subject_id") != subject:
+            continue
+        memory_id = result.get("memory_id")
+        if (
+            isinstance(memory_id, str)
+            and re.fullmatch(r"[A-Za-z0-9_-]{1,200}", memory_id)
+            and memory_id not in saved
+        ):
+            saved.append(memory_id)
+    return saved
+
+
 def _context(rows: list, budget: int) -> tuple[str, int]:
     selected = []
     for row in rows:
@@ -373,9 +419,14 @@ class MemoriaMemoryProvider(MemoryProvider):
                 if text:
                     history.append({"role": message["role"], "content": text})
         try:
+            saved_ids = _turn_saved_ids(messages, self._subject)
             self._outbox.enqueue(
                 self._binding,
-                {"messages": pair, **self._scope(session_id)},
+                {
+                    "messages": pair,
+                    **self._scope(session_id),
+                    **({"exclude_memory_ids": saved_ids} if saved_ids else {}),
+                },
                 digest(history or pair),
             )
             self._wake.set()
@@ -415,7 +466,14 @@ class MemoriaMemoryProvider(MemoryProvider):
                 completion = {"event": row["id"], "claim_token": row["claim_token"]}
                 try:
                     payload = json.loads(row["payload"])
-                    result = self._writer.request("POST", "/v1/observe", json=payload)
+                    # Old servers must reject this route rather than silently ignoring
+                    # the exclusions and storing the same fact a second time.
+                    path = (
+                        "/v1/observe/deduplicated"
+                        if payload.get("exclude_memory_ids")
+                        else "/v1/observe"
+                    )
+                    result = self._writer.request("POST", path, json=payload)
                     if not isinstance(result, dict) or not isinstance(result.get("memories"), list):
                         raise APIError("invalid_observe_response", uncertain=True)
                     warning = "observe_raw_fallback" if result.get("warning") else ""
@@ -424,6 +482,8 @@ class MemoriaMemoryProvider(MemoryProvider):
                         self._notice(warning)
                     self._invalidate_cache()
                 except APIError as exc:
+                    if payload.get("exclude_memory_ids") and exc.code == "not_found":
+                        exc = APIError("capture_dedup_requires_server_upgrade")
                     state = (
                         "uncertain" if exc.uncertain else "pending" if exc.retryable else "failed"
                     )

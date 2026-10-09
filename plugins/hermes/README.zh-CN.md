@@ -1,10 +1,19 @@
 # Memoria Hermes 记忆插件
 
-当前是 **0.1.0 开发预览版**。默认连接免费的 Memoria Cloud，也支持自托管 API。
+当前是 **0.1.1 开发预览版**。默认连接免费的 Memoria Cloud，也支持自托管 API。
 用户无需自行部署数据库、embedding 模型或事实提取服务。
 
-源码已经实现，已通过本地及真实 Cloud API 验收，尚未公开发布或进入 Hermes 官方
-插件目录。暂不要把 `hermes plugins install memoria` 作为已上线命令。
+0.1.0 已通过真实 Cloud API 验收；0.1.1 的去重捕获需要先部署配套服务端更新，
+再更新插件并补做真实 Cloud 验收。目前尚未进入 Hermes 官方插件目录。
+暂不要把 `hermes plugins install memoria` 作为已上线命令。
+
+同轮调用 `memoria_store` 或 `memoria_update` 成功后，自动捕获仅从当前轮工具结果
+提取已保存记忆的 ID，发送至 `/v1/observe/deduplicated`。服务端在相同账户、branch、
+subject 下读取这些事实，让提取模型排除它们的同义表述和翻译，同时保留其他新事实；
+代码另行过滤完全相同的内容。语义排除仍依赖模型遵循提示词。
+旧服务端返回 404 时保留 failed 队列记录，不回退到普通 observe 造成重复；
+带排除条件时，未配置 LLM 或提取失败也不会退回原文存储。升级顺序是服务端在先、
+插件在后。已有重复记录及旧版队列内容不会被本次更新自动修改或删除。
 
 ## 安装和登录
 

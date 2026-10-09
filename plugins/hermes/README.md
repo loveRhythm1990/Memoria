@@ -4,9 +4,10 @@ Native Hermes memory provider, using the free Memoria Cloud by default. Users do
 need to deploy a database, embedding model, extraction model or local Memoria server.
 Self-hosted users can change the API origin in the same plugin.
 
-**Development preview, version 0.1.0.** Source is ready for local installation and
+**Development preview, version 0.1.1.** Source is ready for local installation and
 testing; this directory has not yet been published or accepted into the Hermes
-catalog. Live Cloud API acceptance passed on October 8, 2026; see
+catalog. The 0.1.0 Cloud API acceptance passed on October 8, 2026; the new
+deduplicated-capture route requires server deployment and a fresh live check. See
 [CLOUD_ACCEPTANCE.md](CLOUD_ACCEPTANCE.md) for the tested scope and results.
 
 ## Install the current checkout
@@ -129,6 +130,31 @@ That outer guidance conflicts with this plugin's inner untrusted-data instructio
 the plugin cannot change the host wrapper and does not promise injection immunity.
 
 ## Capture failure recovery
+
+### Explicit writes and automatic capture
+
+When the completed turn includes successful `memoria_store` or `memoria_update`
+tool results, capture forwards only their memory IDs as `exclude_memory_ids` to
+`POST /v1/observe/deduplicated`. Tool output text is not uploaded. The server
+resolves those IDs within the authenticated account, branch and subject, and tells
+the extraction LLM to omit already-saved facts, including translations and
+paraphrases, while retaining other new facts from the same turn. Exact repeated
+content is also filtered in code. Semantic exclusions depend on the extraction
+model following the prompt; this is not a general exactly-once guarantee.
+
+This requires the matching Memoria API update: **deploy the server first, then
+update this plugin**. An old server's 404 produces
+`capture_dedup_requires_server_upgrade` and keeps a failed queue record for safe
+manual retry after upgrade. The plugin never retries that turn against the old
+plain observe route. With exclusions, a missing/failing LLM is an error rather
+than a fallback to raw-message storage. Ordinary turns without successful explicit
+writes continue to use `/v1/observe` with its existing behavior.
+
+The host must include tool calls and results in its completed-turn `messages`
+snapshot (as the tested Hermes build does). With no such transcript, the plugin
+cannot infer whether an explicit write occurred. Earlier-turn results do not
+exclude facts in later turns. Existing duplicates and old queued payloads are not
+rewritten or deleted by this update.
 
 State lives in `$HERMES_HOME/plugin-data/memoria/outbox.sqlite3`, outside the plugin
 install directory, with private file/directory permissions. Pending/failed/uncertain

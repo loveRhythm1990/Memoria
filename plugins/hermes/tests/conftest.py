@@ -57,7 +57,7 @@ class FakeAPI:
         path, method = request.url.path, request.method
         with self.lock:
             self.calls.append((method, path, body, dict(request.url.params)))
-        if path == "/v1/observe":
+        if path in {"/v1/observe", "/v1/observe/deduplicated"}:
             if self.observe_handler:
                 return self.observe_handler(request, body)
             return httpx.Response(200, json={"memories": []})

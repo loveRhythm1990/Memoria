@@ -800,6 +800,8 @@ pub struct ObserveRequest {
     pub session_id: Option<String>,
     pub subject_id: Option<String>,
     pub branch: Option<String>,
+    #[serde(default)]
+    pub exclude_memory_ids: Vec<String>,
 }
 
 /// Extract and store memories from a conversation turn.
@@ -810,17 +812,21 @@ pub async fn observe_turn(
     auth: AuthUser,
     Json(req): Json<ObserveRequest>,
 ) -> ApiResult<serde_json::Value> {
+    if !req.exclude_memory_ids.is_empty() {
+        auth.require_scope(crate::auth::SCOPE_MEMORY_READ)?;
+    }
     let (memories, has_llm) = state
         .service
-        .observe_turn_on_branch(
+        .observe_turn_excluding_on_branch(
             auth.scope_id(),
             branch_param(req.branch.as_deref()),
             &req.messages,
             req.session_id,
             req.subject_id,
+            &req.exclude_memory_ids,
         )
         .await
-        .map_err(api_err)?;
+        .map_err(api_err_typed)?;
 
     let stored: Vec<_> = memories
         .iter()
@@ -838,6 +844,22 @@ pub async fn observe_turn(
         result["warning"] = serde_json::json!("LLM not configured — storing messages as-is");
     }
     Ok(Json(result))
+}
+
+/// Explicit exclusion support is a separate route so old deployments cannot
+/// silently ignore the new request field and write duplicate memories.
+pub async fn observe_turn_deduplicated(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<ObserveRequest>,
+) -> ApiResult<serde_json::Value> {
+    if req.exclude_memory_ids.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "exclude_memory_ids is required".into(),
+        ));
+    }
+    observe_turn(State(state), auth, Json(req)).await
 }
 
 /// GET /v1/memories/:id/history — version chain via superseded_by links.
