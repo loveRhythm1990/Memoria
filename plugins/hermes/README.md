@@ -141,6 +141,12 @@ the extraction LLM to omit already-saved facts, including translations and
 paraphrases, while retaining other new facts from the same turn. Exact repeated
 content is also filtered in code. Semantic exclusions depend on the extraction
 model following the prompt; this is not a general exactly-once guarantee.
+Excluded IDs also protect their original records during vector deduplication:
+if the nearest record is excluded, capture inserts the new candidate without
+superseding that record or searching for another record to supersede. This keeps
+distinct new facts, but can retain a duplicate if the model emits a paraphrase
+despite the exclusion prompt. Oversized successful store/update tool responses
+retain the memory ID, subject and memory type so capture can still detect them.
 Inactive records still supply exclusion content after correction or deletion,
 including when capture was queued before that change. Missing or out-of-scope
 IDs are ignored without exposing their content or rejecting the whole turn.

@@ -612,6 +612,22 @@ class MemoriaMemoryProvider(MemoryProvider):
             # Bound tool output too; don't emit a truncated, invalid JSON document.
             encoded = json.dumps({"success": True, "result": result}, ensure_ascii=False)
             if len(encoded) > 30000:
+                if tool_name in {"memoria_store", "memoria_update"}:
+                    # Capture must still see the successful write's scoped ID.
+                    # JSON escaping can exceed this limit even for valid inputs.
+                    receipt = {
+                        key: result[key]
+                        for key in ("memory_id", "subject_id", "memory_type")
+                        if key in result
+                    }
+                    return json.dumps(
+                        {
+                            "success": True,
+                            "result": receipt,
+                            "result_omitted": "response_too_large",
+                        },
+                        ensure_ascii=False,
+                    )
                 return json.dumps({"success": True, "result_omitted": "response_too_large"})
             return encoded
         except APIError as exc:

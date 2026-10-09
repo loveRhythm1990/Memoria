@@ -1,11 +1,156 @@
 //! Regression coverage for deduplicated observe against the production SQL store.
 //! Uses the same isolated MatrixOne databases as the other API integration tests.
-use memoria_core::MemoryType;
+use std::sync::Arc;
+
+use memoria_core::{interfaces::EmbeddingProvider, MemoriaError, MemoryType, TrustTier};
 use serde_json::{json, Value};
 
 mod support;
 
 const MASTER_KEY: &str = "observe-dedup-test-master";
+
+struct CloseFacts;
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for CloseFacts {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, MemoriaError> {
+        // Both distinct facts and translations can be very close in vector space.
+        Ok(match text {
+            "User drinks coffee at work" | "用户喜欢下雨天" => vec![0.9998, 0.02, 0.0, 0.0],
+            "Second-nearest fact" => vec![0.9982, 0.06, 0.0, 0.0],
+            _ => vec![1.0, 0.0, 0.0, 0.0],
+        })
+    }
+
+    fn dimension(&self) -> usize {
+        4
+    }
+}
+
+#[tokio::test]
+async fn excluded_nearest_record_is_preserved_without_superseding_second_nearest() {
+    let cases = [
+        (
+            "distinct-fact",
+            "User drinks coffee at home",
+            "User drinks coffee at work",
+        ),
+        ("translated-fact", "User likes rainy days", "用户喜欢下雨天"),
+    ];
+    let (llm, _shutdown) = memoria_test_utils::spawn_fake_llm(
+        cases
+            .iter()
+            .map(|(marker, _, captured)| {
+                (
+                    *marker,
+                    json!([{"type": "profile", "content": captured, "confidence": 1.0}]),
+                )
+            })
+            .collect(),
+    )
+    .await;
+    let server = support::multi_db::spawn_api_server(
+        "observe_protected",
+        4,
+        MASTER_KEY.into(),
+        Some(Arc::new(CloseFacts)),
+        Some(llm),
+        None,
+        false,
+    )
+    .await;
+    let service = server.service();
+    for (marker, original, captured) in cases {
+        for protected in [true, false] {
+            let user = format!("observe_user_{}", uuid::Uuid::new_v4().simple());
+            let original_record = service
+                .store_memory(
+                    &user,
+                    original,
+                    MemoryType::Profile,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("subject".into()),
+                )
+                .await
+                .unwrap();
+            let store = server.user_store(&user).await;
+            let table = store.table_for_branch(&user, Some("main")).await.unwrap();
+            // Seed a second existing neighbor directly: another explicit store
+            // would itself supersede the first before observe could be tested.
+            let mut second = original_record.clone();
+            second.memory_id = uuid::Uuid::new_v4().simple().to_string();
+            second.content = "Second-nearest fact".into();
+            second.embedding = Some(CloseFacts.embed(&second.content).await.unwrap());
+            store.insert_into(&table, &second).await.unwrap();
+            let saved = [original_record, second];
+            let nearest = store
+                .find_near_duplicate(
+                    &table,
+                    &user,
+                    &CloseFacts.embed(captured).await.unwrap(),
+                    "profile",
+                    "new-candidate",
+                    0.3162,
+                    Some("subject"),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(nearest.0, saved[0].memory_id);
+            let route = if protected {
+                "/v1/observe/deduplicated"
+            } else {
+                "/v1/observe"
+            };
+            let mut payload = json!({
+                "messages": [{"role": "user", "content": marker}],
+                "subject_id": "subject", "branch": "main",
+            });
+            if protected {
+                payload["exclude_memory_ids"] = json!([saved[0].memory_id]);
+            }
+            let response = server
+                .client
+                .post(format!("{}{route}", server.base))
+                .bearer_auth(MASTER_KEY)
+                .header("X-User-Id", &user)
+                .json(&payload)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(body["memories"].as_array().unwrap().len(), 1);
+            assert_eq!(body["memories"][0]["content"], captured);
+            let old = service
+                .get_for_user_on_branch(&user, Some("main"), &saved[0].memory_id)
+                .await
+                .unwrap();
+            assert_eq!(old.is_some(), protected);
+            if let Some(old) = old {
+                assert_eq!(old.content, original);
+                assert_eq!(old.trust_tier, TrustTier::T1Verified);
+            }
+            assert!(
+                service
+                    .get_for_user_on_branch(&user, Some("main"), &saved[1].memory_id,)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "must not supersede the second-nearest record"
+            );
+            let active = service.list_active(&user, 20).await.unwrap();
+            assert_eq!(active.len(), if protected { 3 } else { 2 });
+            assert!(active
+                .iter()
+                .any(|m| m.content == captured && m.trust_tier == TrustTier::T3Inferred));
+        }
+    }
+}
 
 #[tokio::test]
 async fn inactive_exclusions_survive_same_turn_correction_and_forget_in_sql() {

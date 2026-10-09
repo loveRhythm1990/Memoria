@@ -3006,7 +3006,10 @@ impl MemoryService {
 
         let mut stored = Vec::with_capacity(candidates.len());
         for mem in candidates {
-            match self.persist_with_dedup(user_id, branch, mem).await {
+            match self
+                .persist_with_dedup(user_id, branch, mem, exclude_memory_ids)
+                .await
+            {
                 Ok(m) => stored.push(m),
                 Err(MemoriaError::Blocked(_)) => continue,
                 Err(e) => return Err(e),
@@ -3130,6 +3133,7 @@ impl MemoryService {
         user_id: &str,
         branch: Option<&str>,
         mut mem: Memory,
+        protected_ids: &[String],
     ) -> Result<Memory, MemoriaError> {
         let sensitivity = check_sensitivity(&mem.content);
         if sensitivity.blocked {
@@ -3162,16 +3166,22 @@ impl MemoryService {
                     )
                     .await
                 {
-                    if old_content.trim() != mem.content.trim() {
-                        sql.insert_into(&table, &mem).await?;
-                        sql.supersede_memory(&table, &old_id, &mem.memory_id)
-                            .await?;
-                        info!(old_id, new_id = %mem.memory_id, "superseded near-duplicate");
-                        self.enqueue_entity_extraction(user_id, &mem.memory_id, &mem.content)
-                            .await;
-                        return Ok(mem);
+                    // Keep the original nearest-neighbor query: excluding protected
+                    // IDs in SQL could supersede the next-nearest record instead.
+                    // Similarity alone cannot distinguish a paraphrase from a new
+                    // fact, so preserve both when the nearest record is protected.
+                    if !protected_ids.contains(&old_id) {
+                        if old_content.trim() != mem.content.trim() {
+                            sql.insert_into(&table, &mem).await?;
+                            sql.supersede_memory(&table, &old_id, &mem.memory_id)
+                                .await?;
+                            info!(old_id, new_id = %mem.memory_id, "superseded near-duplicate");
+                            self.enqueue_entity_extraction(user_id, &mem.memory_id, &mem.content)
+                                .await;
+                            return Ok(mem);
+                        }
+                        return Ok(mem); // exact dup — skip
                     }
-                    return Ok(mem); // exact dup — skip
                 }
             }
             sql.insert_into(&table, &mem).await?;

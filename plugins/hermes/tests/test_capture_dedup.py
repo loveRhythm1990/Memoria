@@ -56,6 +56,37 @@ def test_current_turn_write_ids_are_correlated_and_deduplicated(tool):
     assert plugin._turn_saved_ids(messages, "subject") == []
 
 
+@pytest.mark.parametrize("tool", ["memoria_store", "memoria_update"])
+def test_oversized_write_response_keeps_receipt_through_capture(factory, tool):
+    make, server = factory
+    p = make(auto_capture=True)
+    content = '"a",' * 5000  # Valid input; JSON escaping pushes the output over 30,000.
+    if tool == "memoria_store":
+        args = {"content": content, "memory_type": "profile"}
+    else:
+        saved = call(p, "store", content="Original preference", memory_type="profile")["result"]
+        args = {"memory_id": saved["memory_id"], "new_content": content}
+    raw = p.handle_tool_call(tool, args)
+    receipt = json.loads(raw)
+    assert receipt["success"] and len(raw) < 30000
+    assert receipt["result_omitted"] == "response_too_large"
+    result = receipt["result"]
+    assert result["subject_id"] == p._subject
+    assert result["memory_type"] == "profile"
+    assert "content" not in result
+    assert server.memories[result["memory_id"]]["content"] == content
+    messages = write_messages(p._subject, tool=tool)
+    messages[2]["content"] = raw  # Use the actual response, not a fabricated receipt.
+    assert plugin._turn_saved_ids(messages, p._subject) == [result["memory_id"]]
+    p.sync_turn(messages[0]["content"], "Saved", messages=messages)
+    eventually(lambda: p._outbox.counts(p._binding) == {"done": 1})
+    observes = [(path, body) for _, path, body, _ in server.calls if "/observe" in path]
+    assert len(observes) == 1
+    path, payload = observes[0]
+    assert path == "/v1/observe/deduplicated"
+    assert payload["exclude_memory_ids"] == [result["memory_id"]]
+
+
 @pytest.mark.parametrize("case", ["failed", "other_subject", "search", "unmatched", "malformed"])
 def test_capture_does_not_trust_unsuccessful_or_unrelated_tool_results(case):
     messages = write_messages("subject")
