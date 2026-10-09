@@ -25,7 +25,7 @@ from agent.memory_provider import (
 from .client import APIError, Client
 from .config import Config, api_key, home_path, writes_blocked
 from .outbox import Outbox, digest
-from .tools import SCHEMAS, validate
+from .tools import SCHEMAS, TYPES, validate
 
 log = logging.getLogger(__name__)
 _LOCAL_PLATFORMS = {"cli", "local", "desktop"}
@@ -44,6 +44,23 @@ def _direct_text(text: str) -> str:
     if is_compaction_summary_message({"role": "user", "content": text}):
         return ""
     return text
+
+
+def _write_response(content):
+    """Decode JSON or a complete compact receipt in the tested host's preview.
+
+    Aggregate budget enforcement can spill even a small result. Never follow
+    the preview's file path or infer success from a truncated JSON prefix.
+    """
+    if isinstance(content, str) and content.startswith("<persisted-output>\n"):
+        match = re.fullmatch(
+            r"<persisted-output>\n.*?\nPreview \(first ([0-9]{1,6}) chars\):\n(.*)\n</persisted-output>",
+            content,
+            re.DOTALL,
+        )
+        if match and len(match[2]) == int(match[1]) and len(match[2]) <= 1024:
+            content = match[2]
+    return json.loads(content)
 
 
 def _turn_saved_ids(messages, subject):
@@ -74,7 +91,7 @@ def _turn_saved_ids(messages, subject):
         if message.get("role") != "tool" or not isinstance(call_id, str) or call_id not in writes:
             continue
         try:
-            response = json.loads(message.get("content", ""))
+            response = _write_response(message.get("content", ""))
         except (TypeError, ValueError):
             continue
         if not isinstance(response, dict) or response.get("success") is not True:
@@ -599,7 +616,8 @@ class MemoriaMemoryProvider(MemoryProvider):
                     )
             if tool_name in {"memoria_store", "memoria_update"} and (
                 not isinstance(result, dict)
-                or not result.get("memory_id")
+                or not isinstance(result.get("memory_id"), str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", result["memory_id"])
                 or result.get("subject_id") != self._subject
             ):
                 raise APIError("invalid_mutation_response", uncertain=True)
@@ -609,25 +627,17 @@ class MemoriaMemoryProvider(MemoryProvider):
                 return _profile_json(result)
             if tool_name == "memoria_search":
                 return _search_json(result)
+            if tool_name in {"memoria_store", "memoria_update"}:
+                # Always return a bounded receipt, below the tested host's
+                # 1,500-char preview as well as its 8,000-char per-result floor.
+                # Do not echo content/metadata that could hide the successful ID.
+                receipt = {"memory_id": result["memory_id"], "subject_id": self._subject}
+                if result.get("memory_type") in TYPES:
+                    receipt["memory_type"] = result["memory_type"]
+                return json.dumps({"success": True, "result": receipt}, ensure_ascii=False)
             # Bound tool output too; don't emit a truncated, invalid JSON document.
             encoded = json.dumps({"success": True, "result": result}, ensure_ascii=False)
             if len(encoded) > 30000:
-                if tool_name in {"memoria_store", "memoria_update"}:
-                    # Capture must still see the successful write's scoped ID.
-                    # JSON escaping can exceed this limit even for valid inputs.
-                    receipt = {
-                        key: result[key]
-                        for key in ("memory_id", "subject_id", "memory_type")
-                        if key in result
-                    }
-                    return json.dumps(
-                        {
-                            "success": True,
-                            "result": receipt,
-                            "result_omitted": "response_too_large",
-                        },
-                        ensure_ascii=False,
-                    )
                 return json.dumps({"success": True, "result_omitted": "response_too_large"})
             return encoded
         except APIError as exc:

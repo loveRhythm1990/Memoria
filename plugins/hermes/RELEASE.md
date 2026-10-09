@@ -15,9 +15,11 @@ fact should be captured, and no translated/paraphrased copy of the first should
 appear. The October 8 Cloud report covers 0.1.0, not this new route.
 Also verify same-turn store→correct and store→forget, recovery after a pre-write
 extraction failure, and a missing branch without an erroneous upgrade diagnosis.
-Exercise quote-heavy large store/update responses and confirm their compact
-receipts still supply exclusion IDs. If extraction emits a paraphrase despite
-the prompt, it may insert a duplicate, but must keep the excluded T1 active.
+Exercise large and quote-heavy store/update inputs under the host's per-result
+and aggregate tool budgets; compact receipts must still supply exclusion IDs,
+including when aggregate pressure persists the receipt itself. If extraction
+emits a paraphrase despite the prompt, it may insert a duplicate, but must keep
+the excluded T1 active.
 The API/proxy must preserve `X-Memoria-Observe-Deduplicated` and
 `X-Memoria-Observe-Error`; without these markers the plugin conservatively treats
 503 as uncertain and unmarked 404 as an unavailable endpoint.

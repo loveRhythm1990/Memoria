@@ -147,8 +147,14 @@ Excluded IDs also protect their original records during vector deduplication:
 if the nearest record is excluded and its final content differs, capture inserts the candidate without
 superseding that record or searching for another record to supersede. This keeps
 distinct new facts, but can retain a duplicate if the model emits a paraphrase
-despite the exclusion prompt. Oversized successful store/update tool responses
-retain the memory ID, subject and memory type so capture can still detect them.
+despite the exclusion prompt. Successful store/update tools always return compact
+receipts with the memory ID, subject and validated memory type (when provided),
+without echoing content or metadata. These stay below the tested host's preview
+size and per-result budget. If aggregate budget enforcement still persists a
+receipt, capture accepts its complete JSON in the tested Hermes
+`<persisted-output>` preview. Truncated previews are ignored, and capture never
+opens the referenced file. Current-turn call correlation and subject checks
+still apply to these receipts.
 Inactive records still supply exclusion content after correction or deletion,
 including when capture was queued before that change. Missing or out-of-scope
 IDs are ignored without exposing their content or rejecting the whole turn.

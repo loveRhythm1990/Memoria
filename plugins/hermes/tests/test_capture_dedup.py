@@ -68,8 +68,7 @@ def test_oversized_write_response_keeps_receipt_through_capture(factory, tool):
         args = {"memory_id": saved["memory_id"], "new_content": content}
     raw = p.handle_tool_call(tool, args)
     receipt = json.loads(raw)
-    assert receipt["success"] and len(raw) < 30000
-    assert receipt["result_omitted"] == "response_too_large"
+    assert receipt["success"] and len(raw) < 1024
     result = receipt["result"]
     assert result["subject_id"] == p._subject
     assert result["memory_type"] == "profile"
@@ -101,6 +100,121 @@ def test_capture_does_not_trust_unsuccessful_or_unrelated_tool_results(case):
     else:
         messages[2]["content"] = "invalid json"
     assert plugin._turn_saved_ids(messages, "subject") == []
+
+
+@pytest.mark.parametrize("tool", ["memoria_store", "memoria_update"])
+@pytest.mark.parametrize("processing", ["per_result", "aggregate", "aggregate_spills_receipt"])
+def test_real_host_tool_budgets_preserve_write_exclusions(factory, tool, processing):
+    from agent.memory_manager import MemoryManager
+    from tools.budget_config import budget_for_context_window
+    from tools.tool_result_storage import (
+        PERSISTED_OUTPUT_TAG,
+        enforce_turn_budget,
+        maybe_persist_tool_result,
+    )
+
+    make, server = factory
+    p = make(auto_capture=True)
+    manager = MemoryManager(external_prefetch_timeout=1)
+    manager.add_provider(p)
+    budget = budget_for_context_window(8192)
+    assert budget.default_result_size == 8000 and budget.turn_budget == 16000
+    try:
+        content = "x" * 10000  # Below the old plugin limit, above the host's floor.
+        if tool == "memoria_store":
+            args = {"content": content, "memory_type": "profile"}
+        else:
+            saved = json.loads(
+                manager.handle_tool_call(
+                    "memoria_store", {"content": "Original preference", "memory_type": "profile"}
+                )
+            )["result"]
+            args = {"memory_id": saved["memory_id"], "new_content": content}
+        raw = manager.handle_tool_call(tool, args)
+        result = json.loads(raw)["result"]
+        assert server.memories[result["memory_id"]]["content"] == content
+        messages = write_messages(p._subject, tool=tool)
+        messages[1]["tool_calls"][0]["function"]["arguments"] = json.dumps(args)
+        messages[2]["content"] = maybe_persist_tool_result(
+            raw,
+            tool,
+            "save-1",
+            config=budget,
+        )
+        if processing != "per_result":
+            # Ordinary pressure spills larger results first. With enough already
+            # persisted previews, even a compact receipt can be forced to spill.
+            others = []
+            for i in range(10 if processing == "aggregate_spills_receipt" else 4):
+                call_id = f"lookup-{i}"
+                text = "z" * (10000 if processing == "aggregate_spills_receipt" else 7000)
+                messages[1]["tool_calls"].append(
+                    {
+                        "id": call_id,
+                        "function": {"name": "web_search", "arguments": "{}"},
+                    }
+                )
+                others.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": maybe_persist_tool_result(
+                            text, "web_search", call_id, config=budget
+                        ),
+                    }
+                )
+            messages[-1:-1] = others
+            enforce_turn_budget(messages[2:-1], config=budget)
+            assert any(PERSISTED_OUTPUT_TAG in row["content"] for row in messages[3:-1])
+            if processing == "aggregate_spills_receipt":
+                assert messages[2]["content"].startswith(PERSISTED_OUTPUT_TAG)
+        manager.sync_all(
+            messages[0]["content"],
+            messages[-1]["content"],
+            session_id="host-session",
+            messages=messages,
+        )
+        assert manager.flush_pending(timeout=5)
+        eventually(lambda: p._outbox.counts(p._binding) == {"done": 1})
+        observes = [(path, body) for _, path, body, _ in server.calls if "/observe" in path]
+        assert len(observes) == 1
+        path, payload = observes[0]
+        assert (path, payload.get("exclude_memory_ids")) == (
+            "/v1/observe/deduplicated",
+            [result["memory_id"]],
+        )
+        assert len(raw) < 1500
+        assert "content" not in result
+    finally:
+        manager.shutdown_all()
+
+
+@pytest.mark.parametrize(
+    "case", ["truncated", "failed", "other_subject", "length_mismatch", "trailing"]
+)
+def test_persisted_preview_requires_a_complete_successful_scoped_receipt(factory, case):
+    from tools.tool_result_storage import maybe_persist_tool_result
+
+    make, _ = factory
+    p = make()
+    messages = write_messages(p._subject)
+    raw = messages[2]["content"]
+    if case == "truncated":
+        response = json.loads(raw)
+        response["result"]["content"] = "x" * 10000
+        raw = json.dumps(response)
+    elif case == "failed":
+        raw = write_messages(p._subject, success=False)[2]["content"]
+    elif case == "other_subject":
+        raw = write_messages("another-subject")[2]["content"]
+    wrapped = maybe_persist_tool_result(raw, "memoria_store", "save-1", threshold=0)
+    assert wrapped.startswith("<persisted-output>\n")
+    if case == "length_mismatch":
+        wrapped = wrapped.replace(f"first {len(raw)} chars", f"first {len(raw) + 1} chars")
+    elif case == "trailing":
+        wrapped += "unexpected trailing text"
+    messages[2]["content"] = wrapped
+    assert plugin._turn_saved_ids(messages, p._subject) == []
 
 
 def test_old_server_rejection_never_falls_back_to_plain_observe(factory):
