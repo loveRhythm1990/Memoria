@@ -79,7 +79,10 @@ class FakeAPI:
                 r
                 for r in self.memories.values()
                 if r["subject_id"] == request.url.params["subject_id"]
-                and r["memory_type"] == request.url.params["memory_type"]
+                and (
+                    request.url.params.get("memory_type") is None
+                    or r["memory_type"] == request.url.params["memory_type"]
+                )
             ]
             return httpx.Response(200, json={"items": rows, "next_cursor": None})
         memory_id = path.split("/")[3]
