@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import json
 import math
 from typing import TYPE_CHECKING, Any
@@ -451,7 +452,7 @@ class MemoriesResource:
         *,
         extra_metadata_filter: dict[str, Any] | None = None,
         subject_id: str | None = None,
-        memory_types: list[str] | None = None,
+        memory_types: builtins.list[str] | None = None,
         session_id: str | None = None,
         trust_tier: str | None = None,
         branch: str | None = None,
@@ -533,10 +534,10 @@ class MemoriesResource:
     def purge(
         self,
         *,
-        memory_ids: list[str] | None = None,
+        memory_ids: builtins.list[str] | None = None,
         topic: str | None = None,
         session_id: str | None = None,
-        memory_types: list[str] | None = None,
+        memory_types: builtins.list[str] | None = None,
         reason: str | None = None,
         branch: str | None = None,
     ) -> PurgeResult:
@@ -746,7 +747,7 @@ class AsyncMemoriesResource:
         *,
         extra_metadata_filter: dict[str, Any] | None = None,
         subject_id: str | None = None,
-        memory_types: list[str] | None = None,
+        memory_types: builtins.list[str] | None = None,
         session_id: str | None = None,
         trust_tier: str | None = None,
         branch: str | None = None,
@@ -828,10 +829,10 @@ class AsyncMemoriesResource:
     async def purge(
         self,
         *,
-        memory_ids: list[str] | None = None,
+        memory_ids: builtins.list[str] | None = None,
         topic: str | None = None,
         session_id: str | None = None,
-        memory_types: list[str] | None = None,
+        memory_types: builtins.list[str] | None = None,
         reason: str | None = None,
         branch: str | None = None,
     ) -> PurgeResult:
