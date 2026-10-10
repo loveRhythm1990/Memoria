@@ -514,6 +514,39 @@ async fn test_subject_id_length_validation() {
     println!("✅ subject_id length validation");
 }
 
+// ── Test 8b: content length validation (≤32 KiB) ─────────────────────────────
+// Enforced in the service layer (not just the REST handler) so every entry
+// point — REST, embedded MCP, the server's /mcp endpoint — gets the same limit.
+
+#[tokio::test]
+async fn test_content_length_validation() {
+    use memoria_service::service::BatchStoreItem;
+
+    let svc = make_service();
+    let uid = "content-len-user";
+
+    // Exactly 32 KiB — must succeed
+    let ok_content = "x".repeat(32_768);
+    svc.store_memory(uid, &ok_content, MemoryType::Semantic, None, None, None, None, None, None)
+        .await
+        .expect("content of exactly 32 KiB should be accepted");
+
+    // 32 KiB + 1 byte — must be rejected
+    let too_long = "x".repeat(32_769);
+    let err = svc
+        .store_memory(uid, &too_long, MemoryType::Semantic, None, None, None, None, None, None)
+        .await;
+    assert!(err.is_err(), "content over 32 KiB must be rejected");
+
+    // Same limit applies to the batch path
+    let batch_items: Vec<BatchStoreItem> =
+        vec![("y".repeat(32_769), MemoryType::Semantic, None, None, None)];
+    let batch_err = svc.store_batch(uid, batch_items, None).await;
+    assert!(batch_err.is_err(), "batch content over 32 KiB must be rejected");
+
+    println!("✅ content length validation");
+}
+
 // ── Test 9: memory_types post-filter excludes unmatched types ─────────────────
 
 #[tokio::test]

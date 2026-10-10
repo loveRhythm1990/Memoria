@@ -244,12 +244,8 @@ pub async fn store_memory(
             "content must not be empty".into(),
         ));
     }
-    if req.content.len() > 32_768 {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "content exceeds 32 KiB limit".into(),
-        ));
-    }
+    // Content-length cap is enforced in the service layer so every entry point
+    // (REST, embedded MCP, the server's /mcp endpoint) gets the same limit.
     let mt =
         parse_memory_type(&req.memory_type).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
     let tier = req
@@ -305,14 +301,8 @@ pub async fn batch_store(
             "batch exceeds 100 items".into(),
         ));
     }
-    for m in &req.memories {
-        if m.content.len() > 32_768 {
-            return Err((
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "content exceeds 32 KiB limit".into(),
-            ));
-        }
-    }
+    // Per-item content-length cap is enforced in the service layer (see
+    // store_batch_with_metadata_on_branch) so every entry point gets the same limit.
     let batch_subject_id = req.subject_id;
     let top_branch = normalize_branch(req.branch);
     let items: Vec<_> = req
@@ -376,7 +366,7 @@ pub async fn batch_store(
             author,
         )
         .await
-        .map_err(api_err)?;
+        .map_err(api_err_typed)?;
     Ok((
         StatusCode::CREATED,
         Json(results.into_iter().map(Into::into).collect()),
