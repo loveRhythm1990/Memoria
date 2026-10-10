@@ -9658,6 +9658,75 @@ async fn test_batch_store_at_limit() {
     println!("✅ batch store: 100 ok, 101 rejected");
 }
 
+// ── Pressure: content-length cap at the REST layer ───────────────────────────
+// The cap is enforced in the service layer (store_memory_with_metadata_on_branch
+// / store_batch_with_metadata_on_branch), not in the REST handlers themselves —
+// these confirm that still surfaces as 422 (not 500) over HTTP.
+
+#[tokio::test]
+async fn test_store_content_length_cap_is_422_not_500() {
+    let (base, client, _server) = spawn_server().await;
+    let uid = uid();
+
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "x".repeat(32_768)}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201, "exactly 32 KiB should be accepted");
+
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "x".repeat(32_769)}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 422, "over 32 KiB should be a validation error, not a 500");
+    println!("✅ store: content over 32 KiB is 422, not 500");
+}
+
+#[tokio::test]
+async fn test_batch_store_content_length_cap_is_422_not_500() {
+    let (base, client, _server) = spawn_server().await;
+    let uid = uid();
+
+    let memories = json!([
+        {"content": "valid memory one"},
+        {"content": "x".repeat(32_769)},
+        {"content": "valid memory two"},
+    ]);
+    let r = client
+        .post(format!("{base}/v1/memories/batch"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"memories": memories}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        422,
+        "an oversized item in the batch should be a validation error, not a 500"
+    );
+
+    // No partial write over HTTP either.
+    let r = client
+        .get(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    let body: Value = r.json().await.unwrap();
+    let items = body["items"].as_array().expect("items array");
+    assert!(
+        items.is_empty(),
+        "no batch item should be persisted when one fails validation: {items:?}"
+    );
+    println!("✅ batch store: oversized item is 422 with no partial write, not a 500");
+}
+
 // ── Concurrency: parallel feedback on same memory ─────────────────────────────
 
 #[tokio::test]

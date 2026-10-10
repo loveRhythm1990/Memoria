@@ -833,6 +833,51 @@ mod tests {
         assert!(!crate::tool_result::is_error(&success));
     }
 
+    /// Oversized memory_store content (service-layer MemoriaError::Validation,
+    /// not an argument-parsing error) must surface as an isError tool result on
+    /// both embedded dispatch paths — not a JSON-RPC protocol error. Remote mode
+    /// is intentionally excluded here: validate_tool_args doesn't pre-check
+    /// content length, so it would make a real (slow, unreachable-address) network
+    /// call instead of failing fast like the embedded paths do.
+    #[tokio::test]
+    async fn oversized_store_content_is_a_tool_error_on_embedded_paths() {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://test:test@127.0.0.1/test")
+            .unwrap();
+        let store = std::sync::Arc::new(memoria_storage::SqlMemoryStore::new(
+            pool.clone(),
+            3,
+            "test".into(),
+        ));
+        let service = std::sync::Arc::new(memoria_service::MemoryService::new(store, None, None));
+        let git = std::sync::Arc::new(memoria_git::GitForDataService::new(pool, "test"));
+        let embedded = Mode::Embedded {
+            service: service.clone(),
+            git: git.clone(),
+        };
+        let params = json!({"name":"memory_store", "arguments":{"content":"x".repeat(32_769)}});
+
+        let via_dispatch = dispatch("tools/call", Some(params.clone()), &embedded, "test")
+            .await
+            .expect("execution errors must be results");
+        assert_eq!(via_dispatch["isError"], true, "{via_dispatch}");
+        assert!(!via_dispatch["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .is_empty());
+
+        let via_http = super::dispatch_http(
+            "tools/call".into(),
+            Some(params),
+            service,
+            git,
+            "test".into(),
+        )
+        .await
+        .expect("execution errors must be results");
+        assert_eq!(via_http["isError"], true, "{via_http}");
+    }
+
     #[tokio::test]
     async fn downstream_failure_is_a_tool_error_without_url_leakage() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -547,6 +547,34 @@ async fn test_content_length_validation() {
     println!("✅ content length validation");
 }
 
+// ── Test 8c: batch store rejects the whole batch, not just the bad item ──────
+// Validation runs over every item before anything is embedded or written, so
+// a single oversized item in an otherwise-valid batch must not result in the
+// other items being partially persisted.
+
+#[tokio::test]
+async fn test_batch_store_rejects_whole_batch_no_partial_write() {
+    use memoria_service::service::BatchStoreItem;
+
+    let svc = make_service();
+    let uid = "batch-partial-write-user";
+
+    let batch_items: Vec<BatchStoreItem> = vec![
+        ("valid memory one".to_string(), MemoryType::Semantic, None, None, None),
+        ("x".repeat(32_769), MemoryType::Semantic, None, None, None),
+        ("valid memory two".to_string(), MemoryType::Semantic, None, None, None),
+    ];
+    let err = svc.store_batch(uid, batch_items, None).await;
+    assert!(err.is_err(), "batch with an oversized item must be rejected");
+
+    let active = svc.list_active(uid, 10).await.unwrap();
+    assert!(
+        active.is_empty(),
+        "no items from the batch should be persisted when one item fails validation: {active:?}"
+    );
+    println!("✅ batch store: oversized item rejects the whole batch, no partial write");
+}
+
 // ── Test 9: memory_types post-filter excludes unmatched types ─────────────────
 
 #[tokio::test]
