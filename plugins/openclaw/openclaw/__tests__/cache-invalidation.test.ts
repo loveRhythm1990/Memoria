@@ -188,6 +188,70 @@ describe("memory cache invalidation", () => {
     }
   });
 
+  it("branch delete invalidates cached memories (implicit switch to main)", async () => {
+    const f = mockFetch();
+    const c = new MemoriaClient(buildApiConfig());
+    try {
+      await cacheM1(c, f);
+      // Deleting the active branch resets the backend to main.
+      f.respondWith(200, { result: "Deleted branch experiment" });
+      await c.branchDelete({ userId: "u", name: "experiment" });
+      f.respondWith(200, { ...MEMORY, content: "main branch content" });
+      const fetched = await c.getMemory({ userId: "u", memoryId: "m1" });
+      expect(fetched?.content).toBe("main branch content");
+    } finally {
+      c.close();
+    }
+  });
+
+  it("an in-flight read does not repopulate the cache after invalidation", async () => {
+    // Order: start a retrieval, hold its response, purge, then release the
+    // pre-purge response. It describes a state the backend has already left.
+    const originalFetch = globalThis.fetch;
+    let releaseRetrieve: (() => void) | undefined;
+    const retrieveReached = new Promise<void>((resolveReached) => {
+      globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+        const urlStr = typeof url === "string" ? url : url instanceof URL ? url.toString() : url.url;
+        if (urlStr.includes("retrieve")) {
+          resolveReached();
+          await new Promise<void>((r) => {
+            releaseRetrieve = r;
+          });
+          return new Response(JSON.stringify([MEMORY]), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify({ purged: 1 }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }) as typeof globalThis.fetch;
+    });
+
+    const c = new MemoriaClient(buildApiConfig());
+    try {
+      const inFlight = c.retrieve({ userId: "u", query: "old", topK: 5 });
+      await retrieveReached;
+
+      await c.purgeMemory({ userId: "u", topic: "old" });
+
+      releaseRetrieve?.();
+      await inFlight;
+
+      // The stale response must not have been written back into the cache.
+      globalThis.fetch = (async () =>
+        new Response(JSON.stringify({ items: [], next_cursor: null }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })) as typeof globalThis.fetch;
+      expect(await c.getMemory({ userId: "u", memoryId: "m1" })).toBeNull();
+    } finally {
+      c.close();
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("a failed purge keeps the cache", async () => {
     const f = mockFetch();
     const c = new MemoriaClient(buildApiConfig());

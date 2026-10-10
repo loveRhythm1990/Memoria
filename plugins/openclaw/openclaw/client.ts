@@ -325,6 +325,13 @@ function parseGenericResult(text: string): Record<string, unknown> {
 export class MemoriaClient {
   private readonly sessions = new Map<string, MemoriaHttpTransport>();
   private readonly memoryCache = new Map<string, MemoriaMemoryRecord>();
+  /**
+   * Bumped whenever a user's cache is invalidated. A read captures the current
+   * value before issuing its request and only caches its response if the value
+   * is unchanged — otherwise a request that was already in flight during an
+   * invalidation would write pre-purge (or pre-checkout) records back in.
+   */
+  private readonly cacheGeneration = new Map<string, number>();
 
   constructor(private readonly config: MemoriaPluginConfig) {}
 
@@ -355,6 +362,7 @@ export class MemoriaClient {
     sessionId?: string;
     source?: string;
   }) {
+    const generation = this.currentGeneration(params.userId);
     const text = await this.callToolText(params.userId, "memory_store", {
       content: params.content,
       memory_type: params.memoryType,
@@ -362,7 +370,7 @@ export class MemoriaClient {
       trust_tier: params.trustTier,
     });
     const record = parseStoredMemory(text, params);
-    this.cacheMemories(params.userId, [record]);
+    this.cacheMemories(params.userId, [record], generation);
     return record;
   }
 
@@ -374,13 +382,14 @@ export class MemoriaClient {
     sessionId?: string;
     includeCrossSession?: boolean;
   }) {
+    const generation = this.currentGeneration(params.userId);
     const text = await this.callToolText(params.userId, "memory_retrieve", {
       query: params.query,
       top_k: params.topK,
       session_id: params.sessionId,
     });
     const memories = parseMemoryTextList(text);
-    this.cacheMemories(params.userId, memories);
+    this.cacheMemories(params.userId, memories, generation);
     return memories;
   }
 
@@ -389,12 +398,13 @@ export class MemoriaClient {
     query: string;
     topK: number;
   }) {
+    const generation = this.currentGeneration(params.userId);
     const text = await this.callToolText(params.userId, "memory_search", {
       query: params.query,
       top_k: params.topK,
     });
     const memories = parseMemoryTextList(text);
-    this.cacheMemories(params.userId, memories);
+    this.cacheMemories(params.userId, memories, generation);
     return memories;
   }
 
@@ -407,6 +417,7 @@ export class MemoriaClient {
       return cached;
     }
 
+    const generation = this.currentGeneration(params.userId);
     const text = await this.callToolText(params.userId, "memory_get", {
       memory_id: params.memoryId,
     });
@@ -417,7 +428,7 @@ export class MemoriaClient {
       return null;
     }
     const memory = normalizeMemoryRecord(record);
-    this.cacheMemories(params.userId, [memory]);
+    this.cacheMemories(params.userId, [memory], generation);
     return memory;
   }
 
@@ -433,12 +444,13 @@ export class MemoriaClient {
       ? Math.min(2000, Math.max(params.limit, params.limit * this.config.maxListPages))
       : params.limit;
 
+    const generation = this.currentGeneration(params.userId);
     const text = await this.callToolText(params.userId, "memory_list", {
       limit: scanLimit,
     });
     let items = parseMemoryTextList(text);
     const hasMore = parseListHasMore(text) ?? items.length >= scanLimit;
-    this.cacheMemories(params.userId, items);
+    this.cacheMemories(params.userId, items, generation);
 
     const limitations: string[] = [];
     if (params.memoryType) {
@@ -675,6 +687,7 @@ export class MemoriaClient {
     sourceEventIds?: string[];
     sessionId?: string;
   }) {
+    const generation = this.currentGeneration(params.userId);
     const text = await this.callToolText(params.userId, "memory_observe", {
       messages: params.messages,
       session_id: params.sessionId,
@@ -686,7 +699,7 @@ export class MemoriaClient {
           .filter((entry): entry is Record<string, unknown> => Boolean(entry))
           .map((entry) => normalizeMemoryRecord(entry))
       : [];
-    this.cacheMemories(params.userId, memories);
+    this.cacheMemories(params.userId, memories, generation);
     return memories;
   }
 
@@ -760,11 +773,16 @@ export class MemoriaClient {
     userId: string;
     name: string;
   }) {
-    return parseGenericResult(
+    const result = parseGenericResult(
       await this.callToolText(params.userId, "memory_branch_delete", {
         name: params.name,
       }),
     );
+    // Deleting the active branch resets the backend to main, so this has the
+    // same cache implications as a checkout. The response does not say whether
+    // the deleted branch was the active one, so invalidate either way.
+    this.invalidateUserCache(params.userId);
+    return result;
   }
 
   async branchMerge(params: {
@@ -810,9 +828,19 @@ export class MemoriaClient {
         this.memoryCache.delete(key);
       }
     }
+    this.cacheGeneration.set(userId, this.currentGeneration(userId) + 1);
   }
 
-  private cacheMemories(userId: string, memories: MemoriaMemoryRecord[]) {
+  private currentGeneration(userId: string) {
+    return this.cacheGeneration.get(userId) ?? 0;
+  }
+
+  private cacheMemories(userId: string, memories: MemoriaMemoryRecord[], generation?: number) {
+    // A response that was already in flight when the cache was invalidated
+    // describes a state the backend has since left behind.
+    if (generation !== undefined && generation !== this.currentGeneration(userId)) {
+      return;
+    }
     for (const memory of memories) {
       if (!memory.memory_id) {
         continue;
