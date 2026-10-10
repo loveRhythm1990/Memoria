@@ -525,6 +525,9 @@ export class MemoriaClient {
     });
     const corrected = parseCorrectedMemory(text, params.newContent);
     if (corrected) {
+      // The corrected memory comes back under a new id; the superseded one must
+      // not keep serving its old content from the cache.
+      this.memoryCache.delete(this.memoryCacheKey(params.userId, params.memoryId));
       this.cacheMemories(params.userId, [corrected]);
       return corrected;
     }
@@ -544,6 +547,9 @@ export class MemoriaClient {
     });
     const corrected = parseCorrectedMemory(text, params.newContent);
     if (corrected) {
+      // Which memory was superseded is not knowable from the response, so no
+      // cached record for this user can be trusted any more.
+      this.invalidateUserCache(params.userId);
       this.cacheMemories(params.userId, [corrected]);
       return corrected;
     }
@@ -580,6 +586,13 @@ export class MemoriaClient {
           this.memoryCache.delete(this.memoryCacheKey(params.userId, memoryId));
         }
       }
+    } else {
+      // A topic purge does not report which ids it removed, so no cached record
+      // for this user can be trusted. Deliberately not gated on the purged count:
+      // that comes from a regex over human-readable text and reads 0 for a JSON
+      // body, and over-invalidating only costs a cache miss. A failed call throws
+      // above, so the cache survives failures.
+      this.invalidateUserCache(params.userId);
     }
     return { purged: parsePurgedCount(text), message: text };
   }
@@ -698,11 +711,14 @@ export class MemoriaClient {
     userId: string;
     name: string;
   }) {
-    return parseGenericResult(
+    const result = parseGenericResult(
       await this.callToolText(params.userId, "memory_rollback", {
         name: params.name,
       }),
     );
+    // Rolling back replaces the visible memory state wholesale.
+    this.invalidateUserCache(params.userId);
+    return result;
   }
 
   async branchCreate(params: {
@@ -729,11 +745,15 @@ export class MemoriaClient {
     userId: string;
     name: string;
   }) {
-    return parseGenericResult(
+    const result = parseGenericResult(
       await this.callToolText(params.userId, "memory_checkout", {
         name: params.name,
       }),
     );
+    // The cache key carries no branch, so the same id can mean different
+    // content after a checkout.
+    this.invalidateUserCache(params.userId);
+    return result;
   }
 
   async branchDelete(params: {
@@ -752,12 +772,15 @@ export class MemoriaClient {
     source: string;
     strategy: string;
   }) {
-    return parseGenericResult(
+    const result = parseGenericResult(
       await this.callToolText(params.userId, "memory_merge", {
         source: params.source,
         strategy: params.strategy,
       }),
     );
+    // A merge can supersede or add records on the active branch.
+    this.invalidateUserCache(params.userId);
+    return result;
   }
 
   async branchDiff(params: {
@@ -771,6 +794,22 @@ export class MemoriaClient {
         limit: params.limit,
       }),
     );
+  }
+
+  /**
+   * Drop every cached record for one user, leaving other users untouched.
+   * Used after operations whose effect on individual memories cannot be known
+   * from the response (a topic purge, a correction found by query) or that
+   * change which memories are visible at all (branch checkout/merge, snapshot
+   * rollback — the cache key carries no branch or version).
+   */
+  private invalidateUserCache(userId: string) {
+    const prefix = `${userId}::`;
+    for (const key of this.memoryCache.keys()) {
+      if (key.startsWith(prefix)) {
+        this.memoryCache.delete(key);
+      }
+    }
   }
 
   private cacheMemories(userId: string, memories: MemoriaMemoryRecord[]) {
