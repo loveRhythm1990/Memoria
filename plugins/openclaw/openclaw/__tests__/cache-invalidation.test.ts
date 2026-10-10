@@ -268,3 +268,120 @@ describe("memory cache invalidation", () => {
     }
   });
 });
+
+// ── Generation must also advance for id-scoped invalidation, and corrections
+//    must respect a generation captured before their own request ──────────────
+
+/**
+ * Install a fetch that defers the first request matching `deferOn` until the
+ * returned `release` is called, answering everything else immediately from
+ * `respond`. Lets a read be held open across a mutation.
+ */
+function deferredFetch(
+  deferOn: (url: string) => boolean,
+  deferredBody: unknown,
+  respond: (url: string) => unknown,
+) {
+  let release: (() => void) | undefined;
+  let reached: () => void;
+  const reachedPromise = new Promise<void>((r) => {
+    reached = r;
+  });
+  let deferredAlready = false;
+
+  globalThis.fetch = (async (url: string | URL | Request) => {
+    const urlStr = typeof url === "string" ? url : url instanceof URL ? url.toString() : url.url;
+    const json = (body: unknown) =>
+      new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    if (!deferredAlready && deferOn(urlStr)) {
+      deferredAlready = true;
+      reached();
+      await new Promise<void>((r) => {
+        release = r;
+      });
+      return json(deferredBody);
+    }
+    return json(respond(urlStr));
+  }) as typeof globalThis.fetch;
+
+  return { reached: reachedPromise, release: () => release?.() };
+}
+
+describe("cache generation across concurrent operations", () => {
+  // An id-scoped mutation must advance the generation, or a retrieval dispatched
+  // before it can restore exactly the record that was just removed.
+  const idScopedCases: Array<[string, (c: MemoriaClient) => Promise<unknown>]> = [
+    ["correctById", (c) => c.correctById({ userId: "u", memoryId: "m1", newContent: "new" })],
+    ["deleteMemory", (c) => c.deleteMemory({ userId: "u", memoryId: "m1" })],
+    ["purge by memoryId", (c) => c.purgeMemory({ userId: "u", memoryId: "m1" })],
+  ];
+
+  for (const [name, mutate] of idScopedCases) {
+    it(`${name} stops an in-flight read from restoring the record`, async () => {
+      const f = deferredFetch(
+        (url) => url.includes("retrieve"),
+        [MEMORY],
+        () => ({ memory_id: "m2", content: "new", purged: 1 }),
+      );
+      const c = new MemoriaClient(buildApiConfig());
+      try {
+        const inFlight = c.retrieve({ userId: "u", query: "old", topK: 5 });
+        await f.reached;
+
+        await mutate(c);
+
+        f.release();
+        await inFlight;
+
+        globalThis.fetch = (async () =>
+          new Response(JSON.stringify({ items: [], next_cursor: null }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })) as typeof globalThis.fetch;
+        expect(await c.getMemory({ userId: "u", memoryId: "m1" })).toBeNull();
+      } finally {
+        c.close();
+      }
+    });
+  }
+
+  // A correction whose response lands after a checkout describes the branch the
+  // backend has already left, so its replacement must not be cached.
+  const correctionCases: Array<[string, (c: MemoriaClient) => Promise<unknown>]> = [
+    ["correctById", (c) => c.correctById({ userId: "u", memoryId: "m1", newContent: "new" })],
+    ["correctByQuery", (c) => c.correctByQuery({ userId: "u", query: "old", newContent: "new" })],
+  ];
+
+  for (const [name, correct] of correctionCases) {
+    it(`${name} does not cache a replacement that lands after a checkout`, async () => {
+      const f = deferredFetch(
+        (url) => url.includes("correct"),
+        { memory_id: "m2", content: "old-branch replacement" },
+        () => ({ result: "Switched to branch main" }),
+      );
+      const c = new MemoriaClient(buildApiConfig());
+      try {
+        const inFlight = correct(c);
+        await f.reached;
+
+        await c.branchCheckout({ userId: "u", name: "main" });
+
+        f.release();
+        await inFlight;
+
+        // main has no such record; the cache must not answer from the old branch.
+        globalThis.fetch = (async () =>
+          new Response(JSON.stringify({ items: [], next_cursor: null }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })) as typeof globalThis.fetch;
+        expect(await c.getMemory({ userId: "u", memoryId: "m2" })).toBeNull();
+      } finally {
+        c.close();
+      }
+    });
+  }
+});

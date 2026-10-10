@@ -530,6 +530,7 @@ export class MemoriaClient {
     newContent: string;
     reason?: string;
   }) {
+    const generation = this.currentGeneration(params.userId);
     const text = await this.callToolText(params.userId, "memory_correct", {
       memory_id: params.memoryId,
       new_content: params.newContent,
@@ -537,10 +538,15 @@ export class MemoriaClient {
     });
     const corrected = parseCorrectedMemory(text, params.newContent);
     if (corrected) {
-      // The corrected memory comes back under a new id; the superseded one must
-      // not keep serving its old content from the cache.
-      this.memoryCache.delete(this.memoryCacheKey(params.userId, params.memoryId));
-      this.cacheMemories(params.userId, [corrected]);
+      // Assessed before this method's own bump: an invalidation during the await
+      // (a checkout, say) means the replacement describes a state the backend has
+      // left, so it must not be cached — the cache is already empty for this user.
+      if (generation === this.currentGeneration(params.userId)) {
+        // The corrected memory comes back under a new id; the superseded one must
+        // not keep serving its old content from the cache.
+        this.invalidateMemoryIds(params.userId, [params.memoryId]);
+        this.cacheMemories(params.userId, [corrected], this.currentGeneration(params.userId));
+      }
       return corrected;
     }
     return { error: true, message: text };
@@ -552,6 +558,7 @@ export class MemoriaClient {
     newContent: string;
     reason?: string;
   }) {
+    const generation = this.currentGeneration(params.userId);
     const text = await this.callToolText(params.userId, "memory_correct", {
       query: params.query,
       new_content: params.newContent,
@@ -559,10 +566,14 @@ export class MemoriaClient {
     });
     const corrected = parseCorrectedMemory(text, params.newContent);
     if (corrected) {
-      // Which memory was superseded is not knowable from the response, so no
-      // cached record for this user can be trusted any more.
-      this.invalidateUserCache(params.userId);
-      this.cacheMemories(params.userId, [corrected]);
+      // Checked before the invalidation below, which would otherwise make this
+      // method's own bump look like an intervening one.
+      if (generation === this.currentGeneration(params.userId)) {
+        // Which memory was superseded is not knowable from the response, so no
+        // cached record for this user can be trusted any more.
+        this.invalidateUserCache(params.userId);
+        this.cacheMemories(params.userId, [corrected], this.currentGeneration(params.userId));
+      }
       return corrected;
     }
     return { error: true, message: text };
@@ -577,7 +588,7 @@ export class MemoriaClient {
       memory_id: params.memoryId,
       reason: params.reason ?? "",
     });
-    this.memoryCache.delete(this.memoryCacheKey(params.userId, params.memoryId));
+    this.invalidateMemoryIds(params.userId, [params.memoryId]);
     return { purged: parsePurgedCount(text) };
   }
 
@@ -593,11 +604,10 @@ export class MemoriaClient {
       reason: params.reason ?? "",
     });
     if (params.memoryId) {
-      for (const memoryId of params.memoryId.split(",").map((entry) => entry.trim())) {
-        if (memoryId) {
-          this.memoryCache.delete(this.memoryCacheKey(params.userId, memoryId));
-        }
-      }
+      this.invalidateMemoryIds(
+        params.userId,
+        params.memoryId.split(",").map((entry) => entry.trim()),
+      );
     } else {
       // A topic purge does not report which ids it removed, so no cached record
       // for this user can be trusted. Deliberately not gated on the purged count:
@@ -828,6 +838,24 @@ export class MemoriaClient {
         this.memoryCache.delete(key);
       }
     }
+    this.bumpGeneration(userId);
+  }
+
+  /**
+   * Drop specific ids and still advance the generation: a read dispatched
+   * before the mutation holds the old generation and would otherwise restore
+   * exactly the superseded or deleted record. Unrelated cached ids survive.
+   */
+  private invalidateMemoryIds(userId: string, memoryIds: string[]) {
+    for (const memoryId of memoryIds) {
+      if (memoryId) {
+        this.memoryCache.delete(this.memoryCacheKey(userId, memoryId));
+      }
+    }
+    this.bumpGeneration(userId);
+  }
+
+  private bumpGeneration(userId: string) {
     this.cacheGeneration.set(userId, this.currentGeneration(userId) + 1);
   }
 
