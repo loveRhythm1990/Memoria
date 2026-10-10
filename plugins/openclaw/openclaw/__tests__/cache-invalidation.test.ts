@@ -385,3 +385,52 @@ describe("cache generation across concurrent operations", () => {
     });
   }
 });
+
+// ── An unrelated mutation must not suppress a correction's own invalidation ──
+// invalidateMemoryIds keeps unrelated ids, so a changed generation does not mean
+// the cache is empty: the correction still has to drop what it superseded.
+
+describe("correction invalidates regardless of unrelated generation changes", () => {
+  const cases: Array<[string, (c: MemoriaClient) => Promise<unknown>]> = [
+    ["correctById", (c) => c.correctById({ userId: "u", memoryId: "m1", newContent: "new" })],
+    ["correctByQuery", (c) => c.correctByQuery({ userId: "u", query: "old", newContent: "new" })],
+  ];
+
+  for (const [name, correct] of cases) {
+    it(`${name} still drops the superseded record after an unrelated delete`, async () => {
+      const f = mockFetch();
+      const c = new MemoriaClient(buildApiConfig());
+      try {
+        // 1. cache m1 (old active content) and unrelated m9
+        f.respondWith(200, [MEMORY, { ...MEMORY, memory_id: "m9", content: "unrelated" }]);
+        await c.retrieve({ userId: "u", query: "old", topK: 5 });
+
+        // 2. start the correction of m1 and hold its replacement response
+        const deferred = deferredFetch(
+          (url) => url.includes("correct"),
+          { memory_id: "m2", content: "new content" },
+          () => ({ purged: 1 }),
+        );
+        const inFlight = correct(c);
+        await deferred.reached;
+
+        // 3. delete unrelated m9 — advances the generation, leaves m1 cached
+        await c.deleteMemory({ userId: "u", memoryId: "m9" });
+
+        // 4. release the correction
+        deferred.release();
+        await inFlight;
+
+        // 5. m1 was superseded; it must not still answer from cache
+        globalThis.fetch = (async () =>
+          new Response(JSON.stringify({ items: [], next_cursor: null }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })) as typeof globalThis.fetch;
+        expect(await c.getMemory({ userId: "u", memoryId: "m1" })).toBeNull();
+      } finally {
+        c.close();
+      }
+    });
+  }
+});

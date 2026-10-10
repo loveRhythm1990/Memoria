@@ -538,13 +538,14 @@ export class MemoriaClient {
     });
     const corrected = parseCorrectedMemory(text, params.newContent);
     if (corrected) {
-      // Assessed before this method's own bump: an invalidation during the await
-      // (a checkout, say) means the replacement describes a state the backend has
-      // left, so it must not be cached — the cache is already empty for this user.
-      if (generation === this.currentGeneration(params.userId)) {
-        // The corrected memory comes back under a new id; the superseded one must
-        // not keep serving its old content from the cache.
-        this.invalidateMemoryIds(params.userId, [params.memoryId]);
+      // Assessed before this method's own bump below. A generation change does not
+      // mean the cache is empty — invalidateMemoryIds keeps unrelated ids — so it
+      // gates only whether the replacement can be cached, never the invalidation.
+      const unchanged = generation === this.currentGeneration(params.userId);
+      // The original was superseded no matter what else happened meanwhile, so it
+      // must stop serving its old content unconditionally.
+      this.invalidateMemoryIds(params.userId, [params.memoryId]);
+      if (unchanged) {
         this.cacheMemories(params.userId, [corrected], this.currentGeneration(params.userId));
       }
       return corrected;
@@ -567,11 +568,13 @@ export class MemoriaClient {
     const corrected = parseCorrectedMemory(text, params.newContent);
     if (corrected) {
       // Checked before the invalidation below, which would otherwise make this
-      // method's own bump look like an intervening one.
-      if (generation === this.currentGeneration(params.userId)) {
-        // Which memory was superseded is not knowable from the response, so no
-        // cached record for this user can be trusted any more.
-        this.invalidateUserCache(params.userId);
+      // method's own bump look like an intervening one. As in correctById, it
+      // gates caching only — a correction always invalidates.
+      const unchanged = generation === this.currentGeneration(params.userId);
+      // Which memory was superseded is not knowable from the response, so no
+      // cached record for this user can be trusted any more.
+      this.invalidateUserCache(params.userId);
+      if (unchanged) {
         this.cacheMemories(params.userId, [corrected], this.currentGeneration(params.userId));
       }
       return corrected;
