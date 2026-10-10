@@ -2355,9 +2355,16 @@ impl MemoryService {
     ) -> Result<PurgeResult, MemoriaError> {
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
-            let (snap, warning) = sql.create_safety_snapshot("purge").await;
             let table = sql.table_for_branch(user_id, branch).await?;
             let ids = sql.find_ids_by_topic(&table, user_id, topic).await?;
+            if ids.is_empty() {
+                return Ok(PurgeResult {
+                    purged: 0,
+                    snapshot_name: None,
+                    warning: None,
+                });
+            }
+            let (snap, warning) = sql.create_safety_snapshot("purge").await;
             let reason = format!("topic:{topic}");
             self.purge_sql_ids(
                 user_id,
@@ -2401,11 +2408,18 @@ impl MemoryService {
     ) -> Result<PurgeResult, MemoriaError> {
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
-            let (snap, warning) = sql.create_safety_snapshot("purge").await;
             let table = sql.table_for_branch(user_id, branch).await?;
             let ids = sql
                 .find_ids_by_session_id(&table, user_id, session_id, memory_types)
                 .await?;
+            if ids.is_empty() {
+                return Ok(PurgeResult {
+                    purged: 0,
+                    snapshot_name: None,
+                    warning: None,
+                });
+            }
+            let (snap, warning) = sql.create_safety_snapshot("purge").await;
             let reason = format!("session:{session_id}");
             self.purge_sql_ids(
                 user_id,

@@ -614,6 +614,78 @@ async fn test_purge_by_session_id_with_memory_types_verify_db() {
     println!("✅ purge by session_id: working memories removed without touching other active rows");
 }
 
+#[tokio::test]
+#[serial]
+async fn test_purge_by_topic_no_match_skips_snapshot_verify_db() {
+    let (base, client, server) = spawn_server().await;
+    let uid = uid();
+
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "unrelated memory"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(db_count_active(&server, &uid).await, 1);
+
+    // No memory matches this topic — purge is a no-op and must not create a
+    // safety snapshot (issue #219).
+    let r = client
+        .post(format!("{base}/v1/memories/purge"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"topic": "no-such-topic-xyz"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["purged"], 0);
+    assert!(
+        body["snapshot_name"].is_null(),
+        "no-op topic purge must not create a safety snapshot: {body:?}"
+    );
+
+    assert_eq!(db_count_active(&server, &uid).await, 1);
+    println!("✅ purge by topic: no match skips safety snapshot");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_purge_by_session_id_no_match_skips_snapshot_verify_db() {
+    let (base, client, server) = spawn_server().await;
+    let uid = uid();
+
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "unrelated memory", "session_id": "real-session"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(db_count_active(&server, &uid).await, 1);
+
+    // No memory matches this session — purge is a no-op and must not create a
+    // safety snapshot (issue #219).
+    let r = client
+        .post(format!("{base}/v1/memories/purge"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"session_id": "nonexistent-session-xyz"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["purged"], 0);
+    assert!(
+        body["snapshot_name"].is_null(),
+        "no-op session_id purge must not create a safety snapshot: {body:?}"
+    );
+
+    assert_eq!(db_count_active(&server, &uid).await, 1);
+    println!("✅ purge by session_id: no match skips safety snapshot");
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // 4. BATCH STORE — verify all rows in DB with correct types
 // ═══════════════════════════════════════════════════════════════════════════════
