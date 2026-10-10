@@ -31,10 +31,16 @@ pub fn validate_dataset(content: &str) -> Vec<String> {
             return errors;
         }
     };
+    // The executor lowercases scenario_id to build each scenario's user/session
+    // namespace, so uniqueness has to be checked on that same normalized form —
+    // otherwise `CaseA` and `casea` validate as distinct but collide at run time.
     let mut ids = HashSet::new();
     for s in &dataset.scenarios {
-        if !ids.insert(&s.scenario_id) {
-            errors.push(format!("duplicate scenario_id: {}", s.scenario_id));
+        if !ids.insert(s.scenario_id.to_lowercase()) {
+            errors.push(format!(
+                "duplicate scenario_id (case-insensitive): {}",
+                s.scenario_id
+            ));
         }
         if s.seed_memories.is_empty() {
             errors.push(format!("{}: no seed_memories", s.scenario_id));
@@ -127,9 +133,9 @@ mod tests {
             _scenario_id: id.into(),
             step_results: vec![],
             assertion_results: vec![AssertionResult {
-                _query: "query".into(),
+                query: "query".into(),
                 returned_contents: vec!["memory".into()],
-                _error: None,
+                error: None,
             }],
             error: None,
         }
@@ -154,9 +160,9 @@ mod tests {
                     _scenario_id: "lme-2".into(),
                     step_results: vec![],
                     assertion_results: vec![AssertionResult {
-                        _query: "query".into(),
+                        query: "query".into(),
                         returned_contents: vec![],
-                        _error: None,
+                        error: None,
                     }],
                     error: None,
                 },
@@ -196,6 +202,86 @@ mod tests {
         assert_eq!(
             report.results[1].official_category_label.as_deref(),
             Some("Instruction Following")
+        );
+    }
+
+    // ── scenario_id uniqueness must match the execution namespace ────────────
+
+    fn dataset_json(ids: &[&str]) -> String {
+        let scenarios: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                json!({
+                    "scenario_id": id,
+                    "title": "t",
+                    "difficulty": "L1",
+                    "horizon": "short",
+                    "tags": [],
+                    "seed_memories": [{"content": "memory"}],
+                    "assertions": [{"query": "q", "expected_contents": ["memory"]}],
+                })
+            })
+            .collect();
+        json!({"dataset_id": "d", "version": "1", "scenarios": scenarios}).to_string()
+    }
+
+    #[test]
+    fn validate_rejects_case_distinct_scenario_ids_that_share_a_namespace() {
+        let errors = validate_dataset(&dataset_json(&["CaseA", "casea"]));
+        assert!(
+            errors.iter().any(|e| e.contains("duplicate scenario_id")),
+            "case-distinct ids collide in the execution namespace: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_genuinely_distinct_scenario_ids() {
+        assert!(validate_dataset(&dataset_json(&["case-a", "case-b"])).is_empty());
+    }
+
+    // ── a failed retrieval is not an empty-but-successful one ────────────────
+
+    #[test]
+    fn errored_assertion_does_not_pass_on_empty_expectations() {
+        let mut scenario = scenario_with_metadata("err-1", "beam", "event_ordering");
+        // No expected/excluded contents: scoring an errored retrieval like a valid
+        // empty answer would hand this a free pass (recall and noise both 100).
+        scenario.assertions = vec![MemoryAssertion {
+            query: "query".into(),
+            top_k: 3,
+            expected_contents: vec![],
+            excluded_contents: vec![],
+        }];
+
+        let errored_exec = ScenarioExecution {
+            _scenario_id: "err-1".into(),
+            step_results: vec![],
+            assertion_results: vec![AssertionResult {
+                query: "query".into(),
+                returned_contents: vec![],
+                error: Some("HTTP status server error (500)".into()),
+            }],
+            error: None,
+        };
+        let empty_exec = ScenarioExecution {
+            _scenario_id: "err-1".into(),
+            step_results: vec![],
+            assertion_results: vec![AssertionResult {
+                query: "query".into(),
+                returned_contents: vec![],
+                error: None,
+            }],
+            error: None,
+        };
+
+        let errored = score_scenario(&scenario, &errored_exec);
+        let empty = score_scenario(&scenario, &empty_exec);
+        assert_eq!(errored.aus_assertion_pass, 0.0);
+        assert_eq!(errored.mqs_recall, 0.0);
+        assert_eq!(errored.mqs_noise_rejection, 0.0);
+        assert_eq!(
+            empty.aus_assertion_pass, 100.0,
+            "a genuinely empty answer still scores on its own merits"
         );
     }
 }
