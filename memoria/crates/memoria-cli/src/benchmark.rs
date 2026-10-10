@@ -22,6 +22,27 @@ pub use benchmark_taxonomy::{official_category, scenario_question_type, scenario
 
 use std::collections::HashSet;
 
+/// Scenario IDs that collapse to the same execution namespace.
+///
+/// The executor lowercases `scenario_id` to build each scenario's user and
+/// session namespace, so `CaseA` and `casea` are distinct to a case-sensitive
+/// uniqueness check yet share one namespace at run time — letting one
+/// scenario's writes, purges and corrections hit the other. Uniqueness has to
+/// be judged on the normalized form the executor actually uses.
+pub fn colliding_scenario_namespaces(scenarios: &[Scenario]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut errors = Vec::new();
+    for s in scenarios {
+        if !seen.insert(s.scenario_id.to_lowercase()) {
+            errors.push(format!(
+                "duplicate scenario_id (case-insensitive): {}",
+                s.scenario_id
+            ));
+        }
+    }
+    errors
+}
+
 pub fn validate_dataset(content: &str) -> Vec<String> {
     let mut errors = vec![];
     let dataset: ScenarioDataset = match serde_json::from_str(content) {
@@ -31,17 +52,8 @@ pub fn validate_dataset(content: &str) -> Vec<String> {
             return errors;
         }
     };
-    // The executor lowercases scenario_id to build each scenario's user/session
-    // namespace, so uniqueness has to be checked on that same normalized form —
-    // otherwise `CaseA` and `casea` validate as distinct but collide at run time.
-    let mut ids = HashSet::new();
+    errors.extend(colliding_scenario_namespaces(&dataset.scenarios));
     for s in &dataset.scenarios {
-        if !ids.insert(s.scenario_id.to_lowercase()) {
-            errors.push(format!(
-                "duplicate scenario_id (case-insensitive): {}",
-                s.scenario_id
-            ));
-        }
         if s.seed_memories.is_empty() {
             errors.push(format!("{}: no seed_memories", s.scenario_id));
         }
@@ -237,6 +249,18 @@ mod tests {
     #[test]
     fn validate_accepts_genuinely_distinct_scenario_ids() {
         assert!(validate_dataset(&dataset_json(&["case-a", "case-b"])).is_empty());
+    }
+
+    #[test]
+    fn colliding_namespaces_are_detectable_without_full_validation() {
+        // cmd_benchmark enforces this on every run, not just --validate-only,
+        // so the check has to be reachable independently of validate_dataset.
+        let collide: ScenarioDataset =
+            serde_json::from_str(&dataset_json(&["CaseA", "casea"])).unwrap();
+        let distinct: ScenarioDataset =
+            serde_json::from_str(&dataset_json(&["case-a", "case-b"])).unwrap();
+        assert_eq!(colliding_scenario_namespaces(&collide.scenarios).len(), 1);
+        assert!(colliding_scenario_namespaces(&distinct.scenarios).is_empty());
     }
 
     // ── a failed retrieval is not an empty-but-successful one ────────────────

@@ -3295,6 +3295,20 @@ fn cmd_benchmark(
         ds.scenarios.len()
     );
 
+    // --validate-only is not the only way in: scenario IDs that share an
+    // execution namespace would silently let one scenario's writes, purges and
+    // corrections hit another, so this invariant is enforced on every run.
+    let collisions = benchmark::colliding_scenario_namespaces(&ds.scenarios);
+    if !collisions.is_empty() {
+        for c in &collisions {
+            eprintln!("  ❌ {c}");
+        }
+        anyhow::bail!(
+            "dataset has {} scenario_id collision(s); scenarios would share a memory namespace",
+            collisions.len()
+        );
+    }
+
     let executor = benchmark::BenchmarkExecutor::new(api_url, token);
     let mut executions = std::collections::HashMap::new();
 

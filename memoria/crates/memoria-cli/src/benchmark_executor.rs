@@ -170,10 +170,17 @@ impl BenchmarkExecutor {
         let items = items.ok_or_else(|| {
             anyhow::anyhow!("retrieve response was neither an array nor {{\"results\": [...]}}")
         })?;
-        Ok(items
+        // filter_map would silently drop an entry whose content is missing or not
+        // a string, so a malformed backend response could still score full marks.
+        items
             .iter()
-            .filter_map(|i| i["content"].as_str().map(String::from))
-            .collect())
+            .enumerate()
+            .map(|(i, item)| {
+                item["content"].as_str().map(String::from).ok_or_else(|| {
+                    anyhow::anyhow!("retrieve result [{i}] has no string \"content\" field")
+                })
+            })
+            .collect()
     }
 
     fn run_step(&self, client: &Client, step: &ScenarioStep, session_id: &str) -> StepResult {
