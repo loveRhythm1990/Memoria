@@ -3400,7 +3400,12 @@ Confidence guide:
 - 0.7: strongly implied by context
 - 0.4: weakly inferred
 
-Do NOT extract: greetings, pure meta-conversation.
+Do NOT extract: greetings, pure meta-conversation, or information that is only true in the
+moment and has no lasting value (e.g. the live answer to a one-off query). A durable fact the
+user mentions alongside such a query is still worth keeping — the transient answer is not.
+Example: user asks for Shanghai's weather and mentions "I live in Shanghai" -> keep only the
+residence fact, not the forecast.
+
 If nothing worth remembering, return [].
 "#;
 
