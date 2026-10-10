@@ -72,6 +72,31 @@ async fn db_count_active(server: &support::multi_db::ApiTestServer, user_id: &st
     .unwrap()
 }
 
+/// List the user's current snapshot names via the real REST endpoint (not a
+/// field on the purge response), so a before/after comparison can't be fooled
+/// by that response's own shape.
+async fn list_snapshot_names(base: &str, client: &reqwest::Client, user_id: &str) -> Vec<String> {
+    let body: Value = client
+        .get(format!("{base}/v1/snapshots"))
+        .header("X-User-Id", user_id)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut names: Vec<String> = body["snapshots"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
 /// Helper: DB stores empty string "" for NULL-like optional fields.
 /// This normalizes to None for comparison.
 fn db_opt(row: &sqlx::mysql::MySqlRow, col: &str) -> Option<String> {
@@ -612,6 +637,110 @@ async fn test_purge_by_session_id_with_memory_types_verify_db() {
     }));
 
     println!("✅ purge by session_id: working memories removed without touching other active rows");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_purge_by_topic_no_match_skips_snapshot_verify_db() {
+    let (base, client, server) = spawn_server().await;
+    let uid = uid();
+
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "unrelated memory"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(db_count_active(&server, &uid).await, 1);
+
+    let snapshots_before = list_snapshot_names(&base, &client, &uid).await;
+
+    // No memory matches this topic — purge is a no-op and must not create a
+    // safety snapshot (issue #219).
+    let r = client
+        .post(format!("{base}/v1/memories/purge"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"topic": "no-such-topic-xyz"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["purged"], 0);
+    // snapshot_name alone is ambiguous: a failed snapshot attempt also leaves
+    // it null, but sets `warning`. Assert both, and confirm no snapshot object
+    // was actually created in the DB, so the test can't pass for the wrong
+    // reason (skipped vs. attempted-and-failed).
+    assert!(
+        body["snapshot_name"].is_null(),
+        "no-op topic purge must not create a safety snapshot: {body:?}"
+    );
+    assert!(
+        body["warning"].is_null(),
+        "no-op topic purge should not even attempt (and fail) a snapshot: {body:?}"
+    );
+
+    let snapshots_after = list_snapshot_names(&base, &client, &uid).await;
+    assert_eq!(
+        snapshots_before, snapshots_after,
+        "no-op topic purge must not change the user's snapshot set"
+    );
+
+    assert_eq!(db_count_active(&server, &uid).await, 1);
+    println!("✅ purge by topic: no match skips safety snapshot");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_purge_by_session_id_no_match_skips_snapshot_verify_db() {
+    let (base, client, server) = spawn_server().await;
+    let uid = uid();
+
+    client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": "unrelated memory", "session_id": "real-session"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(db_count_active(&server, &uid).await, 1);
+
+    let snapshots_before = list_snapshot_names(&base, &client, &uid).await;
+
+    // No memory matches this session — purge is a no-op and must not create a
+    // safety snapshot (issue #219).
+    let r = client
+        .post(format!("{base}/v1/memories/purge"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"session_id": "nonexistent-session-xyz"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["purged"], 0);
+    // snapshot_name alone is ambiguous: a failed snapshot attempt also leaves
+    // it null, but sets `warning`. Assert both, and confirm no snapshot object
+    // was actually created in the DB, so the test can't pass for the wrong
+    // reason (skipped vs. attempted-and-failed).
+    assert!(
+        body["snapshot_name"].is_null(),
+        "no-op session_id purge must not create a safety snapshot: {body:?}"
+    );
+    assert!(
+        body["warning"].is_null(),
+        "no-op session_id purge should not even attempt (and fail) a snapshot: {body:?}"
+    );
+
+    let snapshots_after = list_snapshot_names(&base, &client, &uid).await;
+    assert_eq!(
+        snapshots_before, snapshots_after,
+        "no-op session_id purge must not change the user's snapshot set"
+    );
+
+    assert_eq!(db_count_active(&server, &uid).await, 1);
+    println!("✅ purge by session_id: no match skips safety snapshot");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
