@@ -514,6 +514,67 @@ async fn test_subject_id_length_validation() {
     println!("✅ subject_id length validation");
 }
 
+// ── Test 8b: content length validation (≤32 KiB) ─────────────────────────────
+// Enforced in the service layer (not just the REST handler) so every entry
+// point — REST, embedded MCP, the server's /mcp endpoint — gets the same limit.
+
+#[tokio::test]
+async fn test_content_length_validation() {
+    use memoria_service::service::BatchStoreItem;
+
+    let svc = make_service();
+    let uid = "content-len-user";
+
+    // Exactly 32 KiB — must succeed
+    let ok_content = "x".repeat(32_768);
+    svc.store_memory(uid, &ok_content, MemoryType::Semantic, None, None, None, None, None, None)
+        .await
+        .expect("content of exactly 32 KiB should be accepted");
+
+    // 32 KiB + 1 byte — must be rejected
+    let too_long = "x".repeat(32_769);
+    let err = svc
+        .store_memory(uid, &too_long, MemoryType::Semantic, None, None, None, None, None, None)
+        .await;
+    assert!(err.is_err(), "content over 32 KiB must be rejected");
+
+    // Same limit applies to the batch path
+    let batch_items: Vec<BatchStoreItem> =
+        vec![("y".repeat(32_769), MemoryType::Semantic, None, None, None)];
+    let batch_err = svc.store_batch(uid, batch_items, None).await;
+    assert!(batch_err.is_err(), "batch content over 32 KiB must be rejected");
+
+    println!("✅ content length validation");
+}
+
+// ── Test 8c: batch store rejects the whole batch, not just the bad item ──────
+// Validation runs over every item before anything is embedded or written, so
+// a single oversized item in an otherwise-valid batch must not result in the
+// other items being partially persisted.
+
+#[tokio::test]
+async fn test_batch_store_rejects_whole_batch_no_partial_write() {
+    use memoria_service::service::BatchStoreItem;
+
+    let svc = make_service();
+    let uid = "batch-partial-write-user";
+
+    let batch_items: Vec<BatchStoreItem> = vec![
+        ("valid memory one".to_string(), MemoryType::Semantic, None, None, None),
+        ("x".repeat(32_769), MemoryType::Semantic, None, None, None),
+        ("valid memory two".to_string(), MemoryType::Semantic, None, None, None),
+    ];
+    let err = svc.store_batch(uid, batch_items, None).await;
+    assert!(err.is_err(), "batch with an oversized item must be rejected");
+
+    let active = svc.list_active(uid, 10).await.unwrap();
+    assert!(
+        active.is_empty(),
+        "no items from the batch should be persisted when one item fails validation: {active:?}"
+    );
+    println!("✅ batch store: oversized item rejects the whole batch, no partial write");
+}
+
 // ── Test 9: memory_types post-filter excludes unmatched types ─────────────────
 
 #[tokio::test]

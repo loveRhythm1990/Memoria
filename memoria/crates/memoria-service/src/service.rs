@@ -383,6 +383,11 @@ const EDIT_LOG_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
 const EDIT_LOG_FLUSH_SIZE: usize = 64;
 const EDIT_LOG_CHANNEL_CAP: usize = 4096;
 const EDIT_LOG_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Max stored memory content size. Enforced here (not just in the REST handler) so
+/// every entry point — REST, embedded MCP, and the server's own /mcp endpoint — gets
+/// the same limit instead of relying on each caller to check it themselves.
+const MAX_MEMORY_CONTENT_BYTES: usize = 32_768;
 const EDIT_LOG_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 impl EditLogBuffer {
@@ -1315,6 +1320,11 @@ impl MemoryService {
                     "subject_id exceeds maximum length of 128 characters".into(),
                 ));
             }
+        }
+        if content.len() > MAX_MEMORY_CONTENT_BYTES {
+            return Err(MemoriaError::Validation(
+                "content exceeds 32 KiB limit".into(),
+            ));
         }
         let t0 = std::time::Instant::now();
         // Sensitivity check — block HIGH tier, redact MEDIUM tier
@@ -2803,6 +2813,11 @@ impl MemoryService {
                         "subject_id exceeds maximum length of 128 characters".into(),
                     ));
                 }
+            }
+            if content.len() > MAX_MEMORY_CONTENT_BYTES {
+                return Err(MemoriaError::Validation(
+                    "content exceeds 32 KiB limit".into(),
+                ));
             }
             let sensitivity = check_sensitivity(&content);
             if sensitivity.blocked {
