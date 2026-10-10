@@ -15,6 +15,9 @@
   an idempotency key risked duplicate writes. Pass `retry_unsafe_writes=True` to either client
   to restore the previous behavior. Idempotent methods are unchanged, and `ConnectError` (where
   the request never reached the server) is still retried for every method.
+  Retry eligibility is per operation rather than purely per HTTP verb: `memories.correct()`
+  uses PUT but is treated as non-idempotent, because the server mints a replacement record and
+  supersedes the original, so a replay either 404s or creates a second replacement.
 
 ### Added
 - Sync and async `memories.query()` for exact structured filtering through the REST API,

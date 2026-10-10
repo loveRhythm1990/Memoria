@@ -594,7 +594,13 @@ while the upstream keeps going and commits, and a connection can drop after the
 write but before the response. Without an idempotency key there is no way to
 retry such a write safely, so by default the SDK does not.
 
-| Condition | Idempotent (GET/PUT/DELETE/…) | Non-idempotent (POST/PATCH) |
+Eligibility is per *operation*, not purely per HTTP verb: `memories.correct()`
+uses `PUT /v1/memories/{id}/correct` but is **not** idempotent — the server
+mints a replacement record and supersedes the original, so a replay either 404s
+on the already-superseded memory or creates a second replacement. It is
+classified with the non-idempotent column below.
+
+| Condition | Idempotent (GET/PUT/DELETE/…) | Non-idempotent (POST/PATCH, `memories.correct`) |
 |-----------|-------------------------------|------------------------------|
 | 500 | Yes — exponential backoff (`max_retries=3`) | No |
 | 502 / 503 / 504 | Yes | No — opt in with `retry_unsafe_writes=True` |

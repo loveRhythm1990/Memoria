@@ -54,28 +54,51 @@ _RETRY_STATUS_UNSAFE = {502, 503, 504}           # non-idempotent methods, opt-i
 _IDEMPOTENT_METHODS = {"GET", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE"}
 
 
-def _should_retry(method: str, status_code: int, retry_unsafe_writes: bool = False) -> bool:
-    if method.upper() in _IDEMPOTENT_METHODS:
+def _is_idempotent(method: str, idempotent: bool | None) -> bool:
+    """Whether repeating this request is safe.
+
+    The HTTP verb is only a default: an endpoint can be non-idempotent despite
+    using an idempotent-looking method, so callers may override. PUT
+    /v1/memories/{id}/correct is the case in point — the server mints a new
+    record and supersedes the old one, so a replay either 404s on the
+    already-superseded memory or creates a second replacement.
+    """
+    if idempotent is not None:
+        return idempotent
+    return method.upper() in _IDEMPOTENT_METHODS
+
+
+def _should_retry(
+    method: str,
+    status_code: int,
+    retry_unsafe_writes: bool = False,
+    idempotent: bool | None = None,
+) -> bool:
+    if _is_idempotent(method, idempotent):
         return status_code in _RETRY_STATUS_SAFE
     return retry_unsafe_writes and status_code in _RETRY_STATUS_UNSAFE
 
 
 def _should_retry_network_error(
-    method: str, exc: Exception, retry_unsafe_writes: bool = False
+    method: str,
+    exc: Exception,
+    retry_unsafe_writes: bool = False,
+    idempotent: bool | None = None,
 ) -> bool:
-    """ConnectError is safe to retry for any method (server never received the request).
+    """ConnectError is safe to retry for anything (the server never received it).
 
-    Everything else is only safe for idempotent methods: a read timeout, a dropped
-    connection or a disconnect-before-response on a POST may all mean the server
+    Everything else is only safe for idempotent operations: a read timeout, a
+    dropped connection or a disconnect-before-response may all mean the server
     processed the request and only the response was lost.
     """
     if isinstance(exc, httpx.ConnectError):
         return True
-    if method.upper() in _IDEMPOTENT_METHODS:
-        return isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.ProtocolError))
-    return retry_unsafe_writes and isinstance(
+    retryable = isinstance(
         exc, (httpx.TimeoutException, httpx.NetworkError, httpx.ProtocolError)
     )
+    if _is_idempotent(method, idempotent):
+        return retryable
+    return retry_unsafe_writes and retryable
 
 
 def _build_headers(api_key: str) -> dict[str, str]:
@@ -161,6 +184,7 @@ class _HttpTransport:
         *,
         params: dict[str, Any] | None = None,
         json: Any = None,
+        idempotent: bool | None = None,
     ) -> Any:
         """Execute a synchronous HTTP request with retry logic.
 
@@ -191,7 +215,7 @@ class _HttpTransport:
             except httpx.TransportError as exc:
                 last_exc = exc
                 if attempt < self._max_retries and _should_retry_network_error(
-                    method, exc, self._retry_unsafe_writes
+                    method, exc, self._retry_unsafe_writes, idempotent
                 ):
                     time.sleep(_backoff(attempt))
                     continue
@@ -209,7 +233,7 @@ class _HttpTransport:
                     return resp.text
 
             if (
-                _should_retry(method, resp.status_code, self._retry_unsafe_writes)
+                _should_retry(method, resp.status_code, self._retry_unsafe_writes, idempotent)
                 and attempt < self._max_retries
             ):
                 time.sleep(_backoff(attempt))
@@ -233,6 +257,7 @@ class _HttpTransport:
         *,
         params: dict[str, Any] | None = None,
         json: Any = None,
+        idempotent: bool | None = None,
     ) -> Any:
         """Execute an asynchronous HTTP request with retry logic.
 
@@ -256,7 +281,7 @@ class _HttpTransport:
             except httpx.TransportError as exc:
                 last_exc = exc
                 if attempt < self._max_retries and _should_retry_network_error(
-                    method, exc, self._retry_unsafe_writes
+                    method, exc, self._retry_unsafe_writes, idempotent
                 ):
                     await asyncio.sleep(_backoff(attempt))
                     continue
@@ -274,7 +299,7 @@ class _HttpTransport:
                     return resp.text
 
             if (
-                _should_retry(method, resp.status_code, self._retry_unsafe_writes)
+                _should_retry(method, resp.status_code, self._retry_unsafe_writes, idempotent)
                 and attempt < self._max_retries
             ):
                 await asyncio.sleep(_backoff(attempt))

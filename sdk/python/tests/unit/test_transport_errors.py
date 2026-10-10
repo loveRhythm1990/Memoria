@@ -13,7 +13,12 @@ import httpx
 import pytest
 from pytest_httpx import HTTPXMock
 
-from memoria import AsyncMemoriaClient, MemoriaClient, MemoriaConnectionError
+from memoria import (
+    AsyncMemoriaClient,
+    MemoriaClient,
+    MemoriaConnectionError,
+    MemoriaServerError,
+)
 from tests.conftest import API_KEY, BASE_URL, MEMORY_STUB
 
 # Every httpx.TransportError branch: no response was produced in any of them.
@@ -101,4 +106,63 @@ def test_connect_error_on_post_is_retried(httpx_mock: HTTPXMock) -> None:
     httpx_mock.add_response(json=MEMORY_STUB)
     client = MemoriaClient(base_url=BASE_URL, api_key=API_KEY, max_retries=3)
     assert client.memories.store(content="x").memory_id == "mem_abc123"
+    assert len(httpx_mock.get_requests()) == 2
+
+
+# ── PUT /v1/memories/{id}/correct is non-idempotent despite the verb ─────────
+# The server mints a replacement record and supersedes the original, so a replay
+# either 404s on the already-superseded memory or creates a second replacement.
+
+
+@pytest.mark.parametrize("status", [502, 503, 504])
+def test_correct_is_not_retried_on_gateway_error(httpx_mock: HTTPXMock, status: int) -> None:
+    httpx_mock.add_response(status_code=status, json={"detail": "gateway"})
+    client = MemoriaClient(base_url=BASE_URL, api_key=API_KEY, max_retries=3)
+    with pytest.raises(MemoriaServerError):
+        client.memories.correct("m1", new_content="new")
+    assert len(httpx_mock.get_requests()) == 1
+
+
+def test_correct_is_not_retried_on_disconnect(httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_exception(httpx.RemoteProtocolError("server disconnected"))
+    client = MemoriaClient(base_url=BASE_URL, api_key=API_KEY, max_retries=3)
+    with pytest.raises(MemoriaConnectionError):
+        client.memories.correct("m1", new_content="new")
+    assert len(httpx_mock.get_requests()) == 1
+
+
+@pytest.mark.asyncio
+async def test_correct_is_not_retried_async(httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_exception(httpx.RemoteProtocolError("server disconnected"))
+    async with AsyncMemoriaClient(base_url=BASE_URL, api_key=API_KEY, max_retries=3) as client:
+        with pytest.raises(MemoriaConnectionError):
+            await client.memories.correct("m1", new_content="new")
+    assert len(httpx_mock.get_requests()) == 1
+
+
+@pytest.mark.asyncio
+async def test_correct_gateway_error_not_retried_async(httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(status_code=504, json={"detail": "gateway"})
+    async with AsyncMemoriaClient(base_url=BASE_URL, api_key=API_KEY, max_retries=3) as client:
+        with pytest.raises(MemoriaServerError):
+            await client.memories.correct("m1", new_content="new")
+    assert len(httpx_mock.get_requests()) == 1
+
+
+def test_correct_is_retried_when_opted_in(httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_exception(httpx.RemoteProtocolError("server disconnected"))
+    httpx_mock.add_response(json=MEMORY_STUB)
+    client = MemoriaClient(
+        base_url=BASE_URL, api_key=API_KEY, max_retries=3, retry_unsafe_writes=True
+    )
+    client.memories.correct("m1", new_content="new")
+    assert len(httpx_mock.get_requests()) == 2
+
+
+def test_genuinely_idempotent_delete_is_still_retried(httpx_mock: HTTPXMock) -> None:
+    # The override is per-operation: DELETE keeps its method-based default.
+    httpx_mock.add_exception(httpx.RemoteProtocolError("server disconnected"))
+    httpx_mock.add_response(status_code=204)
+    client = MemoriaClient(base_url=BASE_URL, api_key=API_KEY, max_retries=3)
+    client.memories.delete("m1")
     assert len(httpx_mock.get_requests()) == 2
