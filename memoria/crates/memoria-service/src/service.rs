@@ -2738,7 +2738,7 @@ impl MemoryService {
         &self,
         user_id: &str,
         sql: &SqlMemoryStore,
-        results: &mut Vec<Memory>,
+        results: &mut [Memory],
     ) -> Result<(), MemoriaError> {
         if results.is_empty() {
             return Ok(());
