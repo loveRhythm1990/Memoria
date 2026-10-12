@@ -1796,8 +1796,13 @@ impl MemoryService {
                     };
                     let graph_store = graph_sql.graph_store();
                     let retriever = memoria_storage::graph::ActivationRetriever::new(&graph_store);
+                    // Over-fetch so the feedback multiplier (applied below, after this
+                    // call's own internal truncate) has room to reorder candidates that
+                    // would otherwise already be cut from the pool — same oversampling
+                    // factor as search_hybrid_from_scored_scoped.
+                    let graph_fetch_k = (top_k * 3).max(20);
                     match retriever
-                        .retrieve(user_id, query, embedding, top_k, None)
+                        .retrieve(user_id, query, embedding, graph_fetch_k, None)
                         .await
                     {
                         Ok(scored_nodes) if !scored_nodes.is_empty() => {

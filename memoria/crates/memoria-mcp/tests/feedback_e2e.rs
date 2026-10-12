@@ -927,6 +927,88 @@ async fn test_feedback_affects_retrieval_ranking() {
     }
 }
 
+// ── 14b. Feedback must be able to flip the winner even when top_k == 1 ───────
+//
+// Regression guard for a bug found in review: ActivationRetriever (the graph
+// retrieval path) truncates its own candidate list to the requested top_k
+// *before* service.rs gets a chance to apply the feedback multiplier. With
+// top_k=1 that meant the naturally-highest-scoring candidate was already the
+// only one left in the pool by the time feedback was considered, so no amount
+// of negative feedback on it (or positive feedback on a runner-up) could ever
+// change the single result returned. The fix over-fetches from the graph
+// retriever so feedback has room to reorder before the real top_k is applied.
+//
+// Note: whether a given query is served by the graph path or by vector-hybrid
+// (which already applied feedback correctly) depends on graph discovery
+// finding activation/entity links; both paths must honor this invariant, so
+// this test checks the end-to-end behavior rather than asserting which path
+// was taken.
+#[tokio::test]
+async fn test_feedback_flips_top1_result() {
+    let (svc, store, uid, _ctx) = setup_with_mock_embedder().await;
+
+    let contents = [
+        "Memory D about Rust programming language",
+        "Memory E about Rust programming language",
+        "Memory F about Rust programming language",
+    ];
+    let mut memory_ids = Vec::new();
+    for content in contents {
+        let r = call(
+            "memory_store",
+            json!({"content": content, "memory_type": "semantic"}),
+            &svc,
+            &uid,
+        )
+        .await;
+        let memory_id = text(&r)
+            .split("Stored memory ")
+            .nth(1)
+            .and_then(|s| s.split(':').next())
+            .expect("extract memory_id")
+            .to_string();
+        memory_ids.push(memory_id);
+    }
+
+    // Baseline order with no feedback at all — whichever ranks first here is
+    // the one a buggy top_k=1 fetch would always return regardless of feedback.
+    let baseline = svc.retrieve(&uid, "Rust programming", 3).await.unwrap();
+    assert!(
+        baseline.len() >= 2,
+        "need at least 2 candidates to test a ranking flip, got {}",
+        baseline.len()
+    );
+    let natural_first = baseline[0].memory_id.clone();
+    let natural_second = baseline[1].memory_id.clone();
+
+    // Push the naturally-top memory down with wrong feedback, and the runner-up
+    // up with useful feedback, strongly enough to flip their order.
+    for _ in 0..6 {
+        store
+            .record_feedback(&uid, &natural_first, "wrong", None)
+            .await
+            .unwrap();
+    }
+    for _ in 0..12 {
+        store
+            .record_feedback(&uid, &natural_second, "useful", None)
+            .await
+            .unwrap();
+    }
+
+    let top1 = svc.retrieve(&uid, "Rust programming", 1).await.unwrap();
+    assert_eq!(top1.len(), 1, "top_k=1 must return exactly one memory");
+    assert_eq!(
+        top1[0].memory_id, natural_second,
+        "feedback must be able to flip which single memory wins at top_k=1; \
+         natural_first={natural_first} natural_second={natural_second}"
+    );
+    println!(
+        "✅ feedback flips top_k=1 winner: {} -> {}",
+        natural_first, top1[0].memory_id
+    );
+}
+
 // ── 15. Verify feedback multiplier in DB scoring ──────────────────────────────
 
 #[tokio::test]
