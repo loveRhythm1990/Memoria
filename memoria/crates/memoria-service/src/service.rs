@@ -1841,6 +1841,16 @@ impl MemoryService {
                                 }
                             }
 
+                            // Graph activation scores don't fold in user feedback —
+                            // apply it here so useful/wrong signals affect ranking
+                            // regardless of which path (graph-only or graph+vector) wins.
+                            self.apply_feedback_adjustment(
+                                user_id,
+                                sql.as_ref(),
+                                &mut graph_memories,
+                            )
+                            .await?;
+
                             if graph_memories.len() as i64 >= top_k {
                                 graph_memories.truncate(top_k as usize);
                                 explain.path = "graph";
@@ -1988,31 +1998,8 @@ impl MemoryService {
             explain.fulltext_hit = !results.is_empty();
 
             // Apply feedback adjustment to fulltext results
-            if !results.is_empty() {
-                let ids: Vec<String> = results.iter().map(|m| m.memory_id.clone()).collect();
-                if let Ok(fb_map) = sql.get_feedback_batch(&ids).await {
-                    let feedback_weight = self.get_feedback_weight(user_id).await?;
-                    for m in &mut results {
-                        if let Some(fb) = fb_map.get(&m.memory_id) {
-                            let positive = fb.useful as f64;
-                            let negative = (fb.irrelevant + fb.outdated + fb.wrong) as f64;
-                            let feedback_delta = positive - 0.5 * negative;
-                            if feedback_delta.abs() > 0.01 {
-                                if let Some(score) = m.retrieval_score.as_mut() {
-                                    *score *=
-                                        (1.0 + feedback_weight * feedback_delta).clamp(0.5, 2.0);
-                                }
-                            }
-                        }
-                    }
-                    // Re-sort after feedback adjustment
-                    results.sort_by(|a, b| {
-                        b.retrieval_score
-                            .partial_cmp(&a.retrieval_score)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                }
-            }
+            self.apply_feedback_adjustment(user_id, sql.as_ref(), &mut results)
+                .await?;
 
             explain.path = if explain.fulltext_hit {
                 "fulltext"
@@ -2742,6 +2729,42 @@ impl MemoryService {
         };
         self.feedback_weight_cache.insert(user_id.to_string(), fw);
         Ok(fw)
+    }
+
+    /// Apply per-memory feedback multiplier to `retrieval_score` and re-sort.
+    /// Shared by retrieval paths (graph, fulltext) whose base score doesn't
+    /// already fold in feedback.
+    async fn apply_feedback_adjustment(
+        &self,
+        user_id: &str,
+        sql: &SqlMemoryStore,
+        results: &mut Vec<Memory>,
+    ) -> Result<(), MemoriaError> {
+        if results.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<String> = results.iter().map(|m| m.memory_id.clone()).collect();
+        if let Ok(fb_map) = sql.get_feedback_batch(&ids).await {
+            let feedback_weight = self.get_feedback_weight(user_id).await?;
+            for m in results.iter_mut() {
+                if let Some(fb) = fb_map.get(&m.memory_id) {
+                    let positive = fb.useful as f64;
+                    let negative = (fb.irrelevant + fb.outdated + fb.wrong) as f64;
+                    let feedback_delta = positive - 0.5 * negative;
+                    if feedback_delta.abs() > 0.01 {
+                        if let Some(score) = m.retrieval_score.as_mut() {
+                            *score *= (1.0 + feedback_weight * feedback_delta).clamp(0.5, 2.0);
+                        }
+                    }
+                }
+            }
+            results.sort_by(|a, b| {
+                b.retrieval_score
+                    .partial_cmp(&a.retrieval_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        Ok(())
     }
 
     /// Batch store with single embedding API call for all memories.
