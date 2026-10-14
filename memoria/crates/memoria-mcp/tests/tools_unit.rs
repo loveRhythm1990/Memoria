@@ -186,6 +186,75 @@ async fn test_tool_memory_store_rejects_empty_content() {
 }
 
 #[tokio::test]
+async fn test_tool_memory_store_rejects_invalid_memory_types() {
+    for memory_type in [
+        json!("invalid_xyz"),
+        json!(""),
+        json!("SEMANTIC"),
+        json!(42),
+        json!(true),
+        json!([]),
+        json!({}),
+    ] {
+        let svc = make_service();
+        let args = json!({"content": "a valid fact", "memory_type": memory_type});
+        let result = memoria_mcp::tools::call("memory_store", args.clone(), &svc, "u1")
+            .await
+            .unwrap();
+        let memories = svc.list_active("u1", 10).await.unwrap();
+        println!(
+            "invalid memory_type {memory_type}: response={result}, persisted_types={:?}",
+            memories
+                .iter()
+                .map(|m| m.memory_type.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            result["isError"], true,
+            "invalid type must be rejected: {result}"
+        );
+        assert!(memoria_mcp::tools::validate_tool_args("memory_store", &args).is_err());
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("memory_type"));
+        assert!(memories.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn test_tool_memory_store_keeps_valid_and_default_memory_types() {
+    let mut cases: Vec<(serde_json::Value, &str)> = memoria_core::MemoryType::ALL_NAMES
+        .iter()
+        .map(|name| {
+            (
+                json!({"content": "a valid fact", "memory_type": name}),
+                *name,
+            )
+        })
+        .collect();
+    cases.push((json!({"content": "a valid fact"}), "semantic"));
+    cases.push((
+        json!({"content": "a valid fact", "memory_type": null}),
+        "semantic",
+    ));
+    for (args, expected) in cases {
+        let svc = make_service();
+        assert!(memoria_mcp::tools::validate_tool_args("memory_store", &args).is_ok());
+        let result = memoria_mcp::tools::call("memory_store", args, &svc, "u1")
+            .await
+            .unwrap();
+        assert_ne!(
+            result["isError"], true,
+            "valid type must be preserved: {result}"
+        );
+        let memories = svc.list_active("u1", 10).await.unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].memory_type.to_string(), expected);
+    }
+}
+
+#[tokio::test]
 async fn test_tool_memory_retrieve_empty() {
     let svc = make_service();
     let result = memoria_mcp::tools::call(

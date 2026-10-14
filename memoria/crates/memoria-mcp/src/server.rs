@@ -767,6 +767,8 @@ mod tests {
         ));
         for params in [
             json!({"name":"memory_store", "arguments":{"content":""}}),
+            json!({"name":"memory_store", "arguments":{"content":"a valid fact", "memory_type":"invalid_xyz"}}),
+            json!({"name":"memory_store", "arguments":{"content":"a valid fact", "memory_type":42}}),
             json!({"name":"memory_apply", "arguments":{"source":"main"}}),
             json!({"name":"memory_apply", "arguments":{"source":42}}),
         ] {
@@ -785,6 +787,12 @@ mod tests {
                 let result = result.expect("execution errors must be results");
                 assert_eq!(result["isError"], true, "{result}");
                 assert!(!result["content"][0]["text"].as_str().unwrap().is_empty());
+                if params["arguments"].get("memory_type").is_some() {
+                    assert!(result["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("memory_type"));
+                }
                 if params["arguments"]["source"] == 42 {
                     assert!(
                         result["content"][0]["text"]

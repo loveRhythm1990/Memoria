@@ -7937,6 +7937,46 @@ async fn test_api_metrics() {
     println!("✅ GET /metrics: {} bytes", body.len());
 }
 
+#[tokio::test]
+async fn test_api_metrics_reports_governance_last_run() {
+    let (base, client, server) = spawn_server().await;
+    let store = server.shared_store();
+    // A scheduled governance run records its outcome in the shared runtime
+    // state (scheduler `run_task` -> `clear_shared_breaker` on success).
+    store
+        .clear_governance_runtime_breaker("metrics_e2e", "daily")
+        .await
+        .expect("record governance run");
+    let ran_at = chrono::Utc::now().timestamp();
+    // Vector-index rebuilds reuse the same table with task=rebuild. A later
+    // rebuild must not move the governance staleness gauge.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    store
+        .record_vector_index_rebuild("mem_memories", 42, 3600)
+        .await
+        .expect("record unrelated rebuild");
+
+    let r = client.get(format!("{base}/metrics")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body = r.text().await.unwrap();
+    let reported: i64 = body
+        .lines()
+        .find_map(|line| line.strip_prefix("memoria_governance_last_run_timestamp "))
+        .unwrap_or_else(|| panic!("missing memoria_governance_last_run_timestamp:\n{body}"))
+        .trim()
+        .parse()
+        .expect("unix timestamp");
+    assert!(
+        (reported - ran_at).abs() <= 120,
+        "governance last run {reported} should be the recorded run time (~{ran_at})"
+    );
+    let now = chrono::Utc::now().timestamp();
+    assert!(
+        now - reported >= 1,
+        "later vector-index rebuild must not bump the gauge (reported={reported}, ran_at={ran_at}, now={now})"
+    );
+}
+
 // ── Snapshot rollback ─────────────────────────────────────────────────────────
 
 #[tokio::test]

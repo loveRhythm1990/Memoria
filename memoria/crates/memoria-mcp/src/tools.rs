@@ -116,6 +116,14 @@ fn parse_store_content(args: &Value) -> Result<String, &'static str> {
     parse_required_str(args, "content", "content is required")
 }
 
+fn parse_store_memory_type(args: &Value) -> Result<MemoryType, &'static str> {
+    match args.get("memory_type") {
+        None | Some(Value::Null) => Ok(MemoryType::Semantic),
+        Some(Value::String(name)) => MemoryType::from_str(name).map_err(|_| "invalid memory_type"),
+        Some(_) => Err("memory_type must be a string"),
+    }
+}
+
 /// 校验各工具的必填非空字符串参数。embedded 分发在各 handler 内部已隐式校验（parse_required_str），
 /// 但 remote 模式直接拼 REST payload 会绕过校验——remote::call 前置调用本函数以保持一致。
 pub fn validate_tool_args(name: &str, args: &Value) -> Result<(), &'static str> {
@@ -127,7 +135,10 @@ pub fn validate_tool_args(name: &str, args: &Value) -> Result<(), &'static str> 
         }
     }
     match name {
-        "memory_store" => parse_required_str(args, "content", "content is required").map(|_| ()),
+        "memory_store" => {
+            parse_store_content(args)?;
+            parse_store_memory_type(args).map(|_| ())
+        }
         "memory_retrieve" | "memory_search" => {
             parse_required_str(args, "query", "query is required").map(|_| ())
         }
@@ -206,7 +217,7 @@ pub fn list() -> Value {
                 "type": "object",
                 "properties": {
                     "content": {"type": "string"},
-                    "memory_type": {"type": "string", "default": "semantic"},
+                    "memory_type": {"type": "string", "enum": MemoryType::ALL_NAMES, "default": "semantic"},
                     "session_id": {"type": "string"},
                     "extra_metadata": {"type": "object", "description": "Optional business metadata (e.g. scene, agent). Persisted with the memory and returned verbatim on read. Memoria itself does not score by it; downstream consumers may use it for their own retrieval-time ranking."},
                     "subject_id": {"type": "string", "description": "Stable business ID of the memory subject (e.g. end-user ID). Set by the integration layer; optional."},
@@ -426,13 +437,15 @@ pub async fn call(
                 Ok(content) => content,
                 Err(msg) => return Ok(mcp_error(msg)),
             };
-            let memory_type = args["memory_type"].as_str().unwrap_or("semantic");
+            let mt = match parse_store_memory_type(&args) {
+                Ok(memory_type) => memory_type,
+                Err(msg) => return Ok(mcp_error(msg)),
+            };
             let session_id = args["session_id"].as_str().map(String::from);
             let trust_tier = args["trust_tier"]
                 .as_str()
                 .map(TrustTier::from_str)
                 .transpose()?;
-            let mt = MemoryType::from_str(memory_type).unwrap_or(MemoryType::Semantic);
             let subject_id = args["subject_id"]
                 .as_str()
                 .map(str::trim)
@@ -560,7 +573,22 @@ pub async fn call(
                 }
                 let text = results
                     .iter()
-                    .map(|m| format!("[{}] ({}) {}{}", m.memory_id, m.memory_type, m.content, m.extra_metadata.as_ref().filter(|md| !md.is_empty()).map(|md| format!(" | metadata: {}", serde_json::to_string(md).unwrap_or_default())).unwrap_or_default()))
+                    .map(|m| {
+                        format!(
+                            "[{}] ({}) {}{}",
+                            m.memory_id,
+                            m.memory_type,
+                            m.content,
+                            m.extra_metadata
+                                .as_ref()
+                                .filter(|md| !md.is_empty())
+                                .map(|md| format!(
+                                    " | metadata: {}",
+                                    serde_json::to_string(md).unwrap_or_default()
+                                ))
+                                .unwrap_or_default()
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join("\n");
                 let explain_json = serde_json::to_string_pretty(&stats).unwrap_or_default();
@@ -582,7 +610,22 @@ pub async fn call(
                 }
                 let text = results
                     .iter()
-                    .map(|m| format!("[{}] ({}) {}{}", m.memory_id, m.memory_type, m.content, m.extra_metadata.as_ref().filter(|md| !md.is_empty()).map(|md| format!(" | metadata: {}", serde_json::to_string(md).unwrap_or_default())).unwrap_or_default()))
+                    .map(|m| {
+                        format!(
+                            "[{}] ({}) {}{}",
+                            m.memory_id,
+                            m.memory_type,
+                            m.content,
+                            m.extra_metadata
+                                .as_ref()
+                                .filter(|md| !md.is_empty())
+                                .map(|md| format!(
+                                    " | metadata: {}",
+                                    serde_json::to_string(md).unwrap_or_default()
+                                ))
+                                .unwrap_or_default()
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join("\n");
                 Ok(mcp_text(&text))
@@ -590,10 +633,11 @@ pub async fn call(
         }
 
         ToolCallName::MemoryCorrect => {
-            let new_content = match parse_required_str(&args, "new_content", "new_content is required") {
-                Ok(s) => s,
-                Err(msg) => return Ok(mcp_error(msg)),
-            };
+            let new_content =
+                match parse_required_str(&args, "new_content", "new_content is required") {
+                    Ok(s) => s,
+                    Err(msg) => return Ok(mcp_error(msg)),
+                };
             let memory_id = args["memory_id"].as_str().unwrap_or("");
             let query = args["query"].as_str().unwrap_or("");
 
@@ -731,7 +775,22 @@ pub async fn call(
             }
             let text = memories
                 .iter()
-                .map(|m| format!("[{}] ({}) {}{}", m.memory_id, m.memory_type, m.content, m.extra_metadata.as_ref().filter(|md| !md.is_empty()).map(|md| format!(" | metadata: {}", serde_json::to_string(md).unwrap_or_default())).unwrap_or_default()))
+                .map(|m| {
+                    format!(
+                        "[{}] ({}) {}{}",
+                        m.memory_id,
+                        m.memory_type,
+                        m.content,
+                        m.extra_metadata
+                            .as_ref()
+                            .filter(|md| !md.is_empty())
+                            .map(|md| format!(
+                                " | metadata: {}",
+                                serde_json::to_string(md).unwrap_or_default()
+                            ))
+                            .unwrap_or_default()
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             Ok(mcp_text(&text))
@@ -1579,15 +1638,28 @@ mod tests {
     fn parse_correct_new_content_rejects_blank() {
         // memory_correct now uses parse_required_str — verify whitespace is rejected
         assert_eq!(
-            parse_required_str(&json!({"new_content": ""}), "new_content", "new_content is required"),
+            parse_required_str(
+                &json!({"new_content": ""}),
+                "new_content",
+                "new_content is required"
+            ),
             Err("new_content is required")
         );
         assert_eq!(
-            parse_required_str(&json!({"new_content": "   "}), "new_content", "new_content is required"),
+            parse_required_str(
+                &json!({"new_content": "   "}),
+                "new_content",
+                "new_content is required"
+            ),
             Err("new_content is required")
         );
         assert_eq!(
-            parse_required_str(&json!({"new_content": "ok"}), "new_content", "new_content is required").unwrap(),
+            parse_required_str(
+                &json!({"new_content": "ok"}),
+                "new_content",
+                "new_content is required"
+            )
+            .unwrap(),
             "ok"
         );
     }

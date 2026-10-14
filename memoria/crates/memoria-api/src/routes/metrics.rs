@@ -108,24 +108,23 @@ async fn collect_metrics(state: &AppState) -> Result<Arc<String>, String> {
     }
 
     // ── Governance last run ───────────────────────────────────────────────
-    let last_gov: Option<(String,)> = sqlx::query_as(
-        "SELECT MAX(updated_at) FROM mem_async_tasks WHERE task_type LIKE 'governance_%'",
+    // Every scheduled governance run upserts its outcome (success or primary
+    // failure) into the shared runtime state with `updated_at = NOW()`.
+    // Scope to governance tasks only: the same table also stores vector-index
+    // rebuild bookkeeping (`task = 'rebuild'`), which must not inflate this
+    // staleness gauge. UNIX_TIMESTAMP matches the session time zone NOW() used.
+    let last_gov: Option<i64> = sqlx::query_scalar(
+        "SELECT CAST(UNIX_TIMESTAMP(MAX(updated_at)) AS SIGNED)          FROM mem_governance_runtime_state          WHERE `task` IN ('hourly', 'daily', 'weekly')",
     )
-    .fetch_optional(shared_pool)
+    .fetch_one(shared_pool)
     .await
     .ok()
     .flatten();
 
-    if let Some((ts,)) = last_gov {
-        // Parse and convert to unix timestamp
-        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%d %H:%M:%S%.f") {
-            let unix = dt.and_utc().timestamp();
-            out.push_str(
-                "# HELP memoria_governance_last_run_timestamp Last governance run (unix).\n",
-            );
-            out.push_str("# TYPE memoria_governance_last_run_timestamp gauge\n");
-            out.push_str(&format!("memoria_governance_last_run_timestamp {unix}\n"));
-        }
+    if let Some(unix) = last_gov {
+        out.push_str("# HELP memoria_governance_last_run_timestamp Last governance run (unix).\n");
+        out.push_str("# TYPE memoria_governance_last_run_timestamp gauge\n");
+        out.push_str(&format!("memoria_governance_last_run_timestamp {unix}\n"));
     }
 
     // ── Instance info ─────────────────────────────────────────────────────
