@@ -3636,10 +3636,9 @@ pub fn idempotent_memory_id(
     use sha2::{Digest, Sha256};
     let identity = serde_json::json!(["memoria.store.v1", user_id, branch.unwrap_or("main"), key]);
     let digest = Sha256::digest(serde_json::to_vec(&identity)?);
-    Ok(digest[..16]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    let mut receipt = [0_u8; 16];
+    receipt.copy_from_slice(&digest[..16]);
+    Ok(format!("{:032x}", u128::from_be_bytes(receipt)))
 }
 
 fn validate_idempotent_receipt(
