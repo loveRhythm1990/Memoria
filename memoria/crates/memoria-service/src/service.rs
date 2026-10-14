@@ -1362,6 +1362,7 @@ impl MemoryService {
                 "content exceeds 32 KiB limit".into(),
             ));
         }
+        reject_reserved_metadata(extra_metadata.as_ref())?;
         let idempotency = if let Some(key) = idempotency_key {
             let id = idempotent_memory_id(user_id, branch, key)?;
             if self.sql_store.is_none() {
@@ -1369,16 +1370,8 @@ impl MemoryService {
                     "idempotent writes require SQL storage".into(),
                 ));
             }
-            if extra_metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.contains_key(STORE_REQUEST_HASH_FIELD))
-            {
-                return Err(MemoriaError::Validation(
-                    "reserved idempotency metadata field".into(),
-                ));
-            }
             use sha2::{Digest, Sha256};
-            let payload = serde_json::json!([
+            let mut payload = serde_json::json!([
                 content,
                 memory_type.to_string(),
                 session_id,
@@ -1392,6 +1385,8 @@ impl MemoryService {
                 subject_id,
                 extra_metadata
             ]);
+            // Canonicalize recursively even if a consumer enables preserve_order.
+            payload.sort_all_objects();
             let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&payload)?));
             let sql = self.user_sql_store(user_id).await?;
             let table = sql.table_for_branch(user_id, branch).await?;
@@ -2951,6 +2946,7 @@ impl MemoryService {
         let mut contents = Vec::with_capacity(items.len());
         let mut checked_items = Vec::with_capacity(items.len());
         for (content, mt, session_id, tier, subject_id, extra_metadata) in items {
+            reject_reserved_metadata(extra_metadata.as_ref())?;
             let subject_id = normalize_opt_string(subject_id);
             if let Some(ref sid) = subject_id {
                 if sid.len() > 128 {
@@ -3619,7 +3615,18 @@ impl MemoryService {
     }
 }
 
-const STORE_REQUEST_HASH_FIELD: &str = "_memoria_store_request_sha256";
+use memoria_core::STORE_REQUEST_HASH_FIELD;
+
+fn reject_reserved_metadata(
+    metadata: Option<&HashMap<String, serde_json::Value>>,
+) -> Result<(), MemoriaError> {
+    if metadata.is_some_and(|metadata| metadata.contains_key(STORE_REQUEST_HASH_FIELD)) {
+        return Err(MemoriaError::Validation(
+            "reserved idempotency metadata field".into(),
+        ));
+    }
+    Ok(())
+}
 
 /// Protocol v1 uses the first 128 SHA-256 bits as a 32-character memory ID.
 /// The backend derives the owner from authentication, never from request JSON.

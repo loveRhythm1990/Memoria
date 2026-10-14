@@ -37,6 +37,11 @@ pub fn validate_extra_metadata_filter(
         )));
     }
     for (key, value) in filter {
+        if key == memoria_core::STORE_REQUEST_HASH_FIELD {
+            return Err(MemoriaError::Validation(
+                "reserved receipt metadata is not queryable".into(),
+            ));
+        }
         let mut chars = key.chars();
         let valid_first = chars
             .next()
@@ -5229,10 +5234,12 @@ impl SqlMemoryStore {
              FROM {table} \
              WHERE user_id = ? AND is_active = 1 \
                AND memory_type = ? \
+               AND JSON_EXTRACT(extra_metadata, '$.{receipt_hash}') IS NULL \
                AND embedding IS NOT NULL AND vector_dims(embedding) > 0 \
                AND memory_id != ? \
                {subject_clause} \
-              ORDER BY l2_dist ASC LIMIT 1 by rank with option 'mode=post'"
+              ORDER BY l2_dist ASC LIMIT 1 by rank with option 'mode=post'",
+            receipt_hash = memoria_core::STORE_REQUEST_HASH_FIELD,
         );
         let rows = sqlx::query(&sql)
             .bind(user_id)

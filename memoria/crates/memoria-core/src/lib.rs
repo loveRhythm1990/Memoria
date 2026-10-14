@@ -41,3 +41,6 @@ pub fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     }
     &s[..end]
 }
+
+/// Reserved persistence fingerprint for atomic store receipts; not caller metadata.
+pub const STORE_REQUEST_HASH_FIELD: &str = "_memoria_store_request_sha256";

@@ -460,7 +460,10 @@ pub struct MemoryResponse {
 }
 
 impl From<Memory> for MemoryResponse {
-    fn from(m: Memory) -> Self {
+    fn from(mut m: Memory) -> Self {
+        if let Some(metadata) = m.extra_metadata.as_mut() {
+            metadata.remove(memoria_core::STORE_REQUEST_HASH_FIELD);
+        }
         Self {
             memory_id: m.memory_id,
             user_id: m.user_id,

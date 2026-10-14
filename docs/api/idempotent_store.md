@@ -15,8 +15,11 @@ session operations cannot acquire each other's record or session metadata.
 A key reused with a different content, type, session, trust tier, confidence,
 observed time, author, subject or caller metadata fails. The backend preserves a
 request fingerprint in reserved `_memoria_store_request_sha256` metadata; callers
-cannot set that reserved field on an idempotent request. A retry never reactivates
-an inactive receipt. The guarantee depends on retaining the record/tombstone;
+cannot set or query that reserved field, and API memory responses hide it while
+returning caller metadata unchanged. Payload fingerprints canonicalize nested
+JSON object keys. Ordinary vector dedup excludes receipt-bearing rows, so an
+ordinary store cannot supersede a receipt or replace its metadata. A retry never
+reactivates an inactive receipt. The guarantee depends on retaining the record/tombstone;
 physical database or record erasure ends that receipt's lifetime. Account/branch
 retention and deletion policies remain authoritative.
 
