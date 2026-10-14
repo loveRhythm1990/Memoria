@@ -2,6 +2,195 @@
 mod support;
 use serde_json::{json, Value};
 
+struct CheckoutEmbedder {
+    entered: tokio::sync::Semaphore,
+    resume: tokio::sync::Semaphore,
+}
+
+#[async_trait::async_trait]
+impl memoria_core::interfaces::EmbeddingProvider for CheckoutEmbedder {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, memoria_core::MemoriaError> {
+        if text == "checkout while embedding" {
+            self.entered.add_permits(1);
+            self.resume.acquire().await.unwrap().forget();
+        }
+        memoria_core::interfaces::EmbeddingProvider::embed(
+            &memoria_embedding::MockEmbedder::new(4),
+            text,
+        )
+        .await
+    }
+
+    fn dimension(&self) -> usize {
+        4
+    }
+}
+
+#[tokio::test]
+async fn receipts_follow_resolved_branch_and_checkout_cannot_retarget_inflight_write() {
+    use std::{sync::Arc, time::Duration};
+    let master = "branch-receipt-test-master";
+    let embedder = Arc::new(CheckoutEmbedder {
+        entered: tokio::sync::Semaphore::new(0),
+        resume: tokio::sync::Semaphore::new(0),
+    });
+    let server = support::multi_db::spawn_api_server(
+        "branch_receipt",
+        4,
+        master.into(),
+        Some(embedder.clone()),
+        None,
+        None,
+        false,
+    )
+    .await;
+    let owner = format!("branch_idem_{}", uuid::Uuid::new_v4().simple());
+    let request = |path: &str| {
+        server
+            .client
+            .post(format!("{}{path}", server.base))
+            .header("Authorization", format!("Memoria-Owner {master}"))
+            .header("X-User-Id", &owner)
+            .timeout(Duration::from_secs(30))
+    };
+    let response = request("/v1/branches")
+        .json(&json!({"name":"reviewb"}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    assert_eq!(status, 201, "{}", response.text().await.unwrap());
+    assert_eq!(
+        request("/v1/branches/reviewb/checkout")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let body = json!({"content":"branch receipt", "memory_type":"episodic", "session_id":"branch-session", "trust_tier":"T3", "idempotency_key":"operation-a"});
+    let response = request("/v1/memories/idempotent")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    let implicit: Value = response.json().await.unwrap();
+    assert_eq!(
+        implicit["memory_id"],
+        memoria_service::service::idempotent_memory_id(&owner, Some("reviewb"), "operation-a")
+            .unwrap()
+    );
+    let mut explicit_body = body.clone();
+    // The HTTP boundary normalizes explicit branch spelling.
+    explicit_body["branch"] = json!(" reviewb ");
+    for endpoint in ["/v1/memories/idempotent", "/v1/memories"] {
+        let response = request(endpoint).json(&explicit_body).send().await.unwrap();
+        assert_eq!(response.status(), 201);
+        let explicit: Value = response.json().await.unwrap();
+        assert_eq!(explicit["memory_id"], implicit["memory_id"]);
+    }
+    let sql = server.user_store(&owner).await;
+    let table = sql.table_for_branch(&owner, Some("reviewb")).await.unwrap();
+    let main = sql.table_for_branch(&owner, Some("main")).await.unwrap();
+    assert_eq!(
+        sql.list_active_from(&table, &owner, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(sql
+        .list_active_from(&main, &owner, 10)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let mut inflight_body = body.clone();
+    inflight_body["content"] = json!("checkout while embedding");
+    inflight_body["idempotency_key"] = json!("inflight-operation");
+    let pending_request = request("/v1/memories/idempotent").json(&inflight_body);
+    let pending = tokio::spawn(async move { pending_request.send().await.unwrap() });
+    tokio::time::timeout(Duration::from_secs(15), embedder.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let checkout = request("/v1/branches/main/checkout").send().await.unwrap();
+    // Release before checking to keep failed assertions from stranding the request.
+    embedder.resume.add_permits(1);
+    assert_eq!(checkout.status(), 200);
+    let response = pending.await.unwrap();
+    assert_eq!(response.status(), 201);
+    let inflight: Value = response.json().await.unwrap();
+    assert_eq!(
+        inflight["memory_id"],
+        memoria_service::service::idempotent_memory_id(
+            &owner,
+            Some("reviewb"),
+            "inflight-operation"
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        sql.list_active_from(&table, &owner, 10)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(sql
+        .list_active_from(&main, &owner, 10)
+        .await
+        .unwrap()
+        .is_empty());
+    inflight_body["branch"] = json!("reviewb");
+    let response = request("/v1/memories/idempotent")
+        .json(&inflight_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["memory_id"],
+        inflight["memory_id"]
+    );
+    // The same key in main has a separate identity, even with identical payload.
+    let response = request("/v1/memories/idempotent")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    let main_receipt: Value = response.json().await.unwrap();
+    assert_ne!(main_receipt["memory_id"], implicit["memory_id"]);
+    explicit_body["branch"] = json!("main");
+    let response = request("/v1/memories/idempotent")
+        .json(&explicit_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["memory_id"],
+        main_receipt["memory_id"]
+    );
+    assert_eq!(
+        sql.list_active_from(&main, &owner, 10).await.unwrap().len(),
+        1
+    );
+    explicit_body["branch"] = json!("missing-branch");
+    assert_eq!(
+        request("/v1/memories/idempotent")
+            .json(&explicit_body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+}
+
 #[tokio::test]
 async fn owner_scoped_store_replays_real_receipts_and_rejects_missing_keys() {
     let master = "idempotent-store-test-master";

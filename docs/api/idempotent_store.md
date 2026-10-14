@@ -5,7 +5,15 @@
 memory-write permission, owner-only deployment authentication, branch validation,
 sensitivity checks and user database routing as ordinary memory writes.
 
-The authenticated owner and branch scope the key. Clients cannot choose another
+The authenticated owner and resolved storage branch scope the key. An omitted or
+blank branch follows the current checkout; specifying that same branch explicitly
+replays the same receipt. The operation freezes the routed SQL store and branch
+table before embedding, so a concurrent checkout cannot retarget the insert or
+conflict lookup. An invalid/deleted branch fails instead of silently moving a keyed
+write to another branch. Clients needing a stable scope across separate retries
+must specify it explicitly (for example, `"branch": "main"`).
+
+Clients cannot choose another
 owner through JSON. Successful retries return the same persisted memory ID.
 Concurrent requests use the memory primary key to arbitrate one insertion;
 only the insertion winner reports a new memory and schedules entity extraction.
@@ -23,7 +31,7 @@ reactivates an inactive receipt. The guarantee depends on retaining the record/t
 physical database or record erasure ends that receipt's lifetime. Account/branch
 retention and deletion policies remain authoritative.
 
-Protocol v1 encodes `["memoria.store.v1", owner, branch_or_main, key]` as compact
+Protocol v1 encodes `["memoria.store.v1", owner, resolved_branch, key]` as compact
 JSON, hashes it with SHA-256 and uses the first 16 bytes as a lowercase 32-character
 hex memory ID. A caller can reject a successful response with an incompatible ID
 before treating it as a write receipt. The identity is an operation key, not an
@@ -44,6 +52,7 @@ Example (the token remains in the application's credential boundary):
   "memory_type": "episodic",
   "session_id": "session-example",
   "trust_tier": "T3",
+  "branch": "main",
   "idempotency_key": "session-example:episode:revision-1"
 }
 ```

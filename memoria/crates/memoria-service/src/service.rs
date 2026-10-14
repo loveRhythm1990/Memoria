@@ -1364,7 +1364,6 @@ impl MemoryService {
         }
         reject_reserved_metadata(extra_metadata.as_ref())?;
         let idempotency = if let Some(key) = idempotency_key {
-            let id = idempotent_memory_id(user_id, branch, key)?;
             if self.sql_store.is_none() {
                 return Err(MemoriaError::Validation(
                     "idempotent writes require SQL storage".into(),
@@ -1389,14 +1388,23 @@ impl MemoryService {
             payload.sort_all_objects();
             let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&payload)?));
             let sql = self.user_sql_store(user_id).await?;
-            let table = sql.table_for_branch(user_id, branch).await?;
+            // Snapshot checkout once. Explicit resolution uses that same branch,
+            // never another read of the mutable active-branch pointer after embed.
+            let resolved_branch = match branch.map(str::trim).filter(|branch| !branch.is_empty()) {
+                Some(branch) => branch.to_owned(),
+                None => sql.active_branch_name(user_id).await?,
+            };
+            let id = idempotent_memory_id(user_id, Some(&resolved_branch), key)?;
+            let table = sql
+                .table_for_branch(user_id, Some(&resolved_branch))
+                .await?;
             if let Some(existing) = sql.get_from(&table, &id).await? {
                 return validate_idempotent_receipt(existing, user_id, &hash);
             }
             extra_metadata
                 .get_or_insert_with(HashMap::new)
                 .insert(STORE_REQUEST_HASH_FIELD.into(), serde_json::json!(hash));
-            Some((id, hash))
+            Some((id, hash, sql, table))
         } else {
             None
         };
@@ -1420,7 +1428,7 @@ impl MemoryService {
         let memory = Memory {
             memory_id: idempotency
                 .as_ref()
-                .map(|(id, _)| id.clone())
+                .map(|(id, ..)| id.clone())
                 .unwrap_or_else(|| Uuid::now_v7().simple().to_string()),
             user_id: user_id.to_string(),
             author_id,
@@ -1442,42 +1450,42 @@ impl MemoryService {
             trust_tier: effective_tier,
             retrieval_score: None,
         };
+        if let Some((id, hash, sql, table)) = idempotency {
+            // INSERT's primary key arbitrates concurrent instances and lost
+            // acknowledgments. Never resurrect an inactive/deleted receipt.
+            match sql.insert_into(&table, &memory).await {
+                Ok(()) => {
+                    let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
+                    self.send_edit_log(
+                        user_id,
+                        "inject",
+                        Some(&id),
+                        Some(&payload),
+                        "store_memory:idempotent",
+                        None,
+                    );
+                    self.report(StatsEvent::MemoryStored {
+                        user_id: user_id.into(),
+                        memory_type: memory.memory_type.to_string(),
+                        trust_tier: memory.trust_tier.to_string(),
+                    });
+                    self.enqueue_entity_extraction(user_id, &id, &memory.content)
+                        .await;
+                    return Ok(memory);
+                }
+                Err(error) => {
+                    if let Some(existing) = sql.get_from(&table, &id).await? {
+                        return validate_idempotent_receipt(existing, user_id, &hash);
+                    }
+                    return Err(error);
+                }
+            }
+        }
         // Dedup: if embedding exists, check for near-duplicate and supersede
         // TODO(concurrency): race between dedup check and insert can create duplicates
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
             let table = sql.table_for_branch(user_id, branch).await?;
-            if let Some((id, hash)) = idempotency {
-                // INSERT's primary key arbitrates concurrent instances and lost
-                // acknowledgments. Never resurrect an inactive/deleted receipt.
-                match sql.insert_into(&table, &memory).await {
-                    Ok(()) => {
-                        let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
-                        self.send_edit_log(
-                            user_id,
-                            "inject",
-                            Some(&id),
-                            Some(&payload),
-                            "store_memory:idempotent",
-                            None,
-                        );
-                        self.report(StatsEvent::MemoryStored {
-                            user_id: user_id.into(),
-                            memory_type: memory.memory_type.to_string(),
-                            trust_tier: memory.trust_tier.to_string(),
-                        });
-                        self.enqueue_entity_extraction(user_id, &id, &memory.content)
-                            .await;
-                        return Ok(memory);
-                    }
-                    Err(error) => {
-                        if let Some(existing) = sql.get_from(&table, &id).await? {
-                            return validate_idempotent_receipt(existing, user_id, &hash);
-                        }
-                        return Err(error);
-                    }
-                }
-            }
             if let Some(ref emb) = memory.embedding {
                 // L2 threshold from cosine similarity 0.95: sqrt(2*(1-0.95)) ≈ 0.3162
                 // Only supersede near-identical memories, not contradictions.
@@ -3630,6 +3638,8 @@ fn reject_reserved_metadata(
 
 /// Protocol v1 uses the first 128 SHA-256 bits as a 32-character memory ID.
 /// The backend derives the owner from authentication, never from request JSON.
+/// Callers must supply the resolved branch; `None` is an explicit main shorthand,
+/// not a request to follow a mutable checkout pointer.
 pub fn idempotent_memory_id(
     user_id: &str,
     branch: Option<&str>,
