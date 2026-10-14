@@ -233,6 +233,22 @@ pub async fn fulltext_search_memories(
     Ok(Json(memories.into_iter().map(Into::into).collect()))
 }
 
+/// Separate route rejects old servers before they can perform a non-idempotent
+/// write. All normal authentication, owner scoping and validation still apply.
+pub async fn store_memory_idempotent(
+    state: State<AppState>,
+    auth: AuthUser,
+    request: Json<StoreRequest>,
+) -> Result<(StatusCode, Json<MemoryResponse>), (StatusCode, String)> {
+    if request.idempotency_key.is_none() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "idempotency_key is required".into(),
+        ));
+    }
+    store_memory(state, auth, request).await
+}
+
 pub async fn store_memory(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -267,7 +283,7 @@ pub async fn store_memory(
     };
     let m = state
         .service
-        .store_memory_with_metadata_on_branch(
+        .store_memory_with_metadata_and_key_on_branch(
             auth.scope_id(),
             branch_param(req.branch.as_deref()),
             &req.content,
@@ -279,6 +295,7 @@ pub async fn store_memory(
             author,
             req.subject_id,
             req.extra_metadata,
+            req.idempotency_key.as_deref(),
         )
         .await
         .map_err(|e| {
@@ -295,6 +312,16 @@ pub async fn batch_store(
     auth: AuthUser,
     Json(req): Json<BatchStoreRequest>,
 ) -> Result<(StatusCode, Json<Vec<MemoryResponse>>), (StatusCode, String)> {
+    if req
+        .memories
+        .iter()
+        .any(|memory| memory.idempotency_key.is_some())
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "idempotency_key requires the single-memory store endpoint".into(),
+        ));
+    }
     if req.memories.len() > 100 {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,

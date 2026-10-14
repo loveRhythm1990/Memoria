@@ -1313,6 +1313,42 @@ impl MemoryService {
         subject_id: Option<String>,
         extra_metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
     ) -> Result<Memory, MemoriaError> {
+        self.store_memory_with_metadata_and_key_on_branch(
+            user_id,
+            branch,
+            content,
+            memory_type,
+            session_id,
+            trust_tier,
+            observed_at,
+            initial_confidence,
+            author_id,
+            subject_id,
+            extra_metadata,
+            None,
+        )
+        .await
+    }
+
+    /// Atomic, owner/branch-scoped retry receipts. The memory primary key is
+    /// deterministic; approximate/vector deduplication is deliberately bypassed.
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(skip_all)]
+    pub async fn store_memory_with_metadata_and_key_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        content: &str,
+        memory_type: MemoryType,
+        session_id: Option<String>,
+        trust_tier: Option<TrustTier>,
+        observed_at: Option<DateTime<Utc>>,
+        initial_confidence: Option<f64>,
+        author_id: Option<String>,
+        subject_id: Option<String>,
+        mut extra_metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
+        idempotency_key: Option<&str>,
+    ) -> Result<Memory, MemoriaError> {
         let subject_id = normalize_opt_string(subject_id);
         if let Some(ref sid) = subject_id {
             if sid.len() > 128 {
@@ -1326,6 +1362,49 @@ impl MemoryService {
                 "content exceeds 32 KiB limit".into(),
             ));
         }
+        let idempotency = if let Some(key) = idempotency_key {
+            let id = idempotent_memory_id(user_id, branch, key)?;
+            if self.sql_store.is_none() {
+                return Err(MemoriaError::Validation(
+                    "idempotent writes require SQL storage".into(),
+                ));
+            }
+            if extra_metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.contains_key(STORE_REQUEST_HASH_FIELD))
+            {
+                return Err(MemoriaError::Validation(
+                    "reserved idempotency metadata field".into(),
+                ));
+            }
+            use sha2::{Digest, Sha256};
+            let payload = serde_json::json!([
+                content,
+                memory_type.to_string(),
+                session_id,
+                trust_tier
+                    .as_ref()
+                    .unwrap_or(&TrustTier::T1Verified)
+                    .to_string(),
+                observed_at,
+                initial_confidence,
+                author_id,
+                subject_id,
+                extra_metadata
+            ]);
+            let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&payload)?));
+            let sql = self.user_sql_store(user_id).await?;
+            let table = sql.table_for_branch(user_id, branch).await?;
+            if let Some(existing) = sql.get_from(&table, &id).await? {
+                return validate_idempotent_receipt(existing, user_id, &hash);
+            }
+            extra_metadata
+                .get_or_insert_with(HashMap::new)
+                .insert(STORE_REQUEST_HASH_FIELD.into(), serde_json::json!(hash));
+            Some((id, hash))
+        } else {
+            None
+        };
         let t0 = std::time::Instant::now();
         // Sensitivity check — block HIGH tier, redact MEDIUM tier
         let sensitivity = check_sensitivity(content);
@@ -1344,7 +1423,10 @@ impl MemoryService {
         let embedding = self.embed(content).await?;
         let t_embed = t0.elapsed();
         let memory = Memory {
-            memory_id: Uuid::now_v7().simple().to_string(),
+            memory_id: idempotency
+                .as_ref()
+                .map(|(id, _)| id.clone())
+                .unwrap_or_else(|| Uuid::now_v7().simple().to_string()),
             user_id: user_id.to_string(),
             author_id,
             subject_id,
@@ -1370,6 +1452,37 @@ impl MemoryService {
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
             let table = sql.table_for_branch(user_id, branch).await?;
+            if let Some((id, hash)) = idempotency {
+                // INSERT's primary key arbitrates concurrent instances and lost
+                // acknowledgments. Never resurrect an inactive/deleted receipt.
+                match sql.insert_into(&table, &memory).await {
+                    Ok(()) => {
+                        let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
+                        self.send_edit_log(
+                            user_id,
+                            "inject",
+                            Some(&id),
+                            Some(&payload),
+                            "store_memory:idempotent",
+                            None,
+                        );
+                        self.report(StatsEvent::MemoryStored {
+                            user_id: user_id.into(),
+                            memory_type: memory.memory_type.to_string(),
+                            trust_tier: memory.trust_tier.to_string(),
+                        });
+                        self.enqueue_entity_extraction(user_id, &id, &memory.content)
+                            .await;
+                        return Ok(memory);
+                    }
+                    Err(error) => {
+                        if let Some(existing) = sql.get_from(&table, &id).await? {
+                            return validate_idempotent_receipt(existing, user_id, &hash);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
             if let Some(ref emb) = memory.embedding {
                 // L2 threshold from cosine similarity 0.95: sqrt(2*(1-0.95)) ≈ 0.3162
                 // Only supersede near-identical memories, not contradictions.
@@ -1493,8 +1606,12 @@ impl MemoryService {
                                 memory_type: memory.memory_type.to_string(),
                                 trust_tier: memory.trust_tier.to_string(),
                             });
-                            self.enqueue_entity_extraction(user_id, &memory.memory_id, &memory.content)
-                                .await;
+                            self.enqueue_entity_extraction(
+                                user_id,
+                                &memory.memory_id,
+                                &memory.content,
+                            )
+                            .await;
                             return Ok(memory);
                         }
                     }
@@ -3499,5 +3616,73 @@ impl MemoryService {
     ) -> Result<Vec<memoria_storage::TierFeedback>, MemoriaError> {
         let sql = self.user_sql_store(user_id).await?;
         sql.get_feedback_by_tier(user_id).await
+    }
+}
+
+const STORE_REQUEST_HASH_FIELD: &str = "_memoria_store_request_sha256";
+
+/// Protocol v1 uses the first 128 SHA-256 bits as a 32-character memory ID.
+/// The backend derives the owner from authentication, never from request JSON.
+pub fn idempotent_memory_id(
+    user_id: &str,
+    branch: Option<&str>,
+    key: &str,
+) -> Result<String, MemoriaError> {
+    if key.is_empty() || key.len() > 128 || !key.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(MemoriaError::Validation(
+            "idempotency_key must contain 1..128 ASCII graphic bytes".into(),
+        ));
+    }
+    use sha2::{Digest, Sha256};
+    let identity = serde_json::json!(["memoria.store.v1", user_id, branch.unwrap_or("main"), key]);
+    let digest = Sha256::digest(serde_json::to_vec(&identity)?);
+    Ok(digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn validate_idempotent_receipt(
+    memory: Memory,
+    owner: &str,
+    request_hash: &str,
+) -> Result<Memory, MemoriaError> {
+    if memory.user_id != owner
+        || !memory.is_active
+        || memory
+            .extra_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(STORE_REQUEST_HASH_FIELD))
+            .and_then(serde_json::Value::as_str)
+            != Some(request_hash)
+    {
+        return Err(MemoriaError::Validation(
+            "idempotency_key was already used for another payload or an inactive receipt".into(),
+        ));
+    }
+    Ok(memory)
+}
+
+#[cfg(test)]
+mod idempotency_tests {
+    use super::idempotent_memory_id;
+    #[test]
+    fn stable_receipts_are_owner_branch_scoped_and_keys_are_exact() {
+        assert_eq!(
+            idempotent_memory_id("owner-a", None, "operation-a").unwrap(),
+            "2015485c7a5b7d3edaf5f9e3b0365b69"
+        );
+        assert_ne!(
+            idempotent_memory_id("owner-a", None, "operation-a").unwrap(),
+            idempotent_memory_id("owner-b", None, "operation-a").unwrap()
+        );
+        assert_ne!(
+            idempotent_memory_id("owner-a", None, "operation-a").unwrap(),
+            idempotent_memory_id("owner-a", Some("branch-b"), "operation-a").unwrap()
+        );
+        for key in ["", " padded", "line\n", "non-ascii-中文"] {
+            assert!(idempotent_memory_id("owner-a", None, key).is_err());
+        }
+        assert!(idempotent_memory_id("owner-a", None, &"x".repeat(129)).is_err());
     }
 }

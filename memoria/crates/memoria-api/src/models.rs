@@ -10,6 +10,9 @@ use std::str::FromStr;
 
 #[derive(Deserialize)]
 pub struct StoreRequest {
+    /// Stable owner/branch-scoped write identity; retries return the same receipt.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
     pub content: String,
     #[serde(default = "default_memory_type")]
     pub memory_type: String,

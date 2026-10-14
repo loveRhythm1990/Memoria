@@ -126,6 +126,7 @@ fn should_mark_metrics_dirty(
     if method == "POST" {
         return match path {
             "/v1/memories"
+            | "/v1/memories/idempotent"
             | "/v1/memories/batch"
             | "/v1/memories/correct"
             | "/v1/memories/purge"
@@ -195,6 +196,10 @@ pub fn build_router(state: AppState) -> Router {
     // In group mode these are forbidden when checked-out on `main`.
     let write_routes = Router::new()
         .route("/v1/memories", post(routes::memory::store_memory))
+        .route(
+            "/v1/memories/idempotent",
+            post(routes::memory::store_memory_idempotent),
+        )
         .route("/v1/memories/batch", post(routes::memory::batch_store))
         .route(
             "/v1/memories/correct",

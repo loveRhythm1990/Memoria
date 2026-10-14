@@ -353,6 +353,7 @@ pub async fn group_main_write_guard(
                         let branch_aware_body_route = matches!(
                             path,
                             "/v1/memories"
+                                | "/v1/memories/idempotent"
                                 | "/v1/memories/batch"
                                 | "/v1/memories/correct"
                                 | "/v1/memories/purge"
