@@ -224,3 +224,91 @@ async fn shared_migrate_is_idempotent_for_async_task_user_id() {
     .expect("query async task user_id column count");
     assert_eq!(user_id_column_count, 1);
 }
+
+// Exercise first access without caller retries. Use distinct users to keep
+// cross-session visibility independent of same-user initialization races.
+#[tokio::test]
+async fn router_initializes_distinct_fresh_users_without_retry() {
+    let shared_url = shared_db_url();
+    let router = DbRouter::connect(&shared_url, test_dim(), Uuid::new_v4().to_string())
+        .await
+        .expect("connect router");
+    let mut outcomes = Vec::new();
+    for _ in 0..16 {
+        let users: Vec<_> = (0..4)
+            .map(|_| format!("schema_init_{}", Uuid::new_v4().simple()))
+            .collect();
+        let results = futures::future::join_all(users.iter().map(|user| {
+            let router = router.clone();
+            async move {
+                let store = router.user_store(user).await?;
+                let memory = make_memory(
+                    &Uuid::new_v4().to_string(),
+                    "schema initialization probe",
+                    user,
+                );
+                store.insert(&memory).await?;
+                assert!(store.get(&memory.memory_id).await?.is_some());
+                Ok::<_, memoria_core::MemoriaError>(())
+            }
+        }))
+        .await;
+        for user in &users {
+            sqlx::raw_sql(&format!(
+                "DROP DATABASE IF EXISTS `{}`",
+                DbRouter::user_db_name_for_id(user)
+            ))
+            .execute(router.shared_pool())
+            .await
+            .expect("clean up test user database");
+        }
+        outcomes.extend(results);
+    }
+    sqlx::raw_sql(&format!("DROP DATABASE `{}`", router.shared_db_name()))
+        .execute(router.shared_pool())
+        .await
+        .expect("clean up test registry database");
+    for result in outcomes {
+        assert!(
+            result.is_ok(),
+            "fresh-user initialization failed: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn router_initializes_one_fresh_user_under_concurrent_access() {
+    let router = DbRouter::connect(&shared_db_url(), test_dim(), Uuid::new_v4().to_string())
+        .await
+        .expect("connect router");
+    let user = format!("schema_race_{}", Uuid::new_v4().simple());
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..16 {
+        let router = router.clone();
+        let user = user.clone();
+        let barrier = barrier.clone();
+        tasks.spawn(async move {
+            barrier.wait().await;
+            router.user_store(&user).await
+        });
+    }
+    let mut outcomes = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        outcomes.push(result.expect("join initialization"));
+    }
+    sqlx::raw_sql(&format!(
+        "DROP DATABASE IF EXISTS `{}`",
+        DbRouter::user_db_name_for_id(&user)
+    ))
+    .execute(router.shared_pool())
+    .await
+    .expect("clean up test user database");
+    sqlx::raw_sql(&format!("DROP DATABASE `{}`", router.shared_db_name()))
+        .execute(router.shared_pool())
+        .await
+        .expect("clean up test registry database");
+    for result in outcomes {
+        assert!(result.is_ok(), "same-user initialization failed");
+    }
+}
