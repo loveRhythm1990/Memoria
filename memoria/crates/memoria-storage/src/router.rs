@@ -8,7 +8,10 @@ use chrono::Utc;
 use memoria_core::MemoriaError;
 use moka::sync::Cache;
 use sha2::{Digest, Sha256};
-use sqlx::{mysql::MySqlPoolOptions, MySqlPool, Row};
+use sqlx::{
+    mysql::{MySqlConnectOptions, MySqlPoolOptions},
+    MySqlPool, Row,
+};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -121,14 +124,14 @@ impl DbRouter {
             "MEMORIA_GLOBAL_USER_POOL_MAX",
             MultiDbPoolKind::GlobalUser,
         );
-        let global_url = append_url_param(shared_db_url, "statement_cache_capacity=0");
+        let user_options = user_pool_options(shared_db_url)?;
         let global_user_pool = MySqlPoolOptions::new()
             .max_connections(global_max)
             .min_connections(global_max.min(2))
             .max_lifetime(std::time::Duration::from_secs(3600))
             .idle_timeout(std::time::Duration::from_secs(300))
             .acquire_timeout(std::time::Duration::from_secs(15))
-            .connect(&global_url)
+            .connect_with(user_options.clone())
             .await
             .map_err(db_err)?;
         tracing::info!(
@@ -153,7 +156,7 @@ impl DbRouter {
             .max_lifetime(std::time::Duration::from_secs(3600))
             .idle_timeout(std::time::Duration::from_secs(300))
             .acquire_timeout(std::time::Duration::from_secs(30))
-            .connect(&global_url)
+            .connect_with(user_options)
             .await
             .map_err(db_err)?;
         tracing::info!(
@@ -719,12 +722,14 @@ fn quote_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 
-fn append_url_param(url: &str, param: &str) -> String {
-    if url.contains('?') {
-        format!("{url}&{param}")
-    } else {
-        format!("{url}?{param}")
-    }
+fn user_pool_options(database_url: &str) -> Result<MySqlConnectOptions, MemoriaError> {
+    // Use the typed setter: the URL parser ignores unknown keys, including the
+    // Rust-style `statement_cache_capacity` spelling. Override any URL setting
+    // consistently for both the shared user-query pool and schema-init pool.
+    Ok(database_url
+        .parse::<MySqlConnectOptions>()
+        .map_err(db_err)?
+        .statement_cache_capacity(0))
 }
 
 fn configured_shared_pool_plan() -> SharedPoolPlan {
@@ -781,12 +786,53 @@ fn configured_shared_pool_plan() -> SharedPoolPlan {
 #[cfg(test)]
 mod tests {
     use super::{
-        configured_shared_pool_plan, SharedPoolPlan, MERGED_SHARED_POOL_MAX_CONNECTIONS_ENV,
+        configured_shared_pool_plan, user_pool_options, SharedPoolPlan,
+        MERGED_SHARED_POOL_MAX_CONNECTIONS_ENV,
     };
     use crate::pool_config::{
         configured_multi_db_pool_size, multi_db_pool_default_size, MultiDbPoolKind,
     };
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn routed_pool_options_disable_statement_cache_and_preserve_url_settings() {
+        use sqlx::ConnectOptions;
+        for suffix in [
+            "",
+            "?statement-cache-capacity=17",
+            "?statement_cache_capacity=0",
+        ] {
+            let url = format!("mysql://localhost/test_schema{suffix}");
+            let options = user_pool_options(&url).expect("valid test URL");
+            let parsed = options.to_url_lossy();
+            assert_eq!(parsed.host_str(), Some("localhost"));
+            assert_eq!(parsed.path(), "/test_schema");
+            assert_eq!(
+                parsed
+                    .query_pairs()
+                    .find(|(key, _)| key == "statement-cache-capacity")
+                    .map(|(_, value)| value.into_owned()),
+                Some("0".into())
+            );
+        }
+    }
+
+    #[test]
+    fn routed_pool_options_keep_transport_settings() {
+        use sqlx::ConnectOptions;
+        let options = user_pool_options(
+            "mysql://localhost:3307/test_schema?ssl-mode=REQUIRED&charset=latin1&statement-cache-capacity=17"
+        ).expect("valid test URL");
+        let parsed = options.to_url_lossy();
+        assert_eq!(parsed.port(), Some(3307));
+        let params: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(params.get("ssl-mode").map(String::as_str), Some("REQUIRED"));
+        assert_eq!(params.get("charset").map(String::as_str), Some("latin1"));
+        assert_eq!(
+            params.get("statement-cache-capacity").map(String::as_str),
+            Some("0")
+        );
+    }
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 

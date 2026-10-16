@@ -9,6 +9,7 @@ use crate::io::MySqlBufExt;
 use crate::io::{ProtocolDecode, ProtocolEncode};
 use crate::net::{BufferedSocket, Socket};
 use crate::protocol::response::{EofPacket, ErrPacket, OkPacket, Status};
+use crate::protocol::statement::StmtClose;
 use crate::protocol::{Capabilities, Packet};
 use crate::{MySqlConnectOptions, MySqlDatabaseError};
 
@@ -19,6 +20,7 @@ pub struct MySqlStream<S = Box<dyn Socket>> {
     pub(super) capabilities: Capabilities,
     pub(crate) sequence_id: u8,
     pub(crate) waiting: VecDeque<Waiting>,
+    pub(crate) pending_statement_close: Option<u32>,
     pub(crate) charset: CharSet,
     pub(crate) collation: Collation,
     pub(crate) is_tls: bool,
@@ -59,6 +61,7 @@ impl<S: Socket> MySqlStream<S> {
 
         Self {
             waiting: VecDeque::new(),
+            pending_statement_close: None,
             capabilities,
             server_version: (0, 0, 0),
             sequence_id: 0,
@@ -103,6 +106,13 @@ impl<S: Socket> MySqlStream<S> {
                     self.skip_result_metadata(packet).await?;
                 }
             }
+        }
+
+        // Do not pipeline COM_STMT_CLOSE ahead of an outstanding execute
+        // response. MatrixOne can otherwise return an invalid result stream.
+        // This also handles callers that drop a row stream before consuming it.
+        if let Some(statement) = self.pending_statement_close.take() {
+            self.send_packet(StmtClose { statement }).await?;
         }
 
         Ok(())
@@ -222,6 +232,7 @@ impl<S: Socket> MySqlStream<S> {
             capabilities: self.capabilities,
             sequence_id: self.sequence_id,
             waiting: self.waiting,
+            pending_statement_close: self.pending_statement_close,
             charset: self.charset,
             collation: self.collation,
             is_tls: self.is_tls,

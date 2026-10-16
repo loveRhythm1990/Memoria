@@ -137,6 +137,10 @@ impl MySqlConnection {
                         .prepare_statement(sql)
                         .await?;
 
+                    // Keep the ID until its execute response has been drained,
+                    // including when a caller stops reading or cancels the query.
+                    self.inner.stream.pending_statement_close = Some(id);
+
                     // https://dev.mysql.com/doc/internals/en/com-stmt-execute.html
                     self.inner.stream
                         .send_packet(StatementExecute {
@@ -144,8 +148,6 @@ impl MySqlConnection {
                             arguments: &arguments,
                         })
                         .await?;
-
-                    self.inner.stream.send_packet(StmtClose { statement: id }).await?;
 
                     (metadata.column_names, MySqlValueFormat::Binary, false)
                 }
@@ -183,6 +185,7 @@ impl MySqlConnection {
                     }
 
                     self.inner.stream.waiting.pop_front();
+                    self.inner.stream.wait_until_ready().await?;
                     return Ok(());
                 }
 
@@ -224,6 +227,7 @@ impl MySqlConnection {
                         }
 
                         self.inner.stream.waiting.pop_front();
+                        self.inner.stream.wait_until_ready().await?;
                         return Ok(());
                     }
 

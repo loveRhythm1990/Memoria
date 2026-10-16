@@ -54,4 +54,6 @@ memoria-test-utils = { path = "crates/memoria-test-utils" }
 # which is non-standard (MySQL uses 0xf5 for JSON). This patch maps 0xf1 -> Blob
 # so sqlx can decode the result set without panicking.
 # Filed as MatrixOne bug: data branch diff uses inconsistent column type codes.
+# Also defer uncached COM_STMT_CLOSE until the execute response is drained:
+# pipelining CLOSE before reading the response breaks MatrixOne result decoding.
 sqlx-mysql = { path = "vendor/sqlx-mysql" }

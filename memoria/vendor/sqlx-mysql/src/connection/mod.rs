@@ -116,6 +116,7 @@ impl Connection for MySqlConnection {
     #[doc(hidden)]
     fn should_flush(&self) -> bool {
         !self.inner.stream.write_buffer().is_empty()
+            || self.inner.stream.pending_statement_close.is_some()
     }
 
     fn begin(&mut self) -> BoxFuture<'_, Result<Transaction<'_, Self::Database>, Error>>
