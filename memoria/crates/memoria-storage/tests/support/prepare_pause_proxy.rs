@@ -68,6 +68,10 @@ impl PreparePauseProxy {
         }
     }
 
+    pub async fn stall_prepare_write(options: MySqlConnectOptions) -> Self {
+        Self::start(options, PAUSED).await
+    }
+
     pub fn arm(&self) {
         self.control.armed.store(true, Ordering::SeqCst);
     }
@@ -100,13 +104,29 @@ impl Drop for PreparePauseProxy {
     }
 }
 
-async fn packet(reader: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Vec<u8>> {
+async fn packet(
+    reader: &mut (impl AsyncRead + Unpin),
+    pause_write: Option<&Control>,
+) -> std::io::Result<Vec<u8>> {
     let mut header = [0_u8; 4];
     reader.read_exact(&mut header).await?;
     let len = header[0] as usize | (header[1] as usize) << 8 | (header[2] as usize) << 16;
     let mut bytes = vec![0; len + 4];
     bytes[..4].copy_from_slice(&header);
-    reader.read_exact(&mut bytes[4..]).await?;
+    if len > 0 {
+        reader.read_exact(&mut bytes[4..5]).await?;
+        if header[3] == 0 && bytes[4] == 0x16 {
+            if let Some(control) = pause_write {
+                if control.armed.swap(false, Ordering::SeqCst) {
+                    // Stop reading the request body so the client's send buffer
+                    // fills. The test aborts this proxy after verifying replacement.
+                    control.paused.notify_one();
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+        reader.read_exact(&mut bytes[5..]).await?;
+    }
     Ok(bytes)
 }
 
@@ -122,7 +142,8 @@ async fn session(
     let requests_phase = phase.clone();
     let requests_control = control.clone();
     let requests = async move {
-        while let Ok(bytes) = packet(&mut cr).await {
+        let pause_write = (packets_before_pause == PAUSED).then_some(requests_control.as_ref());
+        while let Ok(bytes) = packet(&mut cr, pause_write).await {
             if bytes[3] == 0 && bytes.len() > 4 {
                 if requests_phase.load(Ordering::SeqCst) == PAUSED {
                     requests_control
@@ -141,7 +162,7 @@ async fn session(
     let replies_phase = phase.clone();
     let replies_control = control.clone();
     let replies = async move {
-        while let Ok(bytes) = packet(&mut sr).await {
+        while let Ok(bytes) = packet(&mut sr, None).await {
             let phase = replies_phase.load(Ordering::SeqCst);
             if phase > 0 {
                 if phase == packets_before_pause + 1 {

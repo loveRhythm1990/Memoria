@@ -93,6 +93,11 @@ impl Connection for MySqlConnection {
 
     fn close_hard(mut self) -> BoxFuture<'static, Result<(), Error>> {
         Box::pin(async move {
+            if self.inner.preparing_statement {
+                // A cancelled send may still have buffered PREPARE bytes.
+                // Drop this unusable socket without retrying a possibly blocked write.
+                return Ok(());
+            }
             self.inner.stream.shutdown().await?;
             Ok(())
         })

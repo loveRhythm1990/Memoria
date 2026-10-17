@@ -166,6 +166,49 @@ async fn successful_and_server_rejected_prepares_keep_connection_reusable() {
     conn.close().await.expect("close session");
 }
 
+#[tokio::test]
+async fn pool_discards_cancelled_prepare_without_flushing_blocked_writes() {
+    let proxy = PreparePauseProxy::stall_prepare_write(options(0)).await;
+    let pool = MySqlPoolOptions::new()
+        .max_connections(1)
+        .connect_with(proxy.options.clone())
+        .await
+        .expect("connect pool");
+    let mut conn = pool.acquire().await.expect("acquire connection");
+    // Synthetic SQL larger than local TCP buffering. The proxy reads only its
+    // command byte, so cancellation leaves bytes in SQLx's write buffer.
+    let sql = format!("SELECT 1 /*{}*/", "x".repeat(32 * 1024 * 1024));
+    proxy.arm();
+    {
+        let request = conn.prepare(&sql);
+        tokio::pin!(request);
+        tokio::select! {
+            biased;
+            _ = &mut request => panic!("PREPARE completed despite a blocked request body"),
+            _ = proxy.paused() => {},
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut request)
+                .await
+                .is_err()
+        );
+    }
+    assert!(conn.should_flush(), "must exercise buffered PREPARE bytes");
+    drop(conn);
+    let mut replacement = tokio::time::timeout(Duration::from_secs(2), pool.acquire())
+        .await
+        .expect("discard must not flush a blocked write")
+        .expect("replacement connection");
+    let row = (&mut *replacement)
+        .fetch_one("SELECT CAST(42 AS BIGINT)")
+        .await
+        .expect("query on replacement");
+    assert_eq!(row.try_get::<i64, _>(0).expect("replacement result"), 42);
+    assert_eq!(proxy.connection_count(), 2);
+    drop(replacement);
+    pool.close().await;
+}
+
 fn default_test_url() -> String {
     "mysql://root:111@localhost:6001/memoria_test".to_string()
 }
