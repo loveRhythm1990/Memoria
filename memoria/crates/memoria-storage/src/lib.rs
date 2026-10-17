@@ -1,11 +1,11 @@
 mod branch_capability;
 pub mod graph;
+mod keyed_gates;
 pub mod migration;
 pub mod pool_config;
 pub mod router;
 pub mod store;
 pub mod table_schema;
-mod user_init_locks;
 
 pub use graph::types::{GraphEdge, GraphNode, NodeType};
 pub use graph::{

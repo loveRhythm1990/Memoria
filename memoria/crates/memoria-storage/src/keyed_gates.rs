@@ -1,38 +1,38 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 
-type Registry = Mutex<HashMap<String, Weak<UserInitLock>>>;
+type Registry = Mutex<HashMap<String, Weak<KeyedGate>>>;
 
-/// Gates are shared by router clones and live only while callers hold them.
+/// Gates are shared by callers and live only while callers hold them.
 /// Do not evict live gates: that would let a second initializer bypass waiters.
 #[derive(Clone, Default)]
-pub(crate) struct UserInitLocks {
+pub(crate) struct KeyedGates {
     registry: Arc<Registry>,
 }
 
-pub(crate) struct UserInitLock {
+pub(crate) struct KeyedGate {
     pub(crate) mutex: tokio::sync::Mutex<()>,
-    user_id: String,
+    key: String,
     registry: Weak<Registry>,
 }
 
-impl UserInitLocks {
-    pub(crate) fn get(&self, user_id: &str) -> Arc<UserInitLock> {
+impl KeyedGates {
+    pub(crate) fn get(&self, key: &str) -> Arc<KeyedGate> {
         let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = registry.get(user_id).and_then(Weak::upgrade) {
+        if let Some(entry) = registry.get(key).and_then(Weak::upgrade) {
             return entry;
         }
-        let entry = Arc::new(UserInitLock {
+        let entry = Arc::new(KeyedGate {
             mutex: tokio::sync::Mutex::new(()),
-            user_id: user_id.to_owned(),
+            key: key.to_owned(),
             registry: Arc::downgrade(&self.registry),
         });
-        registry.insert(user_id.to_owned(), Arc::downgrade(&entry));
+        registry.insert(key.to_owned(), Arc::downgrade(&entry));
         entry
     }
 }
 
-impl Drop for UserInitLock {
+impl Drop for KeyedGate {
     fn drop(&mut self) {
         let Some(registry) = self.registry.upgrade() else {
             return;
@@ -41,24 +41,24 @@ impl Drop for UserInitLock {
         // A caller can replace an expired Weak while this destructor waits for
         // the registry lock. Never remove that caller's replacement gate.
         if registry
-            .get(&self.user_id)
+            .get(&self.key)
             .is_some_and(|entry| std::ptr::eq(entry.as_ptr(), self))
         {
-            registry.remove(&self.user_id);
+            registry.remove(&self.key);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{UserInitLock, UserInitLocks};
+    use super::{KeyedGate, KeyedGates};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::oneshot;
 
     #[test]
-    fn router_clones_share_live_gates_and_reclaim_idle_entries() {
-        let locks = UserInitLocks::default();
+    fn clones_share_live_gates_and_reclaim_idle_entries() {
+        let locks = KeyedGates::default();
         let first = locks.get("same-user");
         let second = locks.clone().get("same-user");
         assert!(Arc::ptr_eq(&first, &second));
@@ -75,7 +75,7 @@ mod tests {
 
     #[tokio::test]
     async fn different_users_do_not_share_an_initialization_gate() {
-        let locks = UserInitLocks::default();
+        let locks = KeyedGates::default();
         let first = locks.get("first-user");
         let _guard = first.mutex.lock().await;
         let second = locks.get("second-user");
@@ -85,7 +85,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_a_waiter_preserves_the_active_gate() {
-        let locks = UserInitLocks::default();
+        let locks = KeyedGates::default();
         let first = locks.get("same-user");
         let guard = first.mutex.lock().await;
         let shared = locks.clone();
@@ -106,7 +106,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_an_initializer_releases_its_waiters() {
-        let locks = UserInitLocks::default();
+        let locks = KeyedGates::default();
         let shared = locks.clone();
         let (entered, initialized) = oneshot::channel();
         let initializer = tokio::spawn(async move {
@@ -135,13 +135,13 @@ mod tests {
 
     #[test]
     fn expired_gate_cleanup_does_not_remove_a_replacement() {
-        let locks = UserInitLocks::default();
+        let locks = KeyedGates::default();
         let old = locks.get("same-user");
         // Model replacement after the final strong reference expires but before
         // its destructor obtains the registry mutex.
-        let replacement = Arc::new(UserInitLock {
+        let replacement = Arc::new(KeyedGate {
             mutex: tokio::sync::Mutex::new(()),
-            user_id: "same-user".into(),
+            key: "same-user".into(),
             registry: Arc::downgrade(&locks.registry),
         });
         locks
@@ -156,8 +156,8 @@ mod tests {
     }
 
     #[test]
-    fn gate_can_outlive_the_router_registry() {
-        let locks = UserInitLocks::default();
+    fn gate_can_outlive_the_registry() {
+        let locks = KeyedGates::default();
         let entry = locks.get("same-user");
         drop(locks);
         drop(entry);
