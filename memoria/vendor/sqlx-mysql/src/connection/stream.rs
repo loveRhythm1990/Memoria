@@ -40,6 +40,22 @@ pub(crate) enum Waiting {
     Rollback(String),
 }
 
+// An ERR terminates an outstanding response, never an unsent cleanup command.
+// Exchanges such as authentication, ping and explicit PREPARE can have no
+// query-response entry, so an empty queue is also valid.
+fn complete_error_response(waiting: &mut VecDeque<Waiting>) -> Result<(), Error> {
+    match waiting.front() {
+        Some(Waiting::Result | Waiting::Row) => {
+            waiting.pop_front();
+            Ok(())
+        }
+        None => Ok(()),
+        Some(Waiting::Close(_) | Waiting::Rollback(_)) => Err(err_protocol!(
+            "received ERR with a deferred command at the front of the response queue"
+        )),
+    }
+}
+
 impl<S: Socket> MySqlStream<S> {
     pub(crate) fn with_socket(
         charset: CharSet,
@@ -190,13 +206,10 @@ impl<S: Socket> MySqlStream<S> {
             .ok_or(err_protocol!("Packet empty"))?
             .eq(&0xff)
         {
-            self.waiting.pop_front();
-
-            // instead of letting this packet be looked at everywhere, we check here
-            // and emit a proper Error
-            return Err(
-                MySqlDatabaseError(ErrPacket::decode_with(payload, self.capabilities)?).into(),
-            );
+            // Decode first: malformed ERR packets must not advance queue state.
+            let error = ErrPacket::decode_with(payload, self.capabilities)?;
+            complete_error_response(&mut self.waiting)?;
+            return Err(MySqlDatabaseError(error).into());
         }
 
         Ok(Packet(payload))
@@ -258,5 +271,48 @@ impl<S> Deref for MySqlStream<S> {
 impl<S> DerefMut for MySqlStream<S> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.socket
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{complete_error_response, Waiting};
+    use crate::Error;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn error_completes_only_the_active_response() {
+        for response in [Waiting::Result, Waiting::Row] {
+            let mut waiting = VecDeque::from([
+                response,
+                Waiting::Close(7),
+                Waiting::Rollback("ROLLBACK".into()),
+            ]);
+            complete_error_response(&mut waiting).unwrap();
+            assert_eq!(
+                waiting,
+                VecDeque::from([Waiting::Close(7), Waiting::Rollback("ROLLBACK".into()),])
+            );
+        }
+    }
+
+    #[test]
+    fn error_without_a_queued_query_response_is_valid() {
+        let mut waiting = VecDeque::new();
+        complete_error_response(&mut waiting).unwrap();
+        assert!(waiting.is_empty());
+    }
+
+    #[test]
+    fn error_never_discards_a_deferred_command() {
+        for command in [Waiting::Close(7), Waiting::Rollback("ROLLBACK".into())] {
+            let mut waiting = VecDeque::from([command, Waiting::Result]);
+            let original = format!("{waiting:?}");
+            assert!(matches!(
+                complete_error_response(&mut waiting),
+                Err(Error::Protocol(_))
+            ));
+            assert_eq!(format!("{waiting:?}"), original);
+        }
     }
 }

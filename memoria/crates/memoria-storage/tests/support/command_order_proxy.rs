@@ -12,6 +12,8 @@ use tokio::{
     task::JoinHandle,
 };
 
+const CLIENT_DEPRECATE_EOF: u32 = 1 << 24;
+
 #[derive(Default)]
 struct State {
     armed: bool,
@@ -119,7 +121,7 @@ async fn proxy_session(
                 if handshake {
                     assert!(bytes.len() >= 8);
                     let capabilities = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-                    state.deprecate_eof = capabilities & (1 << 24) != 0;
+                    state.deprecate_eof = capabilities & CLIENT_DEPRECATE_EOF != 0;
                     handshake = false;
                 } else if bytes[3] == 0 && bytes.len() > 4 {
                     let command = bytes[4];

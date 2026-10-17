@@ -160,6 +160,8 @@ impl Connection for MySqlConnection {
 
     #[doc(hidden)]
     fn should_flush(&self) -> bool {
+        // Keep the Connection trait's pending-work report accurate. Typed MySQL
+        // pool return drains through ping(), not by consulting this method.
         !self.inner.stream.write_buffer().is_empty() || !self.inner.stream.waiting.is_empty()
     }
 
