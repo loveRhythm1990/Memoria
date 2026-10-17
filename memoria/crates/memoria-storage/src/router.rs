@@ -1,9 +1,9 @@
+use crate::keyed_gates::KeyedGates;
 use crate::pool_config::{
     configured_multi_db_pool_budget, configured_multi_db_pool_size, multi_db_pool_default_size,
     multi_db_pool_max_size, split_pool_budget, MultiDbPoolKind, MULTI_DB_POOL_BUDGET_MAX,
 };
 use crate::store::spawn_pool_monitor;
-use crate::user_init_locks::UserInitLocks;
 use crate::{PoolHealthSnapshot, SqlMemoryStore};
 use chrono::Utc;
 use memoria_core::MemoriaError;
@@ -35,6 +35,10 @@ const USER_SCHEMA_CACHE_MAX_CAPACITY: u64 = 10_000;
 const USER_STORE_CACHE_IDLE_SECS: u64 = 600;
 const MERGED_SHARED_POOL_MAX_CONNECTIONS_ENV: &str = "MEMORIA_MERGED_SHARED_POOL_MAX_CONNECTIONS";
 const LEGACY_SHARED_COMPONENT_WEIGHTS: [u32; 3] = [40, 40, 20];
+
+fn group_cache_key(group_id: &str) -> String {
+    format!("group:{group_id}")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SharedPoolPlan {
@@ -78,7 +82,7 @@ pub struct DbRouter {
     user_db_cache: Cache<String, String>,
     user_schema_cache: Cache<String, bool>,
     user_store_cache: Cache<String, Arc<SqlMemoryStore>>,
-    user_init_locks: UserInitLocks,
+    cache_gates: KeyedGates,
     user_init_semaphore: Arc<Semaphore>,
 }
 
@@ -194,7 +198,7 @@ impl DbRouter {
                 .max_capacity(USER_STORE_CACHE_MAX_CAPACITY)
                 .time_to_idle(std::time::Duration::from_secs(USER_STORE_CACHE_IDLE_SECS))
                 .build(),
-            user_init_locks: UserInitLocks::default(),
+            cache_gates: KeyedGates::default(),
             user_init_semaphore: Arc::new(Semaphore::new(user_init_max)),
         };
         router.ensure_user_registry_table().await?;
@@ -312,6 +316,14 @@ impl DbRouter {
             return Ok(cached);
         }
 
+        // Mapping lookup also publishes a cache entry. Coordinate it with store
+        // initialization and invalidation for the same user.
+        let gate = self.cache_gates.get(user_id);
+        let _guard = gate.mutex.lock().await;
+        if let Some(cached) = self.user_db_cache.get(user_id) {
+            return Ok(cached);
+        }
+
         // Avoid moka single-flight here: its init future makes upstream callers
         // fail Send bounds under axum handlers and tokio::spawn.
         let shared_pool = self.shared_pool.clone();
@@ -338,7 +350,7 @@ impl DbRouter {
 
         // Serialize the complete cold path for this user, including provisioning
         // and cache publication. Same-user waiters do not consume init permits.
-        let init_lock = self.user_init_locks.get(user_id);
+        let init_lock = self.cache_gates.get(user_id);
         let _init_guard = init_lock.mutex.lock().await;
         if let Some(cached) = self.user_store_cache.get(user_id) {
             return Ok(cached);
@@ -426,10 +438,32 @@ impl DbRouter {
         )
     }
 
+    /// Wait for an in-flight cold path before clearing its published caches.
+    /// Existing store handles and database mutations are not cancelled.
     pub async fn invalidate_user(&self, user_id: &str) {
-        self.user_db_cache.invalidate(user_id);
-        self.user_schema_cache.invalidate(user_id);
-        self.user_store_cache.invalidate(user_id);
+        self.invalidate_cached_store(user_id, user_id).await;
+    }
+
+    pub async fn invalidate_group(&self, group_id: &str) {
+        self.invalidate_cached_store(&group_cache_key(group_id), group_id)
+            .await;
+    }
+
+    /// Use the same user/group dispatch as `scope_store()`.
+    pub async fn invalidate_scope(&self, scope_id: &str) {
+        if scope_id.starts_with("grp_") {
+            self.invalidate_group(scope_id).await;
+        } else {
+            self.invalidate_user(scope_id).await;
+        }
+    }
+
+    async fn invalidate_cached_store(&self, cache_key: &str, db_cache_key: &str) {
+        let gate = self.cache_gates.get(cache_key);
+        let _guard = gate.mutex.lock().await;
+        self.user_db_cache.invalidate(db_cache_key);
+        self.user_schema_cache.invalidate(cache_key);
+        self.user_store_cache.invalidate(cache_key);
     }
 
     async fn ensure_user_registry_table(&self) -> Result<(), MemoriaError> {
@@ -554,7 +588,13 @@ impl DbRouter {
     }
 
     pub async fn group_store(&self, group_id: &str) -> Result<Arc<SqlMemoryStore>, MemoriaError> {
-        let cache_key = format!("group:{group_id}");
+        let cache_key = group_cache_key(group_id);
+        if let Some(cached) = self.user_store_cache.get(&cache_key) {
+            return Ok(cached);
+        }
+
+        let gate = self.cache_gates.get(&cache_key);
+        let _guard = gate.mutex.lock().await;
         if let Some(cached) = self.user_store_cache.get(&cache_key) {
             return Ok(cached);
         }
