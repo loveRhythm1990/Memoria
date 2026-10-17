@@ -38,6 +38,10 @@ pub(crate) struct MySqlConnectionInner {
     // wrapped in a buffered stream
     pub(crate) stream: MySqlStream,
 
+    // PREPARE has its own response format. If its future is interrupted, the
+    // session must be discarded rather than drained as an EXECUTE response.
+    pub(crate) preparing_statement: bool,
+
     // transaction status
     pub(crate) transaction_depth: usize,
     status_flags: Status,
@@ -49,6 +53,20 @@ pub(crate) struct MySqlConnectionInner {
 }
 
 impl MySqlConnection {
+    fn check_preparation_state(&self) -> Result<(), Error> {
+        if self.inner.preparing_statement {
+            return Err(err_protocol!(
+                "connection cannot be reused after interrupted statement preparation"
+            ));
+        }
+        Ok(())
+    }
+
+    async fn wait_until_ready(&mut self) -> Result<(), Error> {
+        self.check_preparation_state()?;
+        self.inner.stream.wait_until_ready().await
+    }
+
     pub(crate) fn in_transaction(&self) -> bool {
         self.inner
             .status_flags
@@ -69,6 +87,7 @@ impl Connection for MySqlConnection {
 
     fn close(mut self) -> BoxFuture<'static, Result<(), Error>> {
         Box::pin(async move {
+            self.check_preparation_state()?;
             let result = sqlx_core::rt::timeout(CLOSE_TIMEOUT, async {
                 self.inner.stream.wait_until_ready().await?;
                 self.inner.stream.send_packet(Quit).await?;
@@ -94,6 +113,11 @@ impl Connection for MySqlConnection {
         // Hard close is the escape hatch for a stalled/broken server. Dropping
         // the session releases its statements; do not wait for query responses.
         Box::pin(async move {
+            if self.inner.preparing_statement {
+                // A cancelled send may still have buffered PREPARE bytes.
+                // Drop this unusable socket without retrying a possibly blocked write.
+                return Ok(());
+            }
             self.inner.stream.shutdown().await?;
             Ok(())
         })
@@ -101,7 +125,7 @@ impl Connection for MySqlConnection {
 
     fn ping(&mut self) -> BoxFuture<'_, Result<(), Error>> {
         Box::pin(async move {
-            self.inner.stream.wait_until_ready().await?;
+            self.wait_until_ready().await?;
             self.inner.stream.send_packet(Ping).await?;
             self.inner.stream.recv_ok().await?;
 
@@ -111,7 +135,7 @@ impl Connection for MySqlConnection {
 
     #[doc(hidden)]
     fn flush(&mut self) -> BoxFuture<'_, Result<(), Error>> {
-        self.inner.stream.wait_until_ready().boxed()
+        self.wait_until_ready().boxed()
     }
 
     fn cached_statements_size(&self) -> usize {
@@ -120,7 +144,7 @@ impl Connection for MySqlConnection {
 
     fn clear_cached_statements(&mut self) -> BoxFuture<'_, Result<(), Error>> {
         Box::pin(async move {
-            self.inner.stream.wait_until_ready().await?;
+            self.wait_until_ready().await?;
             while let Some((statement_id, _)) = self.inner.cache_statement.remove_lru() {
                 self.inner
                     .stream
