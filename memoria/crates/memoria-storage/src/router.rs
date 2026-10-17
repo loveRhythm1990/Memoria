@@ -64,9 +64,8 @@ pub struct DbRouter {
     shared_pool: MySqlPool,
     shared_pool_max_connections: u32,
     /// Global pool for all per-user DB queries. Routed stores target the
-    /// correct database via fully-qualified table names, and
-    /// `statement_cache_capacity=0` prevents cross-database prepared-statement
-    /// pollution.
+    /// correct database via fully-qualified table names. Routed pools explicitly
+    /// disable statement caching as a configuration policy.
     global_user_pool: MySqlPool,
     global_user_pool_max_connections: u32,
     user_init_pool: MySqlPool,
@@ -119,7 +118,7 @@ impl DbRouter {
         );
 
         // Global pool for all per-user DB queries.
-        // statement_cache_capacity=0 prevents prepared-statement cross-DB pollution.
+        // Apply the existing disabled-cache policy with typed connect options.
         let global_max = configured_multi_db_pool_size(
             "MEMORIA_GLOBAL_USER_POOL_MAX",
             MultiDbPoolKind::GlobalUser,

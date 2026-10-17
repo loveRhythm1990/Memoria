@@ -5,7 +5,6 @@ use futures_core::future::BoxFuture;
 use crate::connection::Waiting;
 use crate::error::Error;
 use crate::executor::Executor;
-use crate::protocol::text::Query;
 use crate::{MySql, MySqlConnection};
 
 pub(crate) use sqlx_core::transaction::*;
@@ -69,12 +68,11 @@ impl TransactionManager for MySqlTransactionManager {
         let depth = conn.inner.transaction_depth;
 
         if depth > 0 {
-            conn.inner.stream.waiting.push_back(Waiting::Result);
-            conn.inner.stream.sequence_id = 0;
-            conn.inner
-                .stream
-                .write_packet(Query(&rollback_ansi_transaction_sql(depth)))
-                .expect("BUG: unexpected error queueing ROLLBACK");
+            // Drop cannot await. Queue the command after pending rows and
+            // statement cleanup instead of buffering it ahead of that response.
+            conn.inner.stream.waiting.push_back(Waiting::Rollback(
+                rollback_ansi_transaction_sql(depth).into_owned(),
+            ));
 
             conn.inner.transaction_depth = depth - 1;
         }

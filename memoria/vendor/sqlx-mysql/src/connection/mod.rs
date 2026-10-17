@@ -65,6 +65,7 @@ impl Connection for MySqlConnection {
 
     fn close(mut self) -> BoxFuture<'static, Result<(), Error>> {
         Box::pin(async move {
+            self.inner.stream.wait_until_ready().await?;
             self.inner.stream.send_packet(Quit).await?;
             self.inner.stream.shutdown().await?;
 
@@ -73,6 +74,8 @@ impl Connection for MySqlConnection {
     }
 
     fn close_hard(mut self) -> BoxFuture<'static, Result<(), Error>> {
+        // Hard close is the escape hatch for a stalled/broken server. Dropping
+        // the session releases its statements; do not wait for query responses.
         Box::pin(async move {
             self.inner.stream.shutdown().await?;
             Ok(())
@@ -100,6 +103,7 @@ impl Connection for MySqlConnection {
 
     fn clear_cached_statements(&mut self) -> BoxFuture<'_, Result<(), Error>> {
         Box::pin(async move {
+            self.inner.stream.wait_until_ready().await?;
             while let Some((statement_id, _)) = self.inner.cache_statement.remove_lru() {
                 self.inner
                     .stream
@@ -115,8 +119,7 @@ impl Connection for MySqlConnection {
 
     #[doc(hidden)]
     fn should_flush(&self) -> bool {
-        !self.inner.stream.write_buffer().is_empty()
-            || self.inner.stream.pending_statement_close.is_some()
+        !self.inner.stream.write_buffer().is_empty() || !self.inner.stream.waiting.is_empty()
     }
 
     fn begin(&mut self) -> BoxFuture<'_, Result<Transaction<'_, Self::Database>, Error>>

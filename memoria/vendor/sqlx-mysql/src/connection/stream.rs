@@ -10,6 +10,7 @@ use crate::io::{ProtocolDecode, ProtocolEncode};
 use crate::net::{BufferedSocket, Socket};
 use crate::protocol::response::{EofPacket, ErrPacket, OkPacket, Status};
 use crate::protocol::statement::StmtClose;
+use crate::protocol::text::Query;
 use crate::protocol::{Capabilities, Packet};
 use crate::{MySqlConnectOptions, MySqlDatabaseError};
 
@@ -20,7 +21,6 @@ pub struct MySqlStream<S = Box<dyn Socket>> {
     pub(super) capabilities: Capabilities,
     pub(crate) sequence_id: u8,
     pub(crate) waiting: VecDeque<Waiting>,
-    pub(crate) pending_statement_close: Option<u32>,
     pub(crate) charset: CharSet,
     pub(crate) collation: Collation,
     pub(crate) is_tls: bool,
@@ -33,6 +33,11 @@ pub(crate) enum Waiting {
 
     // waiting for a row within a result set
     Row,
+
+    // Commands queued behind the preceding response. Keep these in the same
+    // queue so response draining, statement cleanup and rollback stay ordered.
+    Close(u32),
+    Rollback(String),
 }
 
 impl<S: Socket> MySqlStream<S> {
@@ -61,7 +66,6 @@ impl<S: Socket> MySqlStream<S> {
 
         Self {
             waiting: VecDeque::new(),
-            pending_statement_close: None,
             capabilities,
             server_version: (0, 0, 0),
             sequence_id: 0,
@@ -77,42 +81,46 @@ impl<S: Socket> MySqlStream<S> {
             self.socket.flush().await?;
         }
 
-        while !self.waiting.is_empty() {
-            while self.waiting.front() == Some(&Waiting::Row) {
-                let packet = self.recv_packet().await?;
-
-                if !packet.is_empty() && packet[0] == 0xfe && packet.len() < 9 {
-                    let eof = packet.eof(self.capabilities)?;
-
-                    if eof.status.contains(Status::SERVER_MORE_RESULTS_EXISTS) {
-                        *self.waiting.front_mut().unwrap() = Waiting::Result;
-                    } else {
-                        self.waiting.pop_front();
-                    };
-                }
-            }
-
-            while self.waiting.front() == Some(&Waiting::Result) {
-                let packet = self.recv_packet().await?;
-
-                if !packet.is_empty() && (packet[0] == 0x00 || packet[0] == 0xff) {
-                    let ok = packet.ok()?;
-
-                    if !ok.status.contains(Status::SERVER_MORE_RESULTS_EXISTS) {
-                        self.waiting.pop_front();
+        while let Some(waiting) = self.waiting.front() {
+            match waiting {
+                Waiting::Row => {
+                    let packet = self.recv_packet().await?;
+                    if !packet.is_empty() && packet[0] == 0xfe && packet.len() < 9 {
+                        let eof = packet.eof(self.capabilities)?;
+                        if eof.status.contains(Status::SERVER_MORE_RESULTS_EXISTS) {
+                            *self.waiting.front_mut().unwrap() = Waiting::Result;
+                        } else {
+                            self.waiting.pop_front();
+                        }
                     }
-                } else {
-                    *self.waiting.front_mut().unwrap() = Waiting::Row;
-                    self.skip_result_metadata(packet).await?;
+                }
+                Waiting::Result => {
+                    let packet = self.recv_packet().await?;
+                    if !packet.is_empty() && (packet[0] == 0x00 || packet[0] == 0xff) {
+                        let ok = packet.ok()?;
+                        if !ok.status.contains(Status::SERVER_MORE_RESULTS_EXISTS) {
+                            self.waiting.pop_front();
+                        }
+                    } else {
+                        *self.waiting.front_mut().unwrap() = Waiting::Row;
+                        self.skip_result_metadata(packet).await?;
+                    }
+                }
+                Waiting::Close(statement) => {
+                    let statement = *statement;
+                    self.waiting.pop_front();
+                    self.send_packet(StmtClose { statement }).await?;
+                }
+                Waiting::Rollback(_) => {
+                    let Some(Waiting::Rollback(sql)) = self.waiting.pop_front() else {
+                        unreachable!();
+                    };
+                    // Record the response before the await so cancellation can
+                    // resume by flushing buffered bytes and draining this result.
+                    self.waiting.push_front(Waiting::Result);
+                    self.send_packet(Query(&sql)).await?;
                 }
             }
-        }
-
-        // Do not pipeline COM_STMT_CLOSE ahead of an outstanding execute
-        // response. MatrixOne can otherwise return an invalid result stream.
-        // This also handles callers that drop a row stream before consuming it.
-        if let Some(statement) = self.pending_statement_close.take() {
-            self.send_packet(StmtClose { statement }).await?;
         }
 
         Ok(())
@@ -232,7 +240,6 @@ impl<S: Socket> MySqlStream<S> {
             capabilities: self.capabilities,
             sequence_id: self.sequence_id,
             waiting: self.waiting,
-            pending_statement_close: self.pending_statement_close,
             charset: self.charset,
             collation: self.collation,
             is_tls: self.is_tls,

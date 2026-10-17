@@ -6,11 +6,7 @@ use sqlx::{
 
 #[tokio::test]
 async fn uncached_prepared_queries_preserve_protocol_state() {
-    let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| default_test_url());
-    let options: MySqlConnectOptions = url.parse().expect("parse local database URL");
-    let mut conn = MySqlConnection::connect_with(&options.statement_cache_capacity(0))
-        .await
-        .expect("connect local database");
+    let mut conn = connect_uncached().await;
     for n in 0_i64..10 {
         let got: i64 = sqlx::query_scalar("SELECT CAST(? AS BIGINT)")
             .bind(n)
@@ -25,11 +21,7 @@ async fn uncached_prepared_queries_preserve_protocol_state() {
 
 #[tokio::test]
 async fn uncached_queries_recover_after_errors_and_dropped_results() {
-    let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| default_test_url());
-    let options: MySqlConnectOptions = url.parse().expect("parse local database URL");
-    let mut conn = MySqlConnection::connect_with(&options.statement_cache_capacity(0))
-        .await
-        .expect("connect local database");
+    let mut conn = connect_uncached().await;
     let table = format!("cache_probe_{}", uuid::Uuid::new_v4().simple());
     sqlx::raw_sql(&format!("CREATE TABLE {table} (id BIGINT PRIMARY KEY)"))
         .execute(&mut conn)
@@ -88,7 +80,7 @@ async fn uncached_queries_recover_after_errors_and_dropped_results() {
 
 #[tokio::test]
 async fn pool_reuse_and_explicit_nonpersistent_queries_preserve_results() {
-    let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| default_test_url());
+    let url = database_url();
     for capacity in [0, 100] {
         let options: MySqlConnectOptions = url.parse().expect("parse local database URL");
         let pool = MySqlPoolOptions::new()
@@ -125,7 +117,7 @@ async fn pool_reuse_and_explicit_nonpersistent_queries_preserve_results() {
 
 #[tokio::test]
 async fn routed_user_pool_really_disables_statement_cache() {
-    let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| default_test_url());
+    let url = database_url();
     let suffix_start = url.find(['?', '#']).unwrap_or(url.len());
     let (authority_and_path, suffix) = url.split_at(suffix_start);
     let (base, _) = authority_and_path.rsplit_once('/').expect("database URL");
@@ -161,4 +153,195 @@ async fn routed_user_pool_really_disables_statement_cache() {
 
 fn default_test_url() -> String {
     "mysql://root:111@localhost:6001/memoria_test".into()
+}
+
+fn database_url() -> String {
+    std::env::var("DATABASE_URL").unwrap_or_else(|_| default_test_url())
+}
+
+async fn connect_uncached() -> MySqlConnection {
+    let options: MySqlConnectOptions = database_url().parse().expect("parse local database URL");
+    MySqlConnection::connect_with(&options.statement_cache_capacity(0))
+        .await
+        .expect("connect local database")
+}
+
+#[tokio::test]
+async fn dropped_transactions_rollback_after_abandoned_rows() {
+    let options: MySqlConnectOptions = database_url().parse().expect("parse local database URL");
+    let pool = MySqlPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.statement_cache_capacity(0))
+        .await
+        .expect("connect pool");
+    let table = format!("cache_rollback_{}", uuid::Uuid::new_v4().simple());
+    sqlx::raw_sql(&format!("CREATE TABLE {table} (id BIGINT PRIMARY KEY)"))
+        .execute(&pool)
+        .await
+        .expect("create test table");
+    let select = "SELECT CAST(? AS BIGINT) UNION ALL SELECT CAST(2 AS BIGINT)";
+    // Nested drop must execute rollback-to-savepoint before the outer rollback.
+    let mut conn = pool.acquire().await.expect("acquire connection");
+    let mut txn = conn.begin().await.expect("outer transaction");
+    sqlx::query(&format!("INSERT INTO {table} VALUES (?)"))
+        .bind(1_i64)
+        .execute(&mut *txn)
+        .await
+        .expect("outer write");
+    let mut nested = txn.begin().await.expect("savepoint");
+    sqlx::query(&format!("INSERT INTO {table} VALUES (?)"))
+        .bind(2_i64)
+        .execute(&mut *nested)
+        .await
+        .expect("nested write");
+    let mut rows = sqlx::query(select).bind(1_i64).fetch(&mut *nested);
+    assert!(rows.try_next().await.expect("first row").is_some());
+    drop(rows);
+    drop(nested);
+    drop(txn);
+    // Returning to the pool must flush the rollback without waiting for another query.
+    drop(conn);
+    let count: i64 = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}")).fetch_one(&pool),
+    )
+    .await
+    .expect("pool reuse must not hang")
+    .expect("count after rollback");
+    assert_eq!(count, 0);
+    sqlx::raw_sql(&format!("DROP TABLE {table}"))
+        .execute(&pool)
+        .await
+        .expect("drop test table");
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn clear_cached_statements_drains_an_abandoned_uncached_response() {
+    let options: MySqlConnectOptions = database_url().parse().expect("parse local database URL");
+    let mut conn = MySqlConnection::connect_with(&options.statement_cache_capacity(10))
+        .await
+        .expect("connect cached session");
+    let _: i64 = sqlx::query_scalar("SELECT CAST(? AS BIGINT)")
+        .bind(7_i64)
+        .fetch_one(&mut conn)
+        .await
+        .expect("warm statement cache");
+    assert_eq!(conn.cached_statements_size(), 1);
+    let mut rows = sqlx::query("SELECT CAST(? AS BIGINT) UNION ALL SELECT CAST(2 AS BIGINT)")
+        .bind(1_i64)
+        .persistent(false)
+        .fetch(&mut conn);
+    assert!(rows.try_next().await.expect("first row").is_some());
+    drop(rows);
+    conn.clear_cached_statements()
+        .await
+        .expect("clear after partial result");
+    assert_eq!(conn.cached_statements_size(), 0);
+    conn.ping().await.expect("session remains synchronized");
+    conn.close().await.expect("close session");
+}
+
+#[tokio::test]
+async fn graceful_and_hard_close_accept_abandoned_results() {
+    for hard in [false, true] {
+        let mut conn = connect_uncached().await;
+        let mut rows = sqlx::query("SELECT CAST(? AS BIGINT) UNION ALL SELECT CAST(2 AS BIGINT)")
+            .bind(1_i64)
+            .fetch(&mut conn);
+        assert!(rows.try_next().await.expect("first row").is_some());
+        drop(rows);
+        let close = if hard {
+            conn.close_hard()
+        } else {
+            conn.close()
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), close)
+            .await
+            .expect("close must complete")
+            .expect("close session");
+    }
+}
+
+#[path = "support/command_order_proxy.rs"]
+mod command_order_proxy;
+
+async fn verify_cleanup_command_order(action: &str) {
+    let options: MySqlConnectOptions = database_url().parse().expect("parse local database URL");
+    let proxy =
+        command_order_proxy::CommandOrderProxy::start(options.statement_cache_capacity(10)).await;
+    let mut conn = MySqlConnection::connect_with(&proxy.options)
+        .await
+        .expect("connect via proxy");
+    let _: i64 = sqlx::query_scalar("SELECT CAST(? AS BIGINT)")
+        .bind(7_i64)
+        .fetch_one(&mut conn)
+        .await
+        .expect("warm statement cache");
+    let select = "SELECT CAST(? AS BIGINT) UNION ALL SELECT CAST(2 AS BIGINT)";
+    if action == "rollback" {
+        let mut txn = conn.begin().await.expect("begin transaction");
+        proxy.arm();
+        let mut rows = sqlx::query(select)
+            .bind(1_i64)
+            .persistent(false)
+            .fetch(&mut *txn);
+        assert!(rows.try_next().await.expect("first row").is_some());
+        drop(rows);
+        drop(txn);
+        conn.ping().await.expect("drain and rollback");
+    } else {
+        proxy.arm();
+        let mut rows = sqlx::query(select)
+            .bind(1_i64)
+            .persistent(false)
+            .fetch(&mut conn);
+        assert!(rows.try_next().await.expect("first row").is_some());
+        drop(rows);
+        if action == "clear" {
+            conn.clear_cached_statements()
+                .await
+                .expect("drain and clear cache");
+        }
+    }
+    conn.close().await.expect("drain and close");
+    proxy.assert_ordered().await;
+}
+
+#[tokio::test]
+async fn wire_order_rollback_waits_for_response_tail() {
+    verify_cleanup_command_order("rollback").await;
+}
+
+#[tokio::test]
+async fn wire_order_cache_clear_waits_for_response_tail() {
+    verify_cleanup_command_order("clear").await;
+}
+
+#[tokio::test]
+async fn wire_order_graceful_close_waits_for_response_tail() {
+    verify_cleanup_command_order("close").await;
+}
+
+#[tokio::test]
+async fn hard_close_does_not_wait_for_a_stalled_response() {
+    let options: MySqlConnectOptions = database_url().parse().expect("parse local database URL");
+    let proxy =
+        command_order_proxy::CommandOrderProxy::start(options.statement_cache_capacity(0)).await;
+    let mut conn = MySqlConnection::connect_with(&proxy.options)
+        .await
+        .expect("connect via proxy");
+    proxy.stall_tail();
+    proxy.arm();
+    let mut rows = sqlx::query("SELECT CAST(? AS BIGINT) UNION ALL SELECT CAST(2 AS BIGINT)")
+        .bind(1_i64)
+        .fetch(&mut conn);
+    assert!(rows.try_next().await.expect("first row").is_some());
+    drop(rows);
+    proxy.wait_until_stalled().await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), conn.close_hard())
+        .await
+        .expect("hard close must not drain stalled responses")
+        .expect("hard close");
+    proxy.assert_ordered().await;
 }

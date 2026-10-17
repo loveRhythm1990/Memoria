@@ -13,7 +13,6 @@ struct MapStream {
     capabilities: Capabilities,
     sequence_id: u8,
     waiting: VecDeque<Waiting>,
-    pending_statement_close: Option<u32>,
     charset: CharSet,
     collation: Collation,
 }
@@ -85,7 +84,6 @@ pub(super) async fn maybe_upgrade<S: Socket>(
             capabilities: stream.capabilities,
             sequence_id: stream.sequence_id,
             waiting: stream.waiting,
-            pending_statement_close: stream.pending_statement_close,
             charset: stream.charset,
             collation: stream.collation,
         },
@@ -103,7 +101,6 @@ impl WithSocket for MapStream {
             capabilities: self.capabilities,
             sequence_id: self.sequence_id,
             waiting: self.waiting,
-            pending_statement_close: self.pending_statement_close,
             charset: self.charset,
             collation: self.collation,
             is_tls: true,
