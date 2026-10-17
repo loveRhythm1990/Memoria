@@ -713,7 +713,10 @@ pub async fn get_snapshot(
             let content: String = r.try_get("content").unwrap_or_default();
             let initial_confidence = r.try_get::<f64, _>("initial_confidence").unwrap_or(0.0);
             let truncated = if content.len() > content_limit {
-                format!("{} [truncated]", &content[..content_limit])
+                format!(
+                    "{} [truncated]",
+                    memoria_core::truncate_utf8(&content, content_limit)
+                )
             } else {
                 content
             };

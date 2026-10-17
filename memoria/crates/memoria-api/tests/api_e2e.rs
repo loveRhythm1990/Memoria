@@ -11348,3 +11348,76 @@ async fn test_correction_metadata_by_id_remains_queryable() {
 async fn test_correction_metadata_by_query_remains_queryable() {
     assert_correction_preserves_metadata(true).await;
 }
+
+async fn assert_snapshot_detail_utf8(detail: &str, limit: usize) {
+    let (base, client, _server) = spawn_server().await;
+    let uid = uid();
+    let prefix = "x".repeat(limit - 1);
+    let exact = "a".repeat(limit);
+    let examples = [
+        (format!("{prefix}中文"), format!("{prefix} [truncated]")),
+        (format!("{prefix}🦀tail"), format!("{prefix} [truncated]")),
+        (exact.clone(), exact),
+        ("短文本🦀".to_string(), "短文本🦀".to_string()),
+    ];
+    let mut expected = Vec::new();
+    for (content, preview) in examples {
+        let response = client
+            .post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"content": content, "memory_type": "semantic"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        let stored: Value = response.json().await.unwrap();
+        expected.push((stored["memory_id"].as_str().unwrap().to_string(), preview));
+    }
+    let snap = format!("utf8_{}", uuid::Uuid::new_v4().simple());
+    let response = client
+        .post(format!("{base}/v1/snapshots"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"name": snap}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    let response = client
+        .get(format!("{base}/v1/snapshots/{snap}?detail={detail}"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: Value = response.json().await.unwrap();
+    // Delete the snapshot even when the baseline response is HTTP 500.
+    let deleted = client
+        .delete(format!("{base}/v1/snapshots/{snap}"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert!(deleted.status().is_success());
+    assert_eq!(status, 200, "{detail} detail: {body}");
+    let memories = body["memories"].as_array().unwrap();
+    assert_eq!(memories.len(), expected.len());
+    for (id, preview) in expected {
+        let memory = memories.iter().find(|m| m["memory_id"] == id).unwrap();
+        assert_eq!(memory["content"], preview);
+    }
+}
+
+#[tokio::test]
+async fn test_snapshot_detail_utf8_brief() {
+    assert_snapshot_detail_utf8("brief", 80).await;
+}
+
+#[tokio::test]
+async fn test_snapshot_detail_utf8_normal() {
+    assert_snapshot_detail_utf8("normal", 200).await;
+}
+
+#[tokio::test]
+async fn test_snapshot_detail_utf8_full() {
+    assert_snapshot_detail_utf8("full", 2000).await;
+}

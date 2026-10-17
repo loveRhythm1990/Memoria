@@ -338,7 +338,14 @@ async fn info_schema_table_exists(pool: &MySqlPool, schema_name: &str, table_nam
 pub const CURRENT_USER_SCHEMA_VERSION: i64 = 2;
 const USER_SCHEMA_META_KEY: &str = "user_schema";
 
-async fn ensure_user_schema_meta_table(pool: &MySqlPool, table: &str) -> Result<(), MemoriaError> {
+// MatrixOne's read-your-writes frontier belongs to a database session. Keep
+// CREATE and the dependent metadata statement on one checked-out connection;
+// separate pool executions may observe different catalog snapshots even when
+// the caller awaits them sequentially.
+async fn ensure_user_schema_meta_table(
+    conn: &mut sqlx::MySqlConnection,
+    table: &str,
+) -> Result<(), MemoriaError> {
     sqlx::query(&format!(
         r#"CREATE TABLE IF NOT EXISTS {table} (
             schema_key     VARCHAR(64) PRIMARY KEY,
@@ -346,7 +353,7 @@ async fn ensure_user_schema_meta_table(pool: &MySqlPool, table: &str) -> Result<
             updated_at     DATETIME(6) NOT NULL
         )"#
     ))
-    .execute(pool)
+    .execute(&mut *conn)
     .await
     .map_err(db_err)?;
     Ok(())
@@ -356,11 +363,13 @@ async fn load_user_schema_version(
     pool: &MySqlPool,
     table: &str,
 ) -> Result<Option<i64>, MemoriaError> {
+    let mut conn = pool.acquire().await.map_err(db_err)?;
+    ensure_user_schema_meta_table(&mut conn, table).await?;
     let row = sqlx::query(&format!(
         "SELECT schema_version FROM {table} WHERE schema_key = ? LIMIT 1"
     ))
     .bind(USER_SCHEMA_META_KEY)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await
     .map_err(db_err)?;
 
@@ -373,6 +382,8 @@ async fn store_user_schema_version(
     table: &str,
     version: i64,
 ) -> Result<(), MemoriaError> {
+    let mut conn = pool.acquire().await.map_err(db_err)?;
+    ensure_user_schema_meta_table(&mut conn, table).await?;
     let now = Utc::now().naive_utc();
     sqlx::query(&format!(
         r#"INSERT INTO {table} (schema_key, schema_version, updated_at)
@@ -384,7 +395,7 @@ async fn store_user_schema_version(
     .bind(USER_SCHEMA_META_KEY)
     .bind(version)
     .bind(now)
-    .execute(pool)
+    .execute(&mut *conn)
     .await
     .map_err(db_err)?;
     Ok(())
@@ -2328,7 +2339,7 @@ impl SqlMemoryStore {
             return self.migrate_user_fresh().await;
         }
 
-        ensure_user_schema_meta_table(pool, &meta_table).await?;
+        let schema_version = load_user_schema_version(pool, &meta_table).await?;
         // Non-fatal: snapshot extra column failure must not block subsequent migrations.
         if let Err(e) = self.ensure_snapshot_extra_column(pool, schema_name).await {
             tracing::warn!("migration: ensure_snapshot_extra_column failed (non-fatal): {e}");
@@ -2343,7 +2354,7 @@ impl SqlMemoryStore {
         // (e.g. a partial migration was interrupted), fall through to bootstrap so
         // the table is recreated rather than letting the service start with a broken
         // schema that would only surface as runtime 1146 errors.
-        if load_user_schema_version(pool, &meta_table).await? == Some(CURRENT_USER_SCHEMA_VERSION)
+        if schema_version == Some(CURRENT_USER_SCHEMA_VERSION)
             && info_schema_table_exists(pool, schema_name, "mem_memories").await
         {
             // Monitoring failures must not make an existing user's memories
@@ -2367,7 +2378,6 @@ impl SqlMemoryStore {
         let pool = &self.pool;
         let meta_table = self.t("mem_schema_meta");
         self.bootstrap_user_schema(pool).await?;
-        ensure_user_schema_meta_table(pool, &meta_table).await?;
         store_user_schema_version(pool, &meta_table, CURRENT_USER_SCHEMA_VERSION).await?;
         Ok(())
     }

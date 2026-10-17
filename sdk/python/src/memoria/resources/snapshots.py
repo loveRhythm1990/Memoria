@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 from ..exceptions import MemoriaValidationError
 from ..models import Snapshot
@@ -14,6 +15,14 @@ if TYPE_CHECKING:
 
 def _strip_none(d: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
+
+
+def _snapshot_path(name: str, suffix: str = "") -> str:
+    # A snapshot selector is one literal segment, never URL navigation or a query.
+    encoded = quote(name, safe="")
+    if name in {".", ".."}:
+        encoded = "%2E" * len(name)
+    return f"/v1/snapshots/{encoded}{suffix}"
 
 
 class SnapshotsResource:
@@ -40,7 +49,7 @@ class SnapshotsResource:
         return [Snapshot.from_dict(s) for s in items]
 
     def rollback(self, name: str) -> None:
-        self._client._request("POST", f"/v1/snapshots/{name}/rollback", json={})
+        self._client._request("POST", _snapshot_path(name, "/rollback"), json={})
 
     def delete(
         self,
@@ -72,7 +81,7 @@ class SnapshotsResource:
                 "delete: name, names, prefix, older_than are mutually exclusive"
             )
         if name is not None:
-            self._client._request("DELETE", f"/v1/snapshots/{name}")
+            self._client._request("DELETE", _snapshot_path(name))
         else:
             body = _strip_none({"names": names, "prefix": prefix, "older_than": older_than})
             self._client._request("POST", "/v1/snapshots/delete", json=body)
@@ -101,7 +110,7 @@ class AsyncSnapshotsResource:
         return [Snapshot.from_dict(s) for s in items]
 
     async def rollback(self, name: str) -> None:
-        await self._client._arequest("POST", f"/v1/snapshots/{name}/rollback", json={})
+        await self._client._arequest("POST", _snapshot_path(name, "/rollback"), json={})
 
     async def delete(
         self,
@@ -128,7 +137,7 @@ class AsyncSnapshotsResource:
                 "delete: name, names, prefix, older_than are mutually exclusive"
             )
         if name is not None:
-            await self._client._arequest("DELETE", f"/v1/snapshots/{name}")
+            await self._client._arequest("DELETE", _snapshot_path(name))
         else:
             body = _strip_none({"names": names, "prefix": prefix, "older_than": older_than})
             await self._client._arequest("POST", "/v1/snapshots/delete", json=body)
