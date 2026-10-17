@@ -308,7 +308,109 @@ async fn router_initializes_one_fresh_user_under_concurrent_access() {
         .execute(router.shared_pool())
         .await
         .expect("clean up test registry database");
-    for result in outcomes {
-        assert!(result.is_ok(), "same-user initialization failed");
+    let first = outcomes[0].as_ref().expect("first initializer succeeded");
+    for result in &outcomes {
+        let store = result.as_ref().expect("same-user initialization succeeded");
+        assert!(
+            std::sync::Arc::ptr_eq(first, store),
+            "concurrent first access must reuse one initialized store"
+        );
     }
+}
+
+#[tokio::test]
+async fn router_retries_initialization_after_a_schema_failure() {
+    let router = DbRouter::connect(&shared_db_url(), test_dim(), Uuid::new_v4().to_string())
+        .await
+        .expect("connect router");
+    let user = format!("schema_retry_{}", Uuid::new_v4().simple());
+    let db = router.user_db_name(&user).await.expect("provision user DB");
+    // A partially initialized schema must fail without publishing readiness or
+    // stranding the next caller behind an initialization gate.
+    sqlx::raw_sql(&format!(
+        "CREATE TABLE `{db}`.mem_schema_meta (schema_key VARCHAR(64) PRIMARY KEY)"
+    ))
+    .execute(router.shared_pool())
+    .await
+    .expect("create incomplete schema marker");
+    let first = router.user_store(&user).await;
+    sqlx::raw_sql(&format!("DROP TABLE `{db}`.mem_schema_meta"))
+        .execute(router.shared_pool())
+        .await
+        .expect("remove incomplete marker");
+
+    let retry = tokio::time::timeout(std::time::Duration::from_secs(30), router.user_store(&user))
+        .await
+        .expect("failed initialization must release its gate")
+        .expect("retry initializes repaired schema");
+    let cached = router.user_store(&user).await.expect("cached store");
+    let version: i64 = sqlx::query_scalar(&format!(
+        "SELECT schema_version FROM `{db}`.mem_schema_meta WHERE schema_key = 'user_schema'"
+    ))
+    .fetch_one(router.shared_pool())
+    .await
+    .expect("read repaired schema marker");
+    sqlx::raw_sql(&format!("DROP DATABASE `{db}`"))
+        .execute(router.shared_pool())
+        .await
+        .expect("clean up test user database");
+    sqlx::raw_sql(&format!("DROP DATABASE `{}`", router.shared_db_name()))
+        .execute(router.shared_pool())
+        .await
+        .expect("clean up test registry database");
+
+    assert!(first.is_err(), "incomplete schema must fail initialization");
+    assert!(std::sync::Arc::ptr_eq(&retry, &cached));
+    assert_eq!(version, CURRENT_USER_SCHEMA_VERSION);
+}
+
+#[tokio::test]
+async fn router_recovers_when_a_cold_initializer_or_waiter_is_cancelled() {
+    let router = DbRouter::connect(&shared_db_url(), test_dim(), Uuid::new_v4().to_string())
+        .await
+        .expect("connect router");
+    for cancel_initializer in [true, false] {
+        let user = format!("schema_cancel_{}", Uuid::new_v4().simple());
+        // Exhaust the registry pool so the first cold call stops before
+        // provisioning. Polling both futures makes cancellation deterministic.
+        let mut held_connections = Vec::new();
+        for _ in 0..router.shared_pool_max_connections() {
+            held_connections.push(
+                router
+                    .shared_pool()
+                    .acquire()
+                    .await
+                    .expect("hold pool slot"),
+            );
+        }
+        let mut initializer = Box::pin(router.user_store(&user));
+        assert!(futures::poll!(&mut initializer).is_pending());
+        let mut waiter = Box::pin(router.user_store(&user));
+        assert!(futures::poll!(&mut waiter).is_pending());
+        let survivor = if cancel_initializer {
+            drop(initializer);
+            waiter
+        } else {
+            drop(waiter);
+            initializer
+        };
+        drop(held_connections);
+        let store = tokio::time::timeout(std::time::Duration::from_secs(30), survivor)
+            .await
+            .expect("cancellation must not strand the surviving caller")
+            .expect("surviving caller initializes the user");
+        let cached = router.user_store(&user).await.expect("cached store");
+        assert!(std::sync::Arc::ptr_eq(&store, &cached));
+        sqlx::raw_sql(&format!(
+            "DROP DATABASE `{}`",
+            DbRouter::user_db_name_for_id(&user)
+        ))
+        .execute(router.shared_pool())
+        .await
+        .expect("clean up test user database");
+    }
+    sqlx::raw_sql(&format!("DROP DATABASE `{}`", router.shared_db_name()))
+        .execute(router.shared_pool())
+        .await
+        .expect("clean up test registry database");
 }

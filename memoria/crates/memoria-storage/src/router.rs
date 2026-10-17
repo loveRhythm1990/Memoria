@@ -3,6 +3,7 @@ use crate::pool_config::{
     multi_db_pool_max_size, split_pool_budget, MultiDbPoolKind, MULTI_DB_POOL_BUDGET_MAX,
 };
 use crate::store::spawn_pool_monitor;
+use crate::user_init_locks::UserInitLocks;
 use crate::{PoolHealthSnapshot, SqlMemoryStore};
 use chrono::Utc;
 use memoria_core::MemoriaError;
@@ -77,6 +78,7 @@ pub struct DbRouter {
     user_db_cache: Cache<String, String>,
     user_schema_cache: Cache<String, bool>,
     user_store_cache: Cache<String, Arc<SqlMemoryStore>>,
+    user_init_locks: UserInitLocks,
     user_init_semaphore: Arc<Semaphore>,
 }
 
@@ -192,6 +194,7 @@ impl DbRouter {
                 .max_capacity(USER_STORE_CACHE_MAX_CAPACITY)
                 .time_to_idle(std::time::Duration::from_secs(USER_STORE_CACHE_IDLE_SECS))
                 .build(),
+            user_init_locks: UserInitLocks::default(),
             user_init_semaphore: Arc::new(Semaphore::new(user_init_max)),
         };
         router.ensure_user_registry_table().await?;
@@ -329,6 +332,14 @@ impl DbRouter {
     }
 
     pub async fn user_store(&self, user_id: &str) -> Result<Arc<SqlMemoryStore>, MemoriaError> {
+        if let Some(cached) = self.user_store_cache.get(user_id) {
+            return Ok(cached);
+        }
+
+        // Serialize the complete cold path for this user, including provisioning
+        // and cache publication. Same-user waiters do not consume init permits.
+        let init_lock = self.user_init_locks.get(user_id);
+        let _init_guard = init_lock.mutex.lock().await;
         if let Some(cached) = self.user_store_cache.get(user_id) {
             return Ok(cached);
         }
