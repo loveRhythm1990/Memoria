@@ -29,6 +29,21 @@ impl MySqlConnection {
         &mut self,
         sql: &str,
     ) -> Result<(u32, MySqlStatementMetadata), Error> {
+        self.check_preparation_state()?;
+        self.inner.preparing_statement = true;
+        let result = self.prepare_statement_inner(sql).await;
+        // A complete response or a terminal server ERR restores a known state.
+        // Cancellation and transport/decode errors leave the session unusable.
+        if result.is_ok() || matches!(&result, Err(Error::Database(_))) {
+            self.inner.preparing_statement = false;
+        }
+        result
+    }
+
+    async fn prepare_statement_inner(
+        &mut self,
+        sql: &str,
+    ) -> Result<(u32, MySqlStatementMetadata), Error> {
         // https://dev.mysql.com/doc/internals/en/com-stmt-prepare.html
         // https://dev.mysql.com/doc/internals/en/com-stmt-prepare-response.html#packet-COM_STMT_PREPARE_OK
 
@@ -108,7 +123,7 @@ impl MySqlConnection {
     {
         let mut logger = QueryLogger::new(sql, self.inner.log_settings.clone());
 
-        self.inner.stream.wait_until_ready().await?;
+        self.wait_until_ready().await?;
         self.inner.stream.waiting.push_back(Waiting::Result);
 
         Ok(try_stream! {
@@ -306,7 +321,7 @@ impl<'c> Executor<'c> for &'c mut MySqlConnection {
         'c: 'e,
     {
         Box::pin(async move {
-            self.inner.stream.wait_until_ready().await?;
+            self.wait_until_ready().await?;
 
             let metadata = if self.inner.cache_statement.is_enabled() {
                 self.get_or_prepare_statement(sql).await?.1
@@ -335,7 +350,7 @@ impl<'c> Executor<'c> for &'c mut MySqlConnection {
         'c: 'e,
     {
         Box::pin(async move {
-            self.inner.stream.wait_until_ready().await?;
+            self.wait_until_ready().await?;
 
             let (id, metadata) = self.prepare_statement(sql).await?;
 

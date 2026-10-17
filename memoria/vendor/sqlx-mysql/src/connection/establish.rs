@@ -25,6 +25,7 @@ impl MySqlConnection {
 
         Ok(Self {
             inner: Box::new(MySqlConnectionInner {
+                preparing_statement: false,
                 stream,
                 transaction_depth: 0,
                 status_flags: Default::default(),
