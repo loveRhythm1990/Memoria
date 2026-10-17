@@ -145,7 +145,10 @@ async fn router_persists_and_repairs_user_schema_version_marker() {
         .expect("initial updated_at");
     assert_eq!(initial_version, CURRENT_USER_SCHEMA_VERSION);
 
-    router.invalidate_user(&user).await;
+    router
+        .invalidate_user(&user)
+        .await
+        .expect("invalidate user caches");
     router.user_store(&user).await.expect("user store reentry");
 
     let row_after_skip =
@@ -177,7 +180,10 @@ async fn router_persists_and_repairs_user_schema_version_marker() {
     .await
     .expect("set stale schema marker");
 
-    router.invalidate_user(&user).await;
+    router
+        .invalidate_user(&user)
+        .await
+        .expect("invalidate user caches");
     router
         .user_store(&user)
         .await
@@ -511,7 +517,7 @@ async fn router_invalidation_cannot_be_overtaken_by_a_cold_initializer() {
         .await
         .expect("make initialized schema marker stale");
         if waited {
-            invalidation.await;
+            invalidation.await.expect("invalidate scoped caches");
         }
         let refreshed = router
             .scope_store(&scope)
@@ -579,7 +585,7 @@ async fn router_invalidation_also_orders_an_inflight_database_mapping_lookup() {
         .await
         .expect("replace mapping");
     if waited {
-        invalidation.await;
+        invalidation.await.expect("invalidate scoped caches");
     }
     let refreshed = router.user_db_name(&user).await.expect("reload mapping");
     for db in [&original, &replacement, router.shared_db_name()] {
@@ -590,4 +596,95 @@ async fn router_invalidation_also_orders_an_inflight_database_mapping_lookup() {
     }
     assert!(waited, "invalidation must wait for the mapping publisher");
     assert_eq!(refreshed, replacement);
+}
+
+#[tokio::test]
+async fn router_isolates_user_ids_that_match_the_legacy_group_cache_prefix() {
+    let router = DbRouter::connect(&shared_db_url(), test_dim(), Uuid::new_v4().to_string())
+        .await
+        .expect("connect router");
+    for group_first in [true, false] {
+        let (group, group_db) = register_test_group(&router).await;
+        let user = format!("group:{group}");
+        let user_db = DbRouter::user_db_name_for_id(&user);
+        let (user_store, group_store) = if group_first {
+            let group_store = router
+                .scope_store(&group)
+                .await
+                .expect("initialize group first");
+            (
+                router
+                    .user_store(&user)
+                    .await
+                    .expect("initialize user second"),
+                group_store,
+            )
+        } else {
+            let user_store = router
+                .user_store(&user)
+                .await
+                .expect("initialize user first");
+            (
+                user_store,
+                router
+                    .scope_store(&group)
+                    .await
+                    .expect("initialize group second"),
+            )
+        };
+        let isolated = user_store.db_name() == Some(user_db.as_str())
+            && group_store.db_name() == Some(group_db.as_str())
+            && !std::sync::Arc::ptr_eq(&user_store, &group_store);
+        // Keep cleanup valid on the unfixed implementation too: a collision can
+        // skip user provisioning entirely.
+        if !isolated {
+            for db in [&user_db, &group_db, router.shared_db_name()] {
+                sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS `{db}`"))
+                    .execute(router.shared_pool())
+                    .await
+                    .expect("clean up collision reproduction");
+            }
+            assert!(
+                isolated,
+                "user and group must never return each other's store"
+            );
+        }
+        assert_eq!(
+            router.user_db_name(&user).await.expect("user mapping"),
+            user_db
+        );
+        router
+            .invalidate_user(&user)
+            .await
+            .expect("invalidate only the user");
+        assert!(std::sync::Arc::ptr_eq(
+            &group_store,
+            &router
+                .group_store(&group)
+                .await
+                .expect("group stays cached")
+        ));
+        let refreshed_user = router.user_store(&user).await.expect("reload user");
+        assert!(!std::sync::Arc::ptr_eq(&user_store, &refreshed_user));
+        router
+            .invalidate_group(&group)
+            .await
+            .expect("invalidate only the group");
+        assert!(std::sync::Arc::ptr_eq(
+            &refreshed_user,
+            &router.user_store(&user).await.expect("user stays cached")
+        ));
+        let refreshed_group = router.group_store(&group).await.expect("reload group");
+        assert!(!std::sync::Arc::ptr_eq(&group_store, &refreshed_group));
+        for db in [&user_db, &group_db] {
+            sqlx::raw_sql(&format!("DROP DATABASE `{db}`"))
+                .execute(router.shared_pool())
+                .await
+                .expect("clean up isolated database");
+        }
+    }
+    sqlx::raw_sql(&format!("DROP DATABASE `{}`", router.shared_db_name()))
+        .execute(router.shared_pool())
+        .await
+        .expect("clean up registry database");
 }
