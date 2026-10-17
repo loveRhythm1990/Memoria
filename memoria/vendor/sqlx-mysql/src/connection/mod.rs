@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::fmt::{self, Debug, Formatter};
+use std::time::Duration;
 
 use futures_core::future::BoxFuture;
 use futures_util::FutureExt;
@@ -22,6 +23,9 @@ mod stream;
 mod tls;
 
 const MAX_PACKET_SIZE: u32 = 1024;
+// Match sqlx-core's close-on-drop budget. Bound the entire graceful close,
+// including response draining and socket writes, for all callers.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A connection to a MySQL database.
 pub struct MySqlConnection {
@@ -65,11 +69,24 @@ impl Connection for MySqlConnection {
 
     fn close(mut self) -> BoxFuture<'static, Result<(), Error>> {
         Box::pin(async move {
-            self.inner.stream.wait_until_ready().await?;
-            self.inner.stream.send_packet(Quit).await?;
-            self.inner.stream.shutdown().await?;
+            let result = sqlx_core::rt::timeout(CLOSE_TIMEOUT, async {
+                self.inner.stream.wait_until_ready().await?;
+                self.inner.stream.send_packet(Quit).await?;
+                self.inner.stream.shutdown().await?;
+                Ok(())
+            })
+            .await;
 
-            Ok(())
+            // `self` owns the socket: dropping it on timeout disconnects without
+            // another flush/drain attempt that could wait on the stalled peer.
+            match result {
+                Ok(result) => result,
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out while closing MySQL connection",
+                )
+                .into()),
+            }
         })
     }
 

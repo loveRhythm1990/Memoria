@@ -345,3 +345,60 @@ async fn hard_close_does_not_wait_for_a_stalled_response() {
         .expect("hard close");
     proxy.assert_ordered().await;
 }
+
+#[tokio::test]
+async fn graceful_close_times_out_and_disconnects_a_stalled_response() {
+    let options: MySqlConnectOptions = database_url().parse().expect("parse local database URL");
+    let proxy =
+        command_order_proxy::CommandOrderProxy::start(options.statement_cache_capacity(0)).await;
+    let mut conn = MySqlConnection::connect_with(&proxy.options)
+        .await
+        .expect("connect via proxy");
+    proxy.stall_tail();
+    proxy.arm();
+    let mut rows = sqlx::query("SELECT CAST(? AS BIGINT) UNION ALL SELECT CAST(2 AS BIGINT)")
+        .bind(1_i64)
+        .fetch(&mut conn);
+    assert!(rows.try_next().await.expect("first row").is_some());
+    drop(rows);
+    proxy.wait_until_stalled().await;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(7), conn.close())
+        .await
+        .expect("graceful close must enforce its own deadline");
+    assert!(matches!(result, Err(sqlx::Error::Io(ref error))
+        if error.kind() == std::io::ErrorKind::TimedOut));
+    // The timeout must drop the owned socket even though no final response arrives.
+    proxy.assert_ordered().await;
+}
+
+#[tokio::test]
+async fn expired_connection_return_releases_capacity_after_stalled_response() {
+    let options: MySqlConnectOptions = database_url().parse().expect("parse local database URL");
+    let proxy =
+        command_order_proxy::CommandOrderProxy::start(options.statement_cache_capacity(0)).await;
+    let pool = MySqlPoolOptions::new()
+        .max_connections(1)
+        .max_lifetime(Some(std::time::Duration::from_secs(1)))
+        .connect_with(proxy.options.clone())
+        .await
+        .expect("connect pool via proxy");
+    let mut conn = pool.acquire().await.expect("acquire connection");
+    proxy.stall_tail();
+    proxy.arm();
+    let mut rows = sqlx::query("SELECT CAST(? AS BIGINT) UNION ALL SELECT CAST(2 AS BIGINT)")
+        .bind(1_i64)
+        .fetch(&mut *conn);
+    assert!(rows.try_next().await.expect("first row").is_some());
+    drop(rows);
+    proxy.wait_until_stalled().await;
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    // Exercise the expired-connection branch while the pool is still open.
+    tokio::time::timeout(std::time::Duration::from_secs(7), conn.return_to_pool())
+        .await
+        .expect("expired connection must release its permit");
+    assert_eq!(pool.size(), 0);
+    tokio::time::timeout(std::time::Duration::from_secs(1), pool.close())
+        .await
+        .expect("pool shutdown must complete");
+    proxy.assert_ordered().await;
+}
