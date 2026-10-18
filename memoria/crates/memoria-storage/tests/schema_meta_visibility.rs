@@ -8,21 +8,15 @@ use std::sync::{
     Arc,
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
     sync::Mutex,
 };
 use uuid::Uuid;
 
-async fn packet(reader: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Vec<u8>> {
-    let mut header = [0_u8; 4];
-    reader.read_exact(&mut header).await?;
-    let len = header[0] as usize | (header[1] as usize) << 8 | (header[2] as usize) << 16;
-    let mut bytes = vec![0; len + 4];
-    bytes[..4].copy_from_slice(&header);
-    reader.read_exact(&mut bytes[4..]).await?;
-    Ok(bytes)
-}
+#[path = "support/mysql_packet.rs"]
+mod mysql_packet;
+use mysql_packet::packet;
 
 async fn proxy_session(client: TcpStream, backend: String, rejected: Arc<AtomicUsize>) {
     let Ok(server) = TcpStream::connect(backend).await else {

@@ -408,29 +408,41 @@ impl DbRouter {
                     let _permit = user_init_semaphore.acquire_owned().await.map_err(|_| {
                         MemoriaError::Internal("user schema init semaphore closed".into())
                     })?;
-                    if user_schema_cache.get(&cache_key).is_none() {
-                        let init_store = build_routed_store(
-                            user_init_pool.clone(),
-                            &shared_db_url,
-                            embedding_dim,
-                            &instance_id,
-                            &db_name,
-                        )?;
-                        let init_result = init_store.migrate_user().await;
-                        if let Err(err) = init_result {
-                            if needs_init {
-                                let delete_registration =
-                                    "DELETE FROM mem_user_registry WHERE user_id = ? AND db_name = ?";
-                                let _ = sqlx::query(delete_registration)
-                                    .bind(&user_id_owned)
-                                    .bind(&db_name)
-                                    .execute(&shared_pool)
-                                    .await;
+                    let init_store = build_routed_store(
+                        user_init_pool.clone(),
+                        &shared_db_url,
+                        embedding_dim,
+                        &instance_id,
+                        &db_name,
+                    )?;
+                    let init_result = init_store.migrate_user().await;
+                    if let Err(err) = init_result {
+                        if needs_init {
+                            let delete_registration =
+                                "DELETE FROM mem_user_registry WHERE user_id = ? AND db_name = ?";
+                            if let Err(cleanup_error) = sqlx::query(delete_registration)
+                                .bind(&user_id_owned)
+                                .bind(&db_name)
+                                .execute(&shared_pool)
+                                .await
+                            {
+                                // Error text may contain SQL, identifiers or connection
+                                // details. Record only a bounded category here.
+                                let error_kind = match cleanup_error {
+                                    sqlx::Error::Database(_) => "database",
+                                    sqlx::Error::PoolTimedOut => "pool_timeout",
+                                    sqlx::Error::Io(_) => "io",
+                                    _ => "other",
+                                };
+                                tracing::warn!(
+                                    error_kind,
+                                    "User registry cleanup failed after schema initialization failure; registry state will be revalidated on retry"
+                                );
                             }
-                            return Err(err);
                         }
-                        user_schema_cache.insert(cache_key.clone(), true);
+                        return Err(err);
                     }
+                    user_schema_cache.insert(cache_key.clone(), true);
                 }
                 user_db_cache.insert(user_id_owned.clone(), db_name.clone());
                 let store = Arc::new(build_routed_store(
@@ -669,21 +681,19 @@ impl DbRouter {
                         .map_err(|_| {
                             MemoriaError::Internal("group schema init semaphore closed".into())
                         })?;
-                    if self.user_schema_cache.get(&cache_key_owned).is_none() {
-                        let db_url = self.user_db_url(&db_name)?;
-                        let init_result = match SqlMemoryStore::connect_routed(
-                            &db_url,
-                            self.embedding_dim,
-                            self.instance_id.clone(),
-                        )
-                        .await
-                        {
-                            Ok(init_store) => init_store.migrate_user().await,
-                            Err(err) => Err(err),
-                        };
-                        init_result?;
-                        self.user_schema_cache.insert(cache_key_owned.clone(), true);
-                    }
+                    let db_url = self.user_db_url(&db_name)?;
+                    let init_result = match SqlMemoryStore::connect_routed(
+                        &db_url,
+                        self.embedding_dim,
+                        self.instance_id.clone(),
+                    )
+                    .await
+                    {
+                        Ok(init_store) => init_store.migrate_user().await,
+                        Err(err) => Err(err),
+                    };
+                    init_result?;
+                    self.user_schema_cache.insert(cache_key_owned.clone(), true);
                 }
                 let mut store = build_routed_store(
                     self.global_user_pool.clone(),
