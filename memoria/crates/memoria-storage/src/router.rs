@@ -275,35 +275,47 @@ impl DbRouter {
     }
 
     /// Register (or re-activate) a user→db mapping in mem_user_registry.
+    /// Serialize with initialization/cleanup and expire routing caches before
+    /// writing, including writes whose result becomes unknown on cancellation.
     pub async fn register_user_db(&self, user_id: &str, db_name: &str) -> Result<(), MemoriaError> {
-        let now = Utc::now().naive_utc();
-        let insert = sqlx::query(
-            r#"INSERT INTO mem_user_registry (user_id, db_name, status, created_at, updated_at)
-               VALUES (?, ?, 'active', ?, ?)"#,
-        )
-        .bind(user_id)
-        .bind(db_name)
-        .bind(now)
-        .bind(now)
-        .execute(&self.shared_pool)
-        .await;
-
-        match insert {
-            Ok(_) => Ok(()),
-            Err(e) if is_duplicate_key_error(&e) => {
-                sqlx::query(
-                    "UPDATE mem_user_registry SET db_name = ?, status = 'active', updated_at = ? WHERE user_id = ?",
+        let key = ScopeKey::User(user_id.to_owned());
+        self.cache_operation(
+            key.clone(),
+            self.init_timeout,
+            "user database registration",
+            async {
+                self.clear_scope_caches(&key);
+                let now = Utc::now().naive_utc();
+                let insert = sqlx::query(
+                    r#"INSERT INTO mem_user_registry (user_id, db_name, status, created_at, updated_at)
+                       VALUES (?, ?, 'active', ?, ?)"#,
                 )
+                .bind(user_id)
                 .bind(db_name)
                 .bind(now)
-                .bind(user_id)
+                .bind(now)
                 .execute(&self.shared_pool)
-                .await
-                .map_err(db_err)?;
-                Ok(())
-            }
-            Err(e) => Err(db_err(e)),
-        }
+                .await;
+
+                match insert {
+                    Ok(_) => Ok(()),
+                    Err(e) if is_duplicate_key_error(&e) => {
+                        sqlx::query(
+                            "UPDATE mem_user_registry SET db_name = ?, status = 'active', updated_at = ? WHERE user_id = ?",
+                        )
+                        .bind(db_name)
+                        .bind(now)
+                        .bind(user_id)
+                        .execute(&self.shared_pool)
+                        .await
+                        .map_err(db_err)?;
+                        Ok(())
+                    }
+                    Err(e) => Err(db_err(e)),
+                }
+            },
+        )
+        .await
     }
 
     pub async fn list_registered_users(&self) -> Result<Vec<UserDatabaseRecord>, MemoriaError> {
@@ -503,15 +515,21 @@ impl DbRouter {
             self.invalidation_timeout,
             "cache invalidation",
             async {
-                if let ScopeKey::User(user_id) = &cache_key {
-                    self.user_db_cache.invalidate(user_id);
-                }
-                self.user_schema_cache.invalidate(&cache_key);
-                self.user_store_cache.invalidate(&cache_key);
+                self.clear_scope_caches(&cache_key);
                 Ok(())
             },
         )
         .await
+    }
+
+    // Call only while the corresponding scope gate is held. Do not call the
+    // async public invalidation API from another gated operation: it re-locks.
+    fn clear_scope_caches(&self, key: &ScopeKey) {
+        if let ScopeKey::User(user_id) = key {
+            self.user_db_cache.invalidate(user_id);
+        }
+        self.user_schema_cache.invalidate(key);
+        self.user_store_cache.invalidate(key);
     }
 
     async fn cache_operation<T>(
@@ -1075,6 +1093,13 @@ mod tests {
                 let error = router.user_db_name("synthetic-user").await.unwrap_err();
                 assert!(
                     matches!(error, memoria_core::MemoriaError::Database(ref message) if message.contains("database mapping lookup timed out"))
+                );
+                let error = router
+                    .register_user_db("synthetic-user", "synthetic_replacement")
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, memoria_core::MemoriaError::Database(ref message) if message.contains("user database registration timed out"))
                 );
             }
             drop(blocker);

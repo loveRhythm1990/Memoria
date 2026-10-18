@@ -580,10 +580,14 @@ async fn router_invalidation_also_orders_an_inflight_database_mapping_lookup() {
         .execute(router.shared_pool())
         .await
         .expect("create replacement database");
-    router
-        .register_user_db(&user, &replacement)
+    // Simulate an external registry update. The registration API's own cache
+    // invalidation must not mask the invalidation behavior under test here.
+    sqlx::query("UPDATE mem_user_registry SET db_name = ? WHERE user_id = ?")
+        .bind(&replacement)
+        .bind(&user)
+        .execute(router.shared_pool())
         .await
-        .expect("replace mapping");
+        .expect("replace fixture mapping outside the router");
     if waited {
         invalidation.await.expect("invalidate scoped caches");
     }

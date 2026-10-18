@@ -178,12 +178,102 @@ async fn assert_interrupted_ddl_recovers(
     assert_eq!(version, CURRENT_USER_SCHEMA_VERSION);
 }
 
+async fn registration_survives_failed_initialization_cleanup(
+    router: &DbRouter,
+    proxy: &InitializationFaultProxy,
+    databases: &mut Vec<String>,
+) {
+    let user = format!("registration_race_{}", Uuid::new_v4().simple());
+    let db = DbRouter::user_db_name_for_id(&user);
+    databases.push(db.clone());
+    proxy.reject_init_and_pause_cleanup();
+    let initializer_router = router.clone();
+    let initializer_user = user.clone();
+    let initializer =
+        tokio::spawn(async move { initializer_router.user_store(&initializer_user).await });
+    proxy.cleanup_is_paused().await;
+    let mut registration = Box::pin(router.register_user_db(&user, &db));
+    let early = tokio::time::timeout(Duration::from_secs(1), &mut registration).await;
+    let completed_before_cleanup = early.is_ok();
+    proxy.resume_cleanup();
+    match early {
+        Ok(result) => result.expect("registration succeeds"),
+        Err(_) => registration
+            .as_mut()
+            .await
+            .expect("registration follows failed initialization cleanup"),
+    }
+    drop(registration);
+    assert!(initializer.await.expect("initializer task").is_err());
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mem_user_registry WHERE user_id = ? AND db_name = ? AND status = 'active'",
+    ).bind(&user).bind(&db).fetch_one(router.shared_pool()).await.expect("inspect final registration");
+    assert!(
+        !completed_before_cleanup,
+        "registration must wait for the initializer's gate"
+    );
+    assert_eq!(
+        remaining, 1,
+        "successful registration must survive compensating cleanup"
+    );
+    let repaired = router
+        .user_store(&user)
+        .await
+        .expect("registered user initializes on retry");
+    assert_eq!(repaired.db_name(), Some(db.as_str()));
+}
+
+async fn registration_retargets_warm_caches(
+    router: &DbRouter,
+    admin: &MySqlPool,
+    databases: &mut Vec<String>,
+) {
+    let user = format!("retarget_{}", Uuid::new_v4().simple());
+    let original_db = DbRouter::user_db_name_for_id(&user);
+    let replacement = format!("registration_replacement_{}", Uuid::new_v4().simple());
+    databases.extend([original_db.clone(), replacement.clone()]);
+    let original = router
+        .user_store(&user)
+        .await
+        .expect("warm original schema and store");
+    assert_eq!(
+        router
+            .user_db_name(&user)
+            .await
+            .expect("warm original mapping"),
+        original_db
+    );
+    sqlx::raw_sql(&format!("CREATE DATABASE `{replacement}`"))
+        .execute(admin)
+        .await
+        .expect("create empty replacement database");
+    router
+        .register_user_db(&user, &replacement)
+        .await
+        .expect("retarget existing registration");
+    assert_eq!(
+        router.user_db_name(&user).await.expect("refresh mapping"),
+        replacement
+    );
+    let refreshed = router
+        .user_store(&user)
+        .await
+        .expect("initialize replacement schema");
+    assert!(!Arc::ptr_eq(&original, &refreshed));
+    assert_eq!(refreshed.db_name(), Some(replacement.as_str()));
+    let version: i64 = sqlx::query_scalar(&format!("SELECT schema_version FROM `{replacement}`.mem_schema_meta WHERE schema_key = 'user_schema'"))
+        .fetch_one(admin).await.expect("replacement must not reuse old schema readiness");
+    assert_eq!(version, CURRENT_USER_SCHEMA_VERSION);
+}
+
 async fn exercise_recovery(
     router: &DbRouter,
     admin: &MySqlPool,
     proxy: &InitializationFaultProxy,
     databases: &mut Vec<String>,
 ) {
+    registration_survives_failed_initialization_cleanup(router, proxy, databases).await;
+    registration_retargets_warm_caches(router, admin, databases).await;
     SqlMemoryStore::new(router.shared_pool().clone(), 8, "synthetic-recovery".into())
         .migrate_shared()
         .await
@@ -292,6 +382,7 @@ async fn routed_initialization_recovers_after_committed_ddl_timeout_and_failed_c
         .catch_unwind()
         .await;
     proxy.release_ddl_response();
+    proxy.resume_cleanup();
     for db in databases.iter().chain(std::iter::once(&shared_db)) {
         sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS `{db}`"))
             .execute(&admin)

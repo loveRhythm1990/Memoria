@@ -36,6 +36,9 @@ struct Control {
     reject_init: AtomicBool,
     reject_cleanup: AtomicBool,
     cleanup_rejections: AtomicUsize,
+    pause_cleanup: AtomicBool,
+    cleanup_paused: Notify,
+    resume_cleanup: Notify,
 }
 
 pub struct InitializationFaultProxy {
@@ -106,6 +109,24 @@ impl InitializationFaultProxy {
         self.control.reject_cleanup.store(true, Ordering::SeqCst);
     }
 
+    pub fn reject_init_and_pause_cleanup(&self) {
+        self.control.reject_init.store(true, Ordering::SeqCst);
+        self.control.pause_cleanup.store(true, Ordering::SeqCst);
+    }
+
+    pub async fn cleanup_is_paused(&self) {
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            self.control.cleanup_paused.notified(),
+        )
+        .await
+        .expect("compensating cleanup reaches proxy");
+    }
+
+    pub fn resume_cleanup(&self) {
+        self.control.resume_cleanup.notify_one();
+    }
+
     pub fn cleanup_rejections(&self) -> usize {
         self.control.cleanup_rejections.load(Ordering::SeqCst)
     }
@@ -172,6 +193,12 @@ async fn session(client: TcpStream, server: TcpStream, control: Arc<Control>) {
                         break;
                     }
                     continue;
+                }
+                if sql.starts_with("delete from mem_user_registry")
+                    && requests_control.pause_cleanup.swap(false, Ordering::SeqCst)
+                {
+                    requests_control.cleanup_paused.notify_one();
+                    requests_control.resume_cleanup.notified().await;
                 }
                 let pause = {
                     let mut armed = requests_control.pause.lock().unwrap();
