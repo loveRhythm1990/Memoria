@@ -46,6 +46,14 @@ fn owner_scoped_master_scopes() -> Vec<String> {
         .collect()
 }
 
+/// `grp_` is reserved for group IDs. Every boundary that accepts or mints a
+/// personal `user_id` must reject this prefix, otherwise `DbRouter::scope_store`
+/// (which dispatches on string prefix alone) can route a personal request into
+/// group storage belonging to someone else (#334).
+pub(crate) fn is_reserved_group_id(user_id: &str) -> bool {
+    user_id.starts_with("grp_")
+}
+
 fn validate_owner_scoped_master_request(
     token: &str,
     master_key: &str,
@@ -67,7 +75,7 @@ fn validate_owner_scoped_master_request(
             !value.is_empty()
                 && value.trim() == *value
                 && value.len() <= MAX_OWNER_SCOPED_USER_ID_LEN
-                && !value.starts_with("grp_")
+                && !is_reserved_group_id(value)
                 && !value.chars().any(char::is_control)
         })
         .ok_or_else(|| {
@@ -79,6 +87,35 @@ fn validate_owner_scoped_master_request(
         })?;
 
     Ok(owner.to_string())
+}
+
+/// Resolves the personal `user_id` for master-key and no-auth open-mode
+/// requests (the owner-scoped scheme has its own, already-guarded resolver
+/// above). Rejects the reserved `grp_` prefix so a personal request can
+/// never be dispatched to group storage by `DbRouter::scope_store` (#334).
+fn resolve_personal_user_id(
+    headers: &axum::http::HeaderMap,
+    query: Option<&str>,
+) -> Result<String, (StatusCode, String)> {
+    let user_id = headers
+        .get("X-User-Id")
+        .or_else(|| headers.get("X-Impersonate-User"))
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+        .or_else(|| {
+            serde_urlencoded::from_str::<UserQuery>(query.unwrap_or(""))
+                .ok()
+                .and_then(|q| q.user_id)
+        })
+        .unwrap_or_else(|| "default".to_string());
+
+    if is_reserved_group_id(&user_id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "User ID must not start with the reserved 'grp_' prefix".to_string(),
+        ));
+    }
+    Ok(user_id)
 }
 
 /// Agent labels are recorded only after the request's scope admission. MCP
@@ -1261,19 +1298,17 @@ impl FromRequestParts<AppState> for AuthUser {
         }
         // Reached here: master key validated, or no-auth open mode (master_key not configured)
 
-        let user_id = parts
-            .headers
-            .get("X-User-Id")
-            .or_else(|| parts.headers.get("X-Impersonate-User"))
-            .and_then(|v| v.to_str().ok())
-            .map(String::from)
-            .or_else(|| {
-                let uri = parts.uri.query().unwrap_or("");
-                serde_urlencoded::from_str::<UserQuery>(uri)
-                    .ok()
-                    .and_then(|q| q.user_id)
-            })
-            .unwrap_or_else(|| "default".to_string());
+        let user_id = match resolve_personal_user_id(&parts.headers, parts.uri.query()) {
+            Ok(user_id) => user_id,
+            Err(rejection) => {
+                crate::metrics::registry().security.auth_failures.inc();
+                warn!(
+                    path = %parts.uri.path(),
+                    "auth: personal user id must not use reserved grp_ prefix"
+                );
+                return Err(rejection);
+            }
+        };
 
         if let Some(tool) = tool_name {
             state.tool_usage_batcher.mark_used(user_id.clone(), tool);
@@ -1566,6 +1601,50 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(rejection.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn personal_user_id_with_group_prefix_is_reserved() {
+        assert!(is_reserved_group_id("grp_abc123"));
+        assert!(!is_reserved_group_id("alice"));
+        assert!(!is_reserved_group_id("group_without_underscore_prefix"));
+    }
+
+    #[test]
+    fn open_mode_rejects_group_prefixed_user_id_header() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("X-User-Id", "grp_victim_group".parse().unwrap());
+        let rejection = resolve_personal_user_id(&headers, None).unwrap_err();
+        assert_eq!(rejection.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn open_mode_rejects_group_prefixed_impersonate_header() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("X-Impersonate-User", "grp_victim_group".parse().unwrap());
+        let rejection = resolve_personal_user_id(&headers, None).unwrap_err();
+        assert_eq!(rejection.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn open_mode_rejects_group_prefixed_query_param() {
+        let headers = axum::http::HeaderMap::new();
+        let rejection =
+            resolve_personal_user_id(&headers, Some("user_id=grp_victim_group")).unwrap_err();
+        assert_eq!(rejection.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn open_mode_accepts_ordinary_user_id() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("X-User-Id", "alice".parse().unwrap());
+        assert_eq!(resolve_personal_user_id(&headers, None).unwrap(), "alice");
+
+        let headers = axum::http::HeaderMap::new();
+        assert_eq!(
+            resolve_personal_user_id(&headers, None).unwrap(),
+            "default"
+        );
     }
 
     #[test]

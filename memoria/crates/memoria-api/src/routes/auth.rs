@@ -11,8 +11,8 @@ use sqlx::Row;
 
 use crate::{
     auth::{
-        parse_scopes, AuthUser, DEFAULT_API_KEY_SCOPES, SCOPE_IDENTITY_READ, SCOPE_KEYS_MANAGE,
-        SCOPE_MEMORY_READ, SCOPE_MEMORY_WRITE,
+        is_reserved_group_id, parse_scopes, AuthUser, DEFAULT_API_KEY_SCOPES,
+        SCOPE_IDENTITY_READ, SCOPE_KEYS_MANAGE, SCOPE_MEMORY_READ, SCOPE_MEMORY_WRITE,
     },
     routes::memory::api_err,
     state::AppState,
@@ -216,6 +216,12 @@ pub async fn create_key(
         None => {
             // Personal key: master only
             auth.require_master()?;
+            if is_reserved_group_id(&req.user_id) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Personal user_id must not start with the reserved 'grp_' prefix".into(),
+                ));
+            }
         }
     }
 
