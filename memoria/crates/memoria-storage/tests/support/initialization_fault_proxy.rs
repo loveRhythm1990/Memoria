@@ -2,6 +2,7 @@
 //! backend and hold its OK packet, or reject initialization/cleanup separately.
 //! Neither SQL nor connection credentials are written to logs.
 use sqlx::mysql::{MySqlConnectOptions, MySqlSslMode};
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
@@ -21,6 +22,7 @@ use mysql_packet::packet;
 const COM_QUERY: u8 = 0x03;
 const COM_STMT_PREPARE: u8 = 0x16;
 const COM_STMT_EXECUTE: u8 = 0x17;
+const COM_STMT_CLOSE: u8 = 0x19;
 
 struct Pause {
     verb: &'static str,
@@ -154,17 +156,41 @@ async fn session(client: TcpStream, server: TcpStream, control: Arc<Control>) {
     let (mut sr, mut sw) = server.into_split();
     let pending_reply = Arc::new(Mutex::new(None::<Arc<Notify>>));
     let requests_pending = pending_reply.clone();
-    let preparing = Arc::new(Mutex::new(None::<Arc<Notify>>));
+    let preparing = Arc::new(Mutex::new(None::<String>));
     let requests_preparing = preparing.clone();
-    let prepared = Arc::new(Mutex::new(None::<(u32, Arc<Notify>)>));
+    let prepared = Arc::new(Mutex::new(HashMap::<u32, String>::new()));
     let requests_prepared = prepared.clone();
     let requests_control = control.clone();
     let requests_output = cw.clone();
     let requests = async move {
         while let Ok(bytes) = packet(&mut cr).await {
-            if bytes.len() > 5 && bytes[3] == 0 && matches!(bytes[4], COM_QUERY | COM_STMT_PREPARE)
-            {
-                let sql = String::from_utf8_lossy(&bytes[5..]).to_ascii_lowercase();
+            // Faults apply to execution, including cached prepared statements.
+            // PREPARE only records SQL once its backend acknowledgement gives us
+            // the statement ID; it must not consume an execution fault.
+            let sql = if bytes.len() > 5 && bytes[3] == 0 {
+                match bytes[4] {
+                    COM_QUERY => Some(String::from_utf8_lossy(&bytes[5..]).to_ascii_lowercase()),
+                    COM_STMT_PREPARE => {
+                        *requests_preparing.lock().unwrap() =
+                            Some(String::from_utf8_lossy(&bytes[5..]).to_ascii_lowercase());
+                        None
+                    }
+                    COM_STMT_EXECUTE | COM_STMT_CLOSE if bytes.len() >= 9 => {
+                        let id = u32::from_le_bytes(bytes[5..9].try_into().unwrap());
+                        let mut prepared = requests_prepared.lock().unwrap();
+                        if bytes[4] == COM_STMT_CLOSE {
+                            prepared.remove(&id);
+                            None
+                        } else {
+                            prepared.get(&id).cloned()
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(sql) = sql {
                 let failure = if sql.starts_with("create table")
                     && sql.contains("mem_memories")
                     && requests_control.reject_init.swap(false, Ordering::SeqCst)
@@ -212,21 +238,7 @@ async fn session(client: TcpStream, server: TcpStream, control: Arc<Control>) {
                     }
                 };
                 if let Some(pause) = pause {
-                    if bytes[4] == COM_QUERY {
-                        *requests_pending.lock().unwrap() = Some(pause.release);
-                    } else {
-                        // PREPARE's OK only allocates a statement. Capture its
-                        // ID and wait for the matching EXECUTE before pausing.
-                        *requests_preparing.lock().unwrap() = Some(pause.release);
-                    }
-                }
-            }
-            if bytes.len() >= 9 && bytes[3] == 0 && bytes[4] == COM_STMT_EXECUTE {
-                let id = u32::from_le_bytes(bytes[5..9].try_into().unwrap());
-                let mut prepared = requests_prepared.lock().unwrap();
-                if prepared.as_ref().is_some_and(|(target, _)| *target == id) {
-                    let (_, release) = prepared.take().unwrap();
-                    *requests_pending.lock().unwrap() = Some(release);
+                    *requests_pending.lock().unwrap() = Some(pause.release);
                 }
             }
             if sw.write_all(&bytes).await.is_err() {
@@ -237,18 +249,13 @@ async fn session(client: TcpStream, server: TcpStream, control: Arc<Control>) {
     let replies = async move {
         while let Ok(bytes) = packet(&mut sr).await {
             let prepare = preparing.lock().unwrap().take();
-            if let Some(release) = prepare {
-                assert!(
-                    bytes.len() >= 16 && bytes[4] == 0x00,
-                    "DDL PREPARE must succeed"
-                );
-                assert_eq!(
-                    &bytes[9..13],
-                    &[0, 0, 0, 0],
-                    "synthetic DDL has no result columns or parameters"
-                );
-                let id = u32::from_le_bytes(bytes[5..9].try_into().unwrap());
-                *prepared.lock().unwrap() = Some((id, release));
+            if let Some(sql) = prepare {
+                // Only PREPARE_OK creates a live statement ID. Subsequent
+                // parameter/column packets are forwarded without interpretation.
+                if bytes.len() >= 16 && bytes[4] == 0x00 {
+                    let id = u32::from_le_bytes(bytes[5..9].try_into().unwrap());
+                    prepared.lock().unwrap().insert(id, sql);
+                }
             }
             let pause = pending_reply.lock().unwrap().take();
             if let Some(release) = pause {
@@ -265,4 +272,74 @@ async fn session(client: TcpStream, server: TcpStream, control: Arc<Control>) {
         }
     };
     tokio::select! { _ = requests => {}, _ = replies => {} }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn reused_prepared_cleanup_is_rejected_at_execute() {
+        let (mut client, proxy_client) = tcp_pair().await;
+        let (proxy_server, mut backend) = tcp_pair().await;
+        let control = Arc::new(Control::default());
+        let task = tokio::spawn(session(proxy_client, proxy_server, control.clone()));
+        let outcome = tokio::time::timeout(Duration::from_secs(2), async {
+            let sql = b"DELETE FROM mem_user_registry WHERE user_id = ?";
+            let mut prepare = vec![(sql.len() + 1) as u8, 0, 0, 0, COM_STMT_PREPARE];
+            prepare.extend_from_slice(sql);
+            client.write_all(&prepare).await.unwrap();
+            assert_eq!(packet(&mut backend).await.unwrap(), prepare);
+            // PREPARE_OK: statement 42, no columns, one bound parameter.
+            let prepare_ok = [12, 0, 0, 1, 0, 42, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+            backend.write_all(&prepare_ok).await.unwrap();
+            assert_eq!(packet(&mut client).await.unwrap(), prepare_ok);
+            // SQL values are immaterial to the proxy; the fake backend only
+            // acknowledges this command so the same statement can be reused.
+            let execute = [10, 0, 0, 0, COM_STMT_EXECUTE, 42, 0, 0, 0, 0, 1, 0, 0, 0];
+            let ok = [7, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0];
+            client.write_all(&execute).await.unwrap();
+            assert_eq!(packet(&mut backend).await.unwrap(), execute);
+            backend.write_all(&ok).await.unwrap();
+            assert_eq!(packet(&mut client).await.unwrap(), ok);
+
+            control.reject_cleanup.store(true, Ordering::SeqCst);
+            client.write_all(&execute).await.unwrap();
+            assert_eq!(packet(&mut client).await.unwrap()[4], 0xff);
+            assert_eq!(control.cleanup_rejections.load(Ordering::SeqCst), 1);
+            // The fault is one-shot; retrying the same prepared ID is forwarded.
+            client.write_all(&execute).await.unwrap();
+            assert_eq!(packet(&mut backend).await.unwrap(), execute);
+            backend.write_all(&ok).await.unwrap();
+            assert_eq!(packet(&mut client).await.unwrap(), ok);
+
+            // Closing a statement retires its SQL association. An invalid later
+            // EXECUTE belongs to the backend, not the cleanup fault injector.
+            control.reject_cleanup.store(true, Ordering::SeqCst);
+            let close = [5, 0, 0, 0, COM_STMT_CLOSE, 42, 0, 0, 0];
+            client.write_all(&close).await.unwrap();
+            assert_eq!(packet(&mut backend).await.unwrap(), close);
+            client.write_all(&execute).await.unwrap();
+            assert_eq!(packet(&mut backend).await.unwrap(), execute);
+            backend
+                .write_all(&server_error(1, b"synthetic unknown statement"))
+                .await
+                .unwrap();
+            assert_eq!(packet(&mut client).await.unwrap()[4], 0xff);
+            assert!(control.reject_cleanup.load(Ordering::SeqCst));
+            assert_eq!(control.cleanup_rejections.load(Ordering::SeqCst), 1);
+        })
+        .await;
+        task.abort();
+        outcome.expect("cached EXECUTE must reach the injected cleanup error");
+    }
 }

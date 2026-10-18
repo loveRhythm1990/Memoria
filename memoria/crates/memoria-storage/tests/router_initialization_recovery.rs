@@ -20,8 +20,9 @@ struct TimeoutSetting(Option<std::ffi::OsString>);
 impl TimeoutSetting {
     fn set() -> Self {
         let old = std::env::var_os("MEMORIA_ROUTER_INIT_TIMEOUT_SECS");
-        // This binary has one current-thread test. Only its router constructor
-        // reads this setting; restore it before the concurrent fault scenarios.
+        // Only the current-thread database test constructs a router and reads
+        // this setting; the protocol-only test does not use the environment.
+        // Restore it before the concurrent database fault scenarios.
         std::env::set_var("MEMORIA_ROUTER_INIT_TIMEOUT_SECS", "10");
         Self(old)
     }
