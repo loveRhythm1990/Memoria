@@ -211,6 +211,8 @@ pub struct VisibleSnapshot {
     pub memory_count: Option<i64>,
     pub timestamp: Option<NaiveDateTime>,
     pub registered: bool,
+    /// Classified during discovery; registered user snapshots are never safety snapshots.
+    pub is_safety: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -424,17 +426,18 @@ pub async fn visible_snapshots_for_user(
                 memory_count: memoria_storage::snapshot_extra_memory_count(reg.extra.as_ref()),
                 timestamp: actual.timestamp.or(Some(reg.created_at)),
                 registered: true,
+                is_safety: false,
             });
         }
     }
 
     for actual in actual_by_name.values() {
+        let is_safety = is_safety_snapshot_name(&actual.snapshot_name, db_name);
         if !seen_internal.contains(&actual.snapshot_name)
-            && (actual.snapshot_name.starts_with(MILESTONE_PREFIX)
-                || is_safety_snapshot_name(&actual.snapshot_name, db_name))
+            && (actual.snapshot_name.starts_with(MILESTONE_PREFIX) || is_safety)
         {
             snapshots.push(VisibleSnapshot {
-                display_name: if is_safety_snapshot_name(&actual.snapshot_name, db_name) {
+                display_name: if is_safety {
                     safety_display_name(&actual.snapshot_name)
                         .unwrap_or_else(|| snap_display(&actual.snapshot_name))
                 } else {
@@ -444,6 +447,7 @@ pub async fn visible_snapshots_for_user(
                 memory_count: None,
                 timestamp: actual.timestamp,
                 registered: false,
+                is_safety,
             });
         }
     }
@@ -2599,6 +2603,42 @@ mod tests {
             "memoria_shared_db_with_a_really_long_name_for_product_runs",
         ));
         assert!(prefix.len() < MAX_IDENTIFIER_LEN, "{prefix}");
+    }
+
+    #[test]
+    fn safety_classification_covers_legacy_scoped_and_compacted_prefixes() {
+        assert!(super::is_safety_snapshot_name("mem_snap_pre_purge", None));
+        for db_name in ["snapshot_test", "snapshot_test_database_with_a_long_name"] {
+            assert!(super::is_safety_snapshot_name(
+                "mem_snap_pre_purge",
+                Some(db_name),
+            ));
+            assert!(super::is_safety_snapshot_name(
+                &format!("mem_snap_{db_name}_pre_purge"),
+                Some(db_name),
+            ));
+            assert!(super::is_safety_snapshot_name(
+                &format!("{}purge", safety_prefix(Some(db_name))),
+                Some(db_name),
+            ));
+            assert!(!super::is_safety_snapshot_name(
+                "mem_snap_another_database_pre_purge",
+                Some(db_name),
+            ));
+            assert!(!super::is_safety_snapshot_name(
+                &snap_internal("test_scope", "pre_release"),
+                Some(db_name),
+            ));
+            assert!(!super::is_safety_snapshot_name(
+                "mem_milestone_checkpoint",
+                Some(db_name),
+            ));
+        }
+        let long_db = "snapshot_test_database_with_a_long_name";
+        assert_ne!(
+            safety_prefix(Some(long_db)),
+            format!("mem_snap_{long_db}_pre_")
+        );
     }
 
     #[test]

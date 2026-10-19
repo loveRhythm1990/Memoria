@@ -25,6 +25,17 @@ Registered legacy snapshots still receive read-through count backfill in that
 mode. Unregistered safety snapshots do not have a registration in which to store
 that count, so repeated exact-count requests can repeat historical queries.
 
+A legacy registered snapshot with no cached count stays `null` for every
+cached-only request until another exact-count request or a separately managed
+backfill populates its metadata. Fast listing does not schedule background
+backfill. Any bulk backfill should be a bounded maintenance operation outside
+the dashboard request path, with its own authorization and performance review.
+
+Safety classification is attached to `VisibleSnapshot` during discovery. The
+list route consumes that classification instead of interpreting physical-name
+prefixes again; registered snapshots are classified as user snapshots even when
+their names resemble a safety snapshot.
+
 Historical reads can require loading index snapshot state and checkpoint
 metadata in MatrixOne. Fast listing avoids that work for counts; it still reads
 the snapshot catalog and registration metadata and is not a guarantee that every

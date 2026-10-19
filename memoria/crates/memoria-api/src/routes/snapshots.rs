@@ -486,17 +486,12 @@ async fn snapshot_summary_value(
 }
 
 fn snapshot_page<'a>(
-    sql: &Arc<memoria_storage::SqlMemoryStore>,
     all: &'a [memoria_mcp::git_tools::VisibleSnapshot],
     query: &ListSnapshotsQuery,
 ) -> (usize, Vec<&'a memoria_mcp::git_tools::VisibleSnapshot>) {
     let visible: Vec<_> = all
         .iter()
-        .filter(|snapshot| {
-            query.include_safety
-                || snapshot.registered
-                || !is_safety_snapshot_name(sql, &snapshot.internal_name)
-        })
+        .filter(|snapshot| query.include_safety || !snapshot.is_safety)
         .collect();
     let total = visible.len();
     let page = visible
@@ -522,7 +517,7 @@ async fn snapshot_list_payload(
         .await
         .map_err(api_err_typed)?;
     let visible_elapsed_ms = visible_started.elapsed().as_millis();
-    let (total, page) = snapshot_page(&sql, &all, &query);
+    let (total, page) = snapshot_page(&all, &query);
     let summaries_started = std::time::Instant::now();
     let mut snapshots = Vec::new();
     for snapshot in page {
@@ -1149,6 +1144,7 @@ mod snapshot_list_tests {
             memory_count: count,
             timestamp: None,
             registered,
+            is_safety: false,
         }
     }
 
@@ -1172,19 +1168,22 @@ mod snapshot_list_tests {
         );
     }
 
-    #[tokio::test]
-    async fn safety_filter_precedes_pagination_and_preserves_registered_pre_names() {
-        let sql = closed_store().await;
+    #[test]
+    fn safety_filter_precedes_pagination_and_preserves_registered_pre_names() {
         let mut legacy = snapshot("pre_legacy", false, None);
         legacy.internal_name = "mem_snap_pre_legacy".into();
+        legacy.is_safety = true;
         let mut milestone = snapshot("auto:checkpoint", false, None);
         milestone.internal_name = "mem_milestone_checkpoint".into();
         let mut compact = snapshot("pre_compact", false, None);
         compact.internal_name = format!("{}compact", compact_safety_prefix("snapshot_test"));
+        compact.is_safety = true;
+        let mut purge = snapshot("pre_purge", false, None);
+        purge.is_safety = true;
         let all = vec![
             legacy,
             snapshot("first", true, Some(3)),
-            snapshot("pre_purge", false, None),
+            purge,
             snapshot("pre_release", true, Some(4)),
             compact,
             milestone,
@@ -1195,40 +1194,34 @@ mod snapshot_list_tests {
             limit: 1,
             offset: 1,
         };
-        let (total, page) = snapshot_page(&sql, &all, &query);
+        let (total, page) = snapshot_page(&all, &query);
         assert_eq!(total, 3);
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].display_name, "pre_release");
 
         query.offset = 2;
-        let (_, page) = snapshot_page(&sql, &all, &query);
+        let (_, page) = snapshot_page(&all, &query);
         assert_eq!(page[0].internal_name, "mem_milestone_checkpoint");
         query.offset = 20;
-        assert!(snapshot_page(&sql, &all, &query).1.is_empty());
+        assert!(snapshot_page(&all, &query).1.is_empty());
 
         query.include_safety = true;
-        assert_eq!(snapshot_page(&sql, &all, &query).0, all.len());
+        assert_eq!(snapshot_page(&all, &query).0, all.len());
     }
 
-    #[tokio::test]
-    async fn safety_filter_recognizes_long_and_compacted_database_prefixes() {
-        let mut sql = closed_store().await;
-        let db_name = "snapshot_test_database_with_a_long_name";
-        Arc::get_mut(&mut sql).unwrap().set_db_name(db_name.into());
-        let mut full = snapshot("pre_full", false, None);
-        full.internal_name = format!("mem_snap_{db_name}_pre_full");
-        let mut compact = snapshot("pre_compact", false, None);
-        compact.internal_name = format!("{}compact", compact_safety_prefix(db_name));
-        assert_ne!(
-            compact_safety_prefix(db_name),
-            format!("mem_snap_{db_name}_pre_")
-        );
-        let all = vec![full, compact, snapshot("pre_release", true, None)];
+    #[test]
+    fn safety_filter_uses_discovery_metadata_instead_of_reparsing_names() {
+        let mut safety = snapshot("backup", false, None);
+        safety.internal_name = "another_internal_naming_format".into();
+        safety.is_safety = true;
+        let mut registered = snapshot("pre_release", true, None);
+        registered.internal_name = "mem_snap_pre_release".into();
+        let all = vec![safety, registered];
         let query = ListSnapshotsQuery {
             include_safety: false,
             ..Default::default()
         };
-        let (total, page) = snapshot_page(&sql, &all, &query);
+        let (total, page) = snapshot_page(&all, &query);
         assert_eq!(total, 1);
         assert_eq!(page[0].display_name, "pre_release");
     }
