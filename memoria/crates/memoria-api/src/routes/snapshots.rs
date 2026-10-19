@@ -17,15 +17,36 @@ use memoria_core::{MemoriaError, TrustTier};
 use memoria_git::GitForDataService;
 use std::sync::Arc;
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 pub struct ListSnapshotsQuery {
     #[serde(default = "default_snap_limit")]
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+    /// Include automatic safety snapshots; filter before pagination when false.
+    #[serde(default = "default_true")]
+    pub include_safety: bool,
+    /// Backfill missing historical counts. When false, unknown counts are null.
+    #[serde(default = "default_true")]
+    pub resolve_memory_counts: bool,
 }
 fn default_snap_limit() -> i64 {
     20
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for ListSnapshotsQuery {
+    fn default() -> Self {
+        Self {
+            limit: default_snap_limit(),
+            offset: 0,
+            include_safety: true,
+            resolve_memory_counts: true,
+        }
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -404,10 +425,11 @@ async fn snapshot_summary_value(
     sql: &Arc<memoria_storage::SqlMemoryStore>,
     user_id: &str,
     snapshot: &memoria_mcp::git_tools::VisibleSnapshot,
+    resolve_memory_counts: bool,
 ) -> Result<Value, (StatusCode, String)> {
     let snapshot_name = validate_snapshot_identifier(&snapshot.internal_name)?.to_string();
-    let memory_count = if let Some(memory_count) = snapshot.memory_count {
-        memory_count
+    let memory_count = if snapshot.memory_count.is_some() || !resolve_memory_counts {
+        snapshot.memory_count
     } else {
         // Read-through backfill for registrations created before mem_snapshots.extra.
         // The response still returns a concrete count, and registered snapshots are
@@ -449,7 +471,7 @@ async fn snapshot_summary_value(
                 "snapshot_list_phase: snapshot_memory_count"
             );
         }
-        memory_count
+        Some(memory_count)
     };
     let timestamp = format_snapshot_timestamp(snapshot.timestamp);
     Ok(json!({
@@ -463,12 +485,34 @@ async fn snapshot_summary_value(
     }))
 }
 
+fn snapshot_page<'a>(
+    sql: &Arc<memoria_storage::SqlMemoryStore>,
+    all: &'a [memoria_mcp::git_tools::VisibleSnapshot],
+    query: &ListSnapshotsQuery,
+) -> (usize, Vec<&'a memoria_mcp::git_tools::VisibleSnapshot>) {
+    let visible: Vec<_> = all
+        .iter()
+        .filter(|snapshot| {
+            query.include_safety
+                || snapshot.registered
+                || !is_safety_snapshot_name(sql, &snapshot.internal_name)
+        })
+        .collect();
+    let total = visible.len();
+    let page = visible
+        .into_iter()
+        .skip(query.offset.max(0) as usize)
+        .take(query.limit.max(0) as usize)
+        .collect();
+    (total, page)
+}
+
 async fn snapshot_list_payload(
     state: &AppState,
     user_id: &str,
-    limit: i64,
-    offset: i64,
+    query: ListSnapshotsQuery,
 ) -> Result<Value, (StatusCode, String)> {
+    let ListSnapshotsQuery { limit, offset, .. } = query;
     let started = std::time::Instant::now();
     let store_started = std::time::Instant::now();
     let sql = user_snapshot_store(state, user_id).await?;
@@ -478,15 +522,13 @@ async fn snapshot_list_payload(
         .await
         .map_err(api_err_typed)?;
     let visible_elapsed_ms = visible_started.elapsed().as_millis();
-    let total = all.len();
+    let (total, page) = snapshot_page(&sql, &all, &query);
     let summaries_started = std::time::Instant::now();
     let mut snapshots = Vec::new();
-    for snapshot in all
-        .iter()
-        .skip(offset.max(0) as usize)
-        .take(limit.max(0) as usize)
-    {
-        snapshots.push(snapshot_summary_value(&sql, user_id, snapshot).await?);
+    for snapshot in page {
+        snapshots.push(
+            snapshot_summary_value(&sql, user_id, snapshot, query.resolve_memory_counts).await?,
+        );
     }
     let summaries_elapsed_ms = summaries_started.elapsed().as_millis();
     let has_more = offset.max(0) as usize + snapshots.len() < total;
@@ -626,7 +668,7 @@ pub async fn create_snapshot(
             .iter()
             .find(|snapshot| snapshot.display_name == display_name)
         {
-            body = snapshot_summary_value(&sql, auth.scope_id(), snapshot).await?;
+            body = snapshot_summary_value(&sql, auth.scope_id(), snapshot, true).await?;
             body["description"] = json!(req.description.clone());
             body["result"] = json!(result.clone());
         }
@@ -640,7 +682,7 @@ pub async fn list_snapshots(
     Query(q): Query<ListSnapshotsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     Ok(Json(
-        snapshot_list_payload(&state, auth.scope_id(), q.limit, q.offset).await?,
+        snapshot_list_payload(&state, auth.scope_id(), q).await?,
     ))
 }
 
@@ -1084,4 +1126,144 @@ pub async fn delete_branch(
     )
     .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod snapshot_list_tests {
+    use super::*;
+    use memoria_mcp::git_tools::VisibleSnapshot;
+
+    async fn closed_store() -> Arc<memoria_storage::SqlMemoryStore> {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy_with(sqlx::mysql::MySqlConnectOptions::new());
+        pool.close().await;
+        let mut store = memoria_storage::SqlMemoryStore::new(pool, 4, "test".into());
+        store.set_db_name("snapshot_test".into());
+        Arc::new(store)
+    }
+
+    fn snapshot(name: &str, registered: bool, count: Option<i64>) -> VisibleSnapshot {
+        VisibleSnapshot {
+            display_name: name.into(),
+            internal_name: format!("mem_snap_snapshot_test_{name}"),
+            memory_count: count,
+            timestamp: None,
+            registered,
+        }
+    }
+
+    #[test]
+    fn snapshot_query_defaults_preserve_exact_counts_and_safety_visibility() {
+        let query: ListSnapshotsQuery = serde_urlencoded::from_str("").unwrap();
+        assert_eq!(query.limit, 20);
+        assert_eq!(query.offset, 0);
+        assert!(query.include_safety);
+        assert!(query.resolve_memory_counts);
+
+        let query: ListSnapshotsQuery = serde_urlencoded::from_str(
+            "include_safety=false&resolve_memory_counts=false&limit=2&offset=1",
+        )
+        .unwrap();
+        assert!(!query.include_safety);
+        assert!(!query.resolve_memory_counts);
+        assert_eq!((query.limit, query.offset), (2, 1));
+        assert!(
+            serde_urlencoded::from_str::<ListSnapshotsQuery>("include_safety=invalid").is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn safety_filter_precedes_pagination_and_preserves_registered_pre_names() {
+        let sql = closed_store().await;
+        let mut legacy = snapshot("pre_legacy", false, None);
+        legacy.internal_name = "mem_snap_pre_legacy".into();
+        let mut milestone = snapshot("auto:checkpoint", false, None);
+        milestone.internal_name = "mem_milestone_checkpoint".into();
+        let mut compact = snapshot("pre_compact", false, None);
+        compact.internal_name = format!("{}compact", compact_safety_prefix("snapshot_test"));
+        let all = vec![
+            legacy,
+            snapshot("first", true, Some(3)),
+            snapshot("pre_purge", false, None),
+            snapshot("pre_release", true, Some(4)),
+            compact,
+            milestone,
+        ];
+        let mut query = ListSnapshotsQuery {
+            include_safety: false,
+            resolve_memory_counts: false,
+            limit: 1,
+            offset: 1,
+        };
+        let (total, page) = snapshot_page(&sql, &all, &query);
+        assert_eq!(total, 3);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].display_name, "pre_release");
+
+        query.offset = 2;
+        let (_, page) = snapshot_page(&sql, &all, &query);
+        assert_eq!(page[0].internal_name, "mem_milestone_checkpoint");
+        query.offset = 20;
+        assert!(snapshot_page(&sql, &all, &query).1.is_empty());
+
+        query.include_safety = true;
+        assert_eq!(snapshot_page(&sql, &all, &query).0, all.len());
+    }
+
+    #[tokio::test]
+    async fn safety_filter_recognizes_long_and_compacted_database_prefixes() {
+        let mut sql = closed_store().await;
+        let db_name = "snapshot_test_database_with_a_long_name";
+        Arc::get_mut(&mut sql).unwrap().set_db_name(db_name.into());
+        let mut full = snapshot("pre_full", false, None);
+        full.internal_name = format!("mem_snap_{db_name}_pre_full");
+        let mut compact = snapshot("pre_compact", false, None);
+        compact.internal_name = format!("{}compact", compact_safety_prefix(db_name));
+        assert_ne!(
+            compact_safety_prefix(db_name),
+            format!("mem_snap_{db_name}_pre_")
+        );
+        let all = vec![full, compact, snapshot("pre_release", true, None)];
+        let query = ListSnapshotsQuery {
+            include_safety: false,
+            ..Default::default()
+        };
+        let (total, page) = snapshot_page(&sql, &all, &query);
+        assert_eq!(total, 1);
+        assert_eq!(page[0].display_name, "pre_release");
+    }
+
+    #[tokio::test]
+    async fn cached_only_summaries_never_query_or_backfill_a_closed_database() {
+        let sql = closed_store().await;
+        for registered in [true, false] {
+            for count in [None, Some(0), Some(7)] {
+                let snapshot = snapshot("backup", registered, count);
+                for _ in 0..2 {
+                    let summary = snapshot_summary_value(&sql, "test_user", &snapshot, false)
+                        .await
+                        .expect("cached-only listing must not access the closed pool");
+                    assert_eq!(summary["memory_count"], json!(count));
+                    assert_eq!(summary["registered"], registered);
+                    assert_eq!(summary["name"], "backup");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_count_mode_keeps_cached_counts_and_propagates_database_failures() {
+        let sql = closed_store().await;
+        let cached = snapshot("cached", true, Some(8));
+        let summary = snapshot_summary_value(&sql, "test_user", &cached, true)
+            .await
+            .unwrap();
+        assert_eq!(summary["memory_count"], 8);
+
+        let legacy = snapshot("legacy", true, None);
+        let error = snapshot_summary_value(&sql, "test_user", &legacy, true)
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }

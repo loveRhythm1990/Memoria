@@ -375,6 +375,9 @@ AI:  → memory_branch(name="eval_sqlite")
 
 </details>
 
+REST clients can use [cached-count snapshot listing](docs/snapshot-listing.md)
+to avoid historical count queries and exclude automatic safety snapshots.
+
 <details>
 <summary><b>Maintenance</b></summary>
 
