@@ -9,6 +9,11 @@ pull_request_rules:
         name: main
 queue_rules:
   - name: main
+    # Enforce eligibility even when Workflow Automation is disabled.
+    queue_conditions:
+      - "#approved-reviews-by>=1"
+      - label!=do-not-merge
+      - base=main
     merge_method: squash
     commit_message_format:
       title: pr-title
