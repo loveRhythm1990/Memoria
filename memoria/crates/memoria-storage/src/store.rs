@@ -939,6 +939,8 @@ pub struct SqlMemoryStore {
     /// Shared across main store and background pool clones so a single clear drains all.
     edit_log_tx: Arc<std::sync::RwLock<Option<tokio::sync::mpsc::Sender<OwnedEditLogEntry>>>>,
     db_router: Option<Arc<DbRouter>>,
+    /// Opt-in schema for local CAGRA experiments; all IVF management is disabled.
+    cuvs_experiment: bool,
     /// When Some, `t()` qualifies table names with this database prefix.
     /// Enables a single global pool to serve queries for different per-user databases.
     db_name: Option<String>,
@@ -1045,8 +1047,19 @@ impl SqlMemoryStore {
                 .build(),
             edit_log_tx: Arc::new(std::sync::RwLock::new(None)),
             db_router: None,
+            cuvs_experiment: false,
             db_name: None,
         }
+    }
+
+    /// Configure only before migration/use. No existing schema is converted.
+    pub fn with_cuvs_experiment(mut self, enabled: bool) -> Self {
+        self.cuvs_experiment = enabled;
+        self
+    }
+
+    pub fn cuvs_experiment_enabled(&self) -> bool {
+        self.cuvs_experiment
     }
 
     /// Set the edit-log channel sender (once, at startup).
@@ -1358,6 +1371,8 @@ impl SqlMemoryStore {
                 // Share the same edit_log_tx Arc so clear_edit_log_tx drains all stores at once
                 s.edit_log_tx = self.edit_log_tx.clone();
                 s.db_router = self.db_router.clone();
+                s.db_name = self.db_name.clone();
+                s.cuvs_experiment = self.cuvs_experiment;
                 Ok(std::sync::Arc::new(s))
             }
             Err(e) => Err(db_err(e)),
@@ -1385,7 +1400,7 @@ impl SqlMemoryStore {
         let api_call_log_table = self.t("mem_api_call_log");
         let sql = format!(
             r#"CREATE TABLE IF NOT EXISTS {memories_table} (
-                memory_id       VARCHAR(64)  PRIMARY KEY,
+                {memory_key_columns}
                 user_id         VARCHAR(64)  NOT NULL,
                 author_id       VARCHAR(64)  DEFAULT NULL,
                 subject_id      VARCHAR(128) DEFAULT NULL,
@@ -1410,9 +1425,17 @@ impl SqlMemoryStore {
                 FULLTEXT INDEX ft_content (content) WITH PARSER ngram -- MO#23861: breaks on concurrent snapshot restore
             )"#,
             memories_table = memories_table,
+            memory_key_columns = if self.cuvs_experiment {
+                "id BIGINT AUTO_INCREMENT PRIMARY KEY, memory_id VARCHAR(64) NOT NULL UNIQUE,"
+            } else {
+                "memory_id VARCHAR(64) PRIMARY KEY,"
+            },
             dim = self.embedding_dim
         );
         sqlx::query(&sql).execute(pool).await.map_err(db_err)?;
+        if self.cuvs_experiment {
+            self.ensure_cuvs_memory_schema(false).await?;
+        }
 
         sqlx::query(&format!(
             r#"CREATE TABLE IF NOT EXISTS {user_state_table} (
@@ -2328,7 +2351,28 @@ impl SqlMemoryStore {
         Ok(())
     }
 
+    async fn ensure_cuvs_memory_schema(&self, allow_missing: bool) -> Result<(), MemoriaError> {
+        let schema = self.current_schema_name().await?;
+        let columns: Vec<(String, String, String, String, String)> = sqlx::query_as(
+            "SELECT COLUMN_NAME, COLUMN_TYPE, COLUMN_KEY, EXTRA, IS_NULLABLE \
+             FROM information_schema.columns WHERE table_schema=? AND table_name='mem_memories'",
+        )
+        .bind(schema.as_ref())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if columns.is_empty() && allow_missing {
+            return Ok(());
+        }
+        crate::cuvs_experiment::validate_memory_columns(&columns)
+    }
+
     pub async fn migrate_user(&self) -> Result<(), MemoriaError> {
+        // Check BEFORE compat migrations and the version fast path. Never convert
+        // a legacy table merely because experimental mode was enabled.
+        if self.cuvs_experiment {
+            self.ensure_cuvs_memory_schema(true).await?;
+        }
         let pool = &self.pool;
         let meta_table = self.t("mem_schema_meta");
         let schema_name = self.current_schema_name().await?;
@@ -3926,6 +3970,11 @@ impl SqlMemoryStore {
     /// Rebuild IVF vector index for a table. lists = max(1, rows/50), capped at 1024.
     pub async fn rebuild_vector_index(&self, table: &str) -> Result<i64, MemoriaError> {
         Self::validate_table_name(table)?;
+        // Covers monitor, governance, plugin and direct calls before any SQL.
+        // CAGRA is created explicitly and maintained by MatrixOne, not this IVF path.
+        if self.cuvs_experiment {
+            return Ok(0);
+        }
         let qualified_table = self.t(table);
 
         // Workaround: MO PREPARE/EXECUTE stores None vecf32 as '[]' instead of NULL.
@@ -4324,8 +4373,11 @@ impl SqlMemoryStore {
         &self,
         table: &str,
     ) -> Result<(bool, i64, Option<i64>), MemoriaError> {
-        let mut conn = self.conn().await?;
         Self::validate_table_name(table)?;
+        if self.cuvs_experiment {
+            return Ok((false, 0, None));
+        }
+        let mut conn = self.conn().await?;
         let qualified_table = self.t(table);
         let runtime_table = self.t("mem_governance_runtime_state");
         let key = format!("vector_index_rebuild:{table}");

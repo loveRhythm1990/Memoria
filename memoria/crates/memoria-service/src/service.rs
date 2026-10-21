@@ -574,6 +574,7 @@ pub struct MemoryService {
     /// Isolated pool for graph retrieval (spreading activation, entity recall)
     /// to avoid starving the main pool during heavy retrieve queries.
     graph_pool: Option<Arc<SqlMemoryStore>>,
+    graph_retrieval_enabled: bool,
     /// Shared operational metrics reporter (None = disabled, zero overhead).
     /// Wrapped in OnceLock so the entity background worker can also access it
     /// after construction via `with_stats()`.
@@ -613,6 +614,20 @@ impl MemoryService {
         embedder: Option<Arc<dyn EmbeddingProvider>>,
         llm: Option<Arc<LlmClient>>,
     ) -> Self {
+        let graph_retrieval_enabled = !store.cuvs_experiment_enabled();
+        Self::new_sql_with_runtime_options(store, db_router, embedder, llm, graph_retrieval_enabled)
+            .await
+    }
+
+    /// Explicit runtime options, captured before background pools are created.
+    pub async fn new_sql_with_runtime_options(
+        store: Arc<SqlMemoryStore>,
+        db_router: Option<Arc<DbRouter>>,
+        embedder: Option<Arc<dyn EmbeddingProvider>>,
+        llm: Option<Arc<LlmClient>>,
+        graph_retrieval_enabled: bool,
+    ) -> Self {
+        let graph_retrieval_enabled = graph_retrieval_enabled && !store.cuvs_experiment_enabled();
         // Create edit-log buffer early so background stores inherit the sender
         let edit_log = EditLogBuffer::new(store.clone());
         store.set_edit_log_tx(edit_log.entry_sender());
@@ -626,7 +641,10 @@ impl MemoryService {
             .and_then(|s| s.parse().ok())
             .unwrap_or(512)
             .clamp(64, 8192);
-        let vector_monitor = if db_router.is_some() {
+        let vector_monitor = if store.cuvs_experiment_enabled() {
+            info!("IVF monitor disabled; cuVS experiment uses an externally managed index");
+            None
+        } else if db_router.is_some() {
             info!("vector rebuild worker disabled in multi-db mode");
             None
         } else {
@@ -719,7 +737,10 @@ impl MemoryService {
         let graph_pool_size_raw: Option<u32> = std::env::var("GRAPH_POOL_SIZE")
             .ok()
             .and_then(|s| s.parse().ok());
-        let graph_pool = if db_router.is_some() {
+        let graph_pool = if !graph_retrieval_enabled {
+            info!("Graph retrieval disabled; graph query pool not created");
+            None
+        } else if db_router.is_some() {
             if let Some(raw) = graph_pool_size_raw.filter(|raw| *raw > 0) {
                 info!(
                     graph_pool_size = raw,
@@ -774,6 +795,7 @@ impl MemoryService {
                 .build(),
             vector_monitor,
             graph_pool,
+            graph_retrieval_enabled,
             stats: stats_cell,
         }
     }
@@ -798,6 +820,9 @@ impl MemoryService {
             }
         };
         Self {
+            graph_retrieval_enabled: sql_store
+                .as_ref()
+                .is_none_or(|store| !store.cuvs_experiment_enabled()),
             store: store.clone(),
             sql_store,
             db_router: None,
@@ -842,10 +867,25 @@ impl MemoryService {
                     .build(),
                 vector_monitor: None,
                 graph_pool: None,
+                graph_retrieval_enabled: true,
                 stats: Arc::new(OnceLock::new()),
             },
             entries,
         )
+    }
+
+    /// Change retrieval policy on lightweight/test services without environment mutation.
+    pub fn with_graph_retrieval_enabled(mut self, enabled: bool) -> Self {
+        self.graph_retrieval_enabled = enabled
+            && self
+                .sql_store
+                .as_ref()
+                .is_none_or(|store| !store.cuvs_experiment_enabled());
+        self
+    }
+
+    pub fn graph_retrieval_enabled(&self) -> bool {
+        self.graph_retrieval_enabled
     }
 
     /// Attach a `StatsReporter` after construction.
@@ -1900,7 +1940,8 @@ impl MemoryService {
             // nodes spanning all subjects/types, almost all of which would be discarded
             // by the post-filter.  This mirrors the existing strict_session_id skip and
             // avoids wasted traversal work + spurious hybrid fallbacks.
-            if strict_session_id.is_none()
+            if self.graph_retrieval_enabled
+                && strict_session_id.is_none()
                 && subject_id.is_none()
                 && memory_types.is_none()
                 && table == main_table
@@ -3529,6 +3570,26 @@ mod tests {
     // ── existing test ─────────────────────────────────────────────────────────
 
     #[tokio::test]
+    async fn cuvs_service_disables_graph_pool_and_ivf_monitor_before_startup() {
+        let pool = MySqlPoolOptions::new().connect_lazy_with(
+            sqlx::mysql::MySqlConnectOptions::new()
+                .host("127.0.0.1")
+                .port(1),
+        );
+        let store = Arc::new(
+            SqlMemoryStore::new(pool, 4, "cuvs-local-test".into()).with_cuvs_experiment(true),
+        );
+        let service =
+            MemoryService::new_sql_with_runtime_options(store, None, None, None, true).await;
+        assert!(!service.graph_retrieval_enabled());
+        assert!(service.graph_pool.is_none());
+        assert!(service.vector_monitor.is_none());
+        assert!(!service
+            .with_graph_retrieval_enabled(true)
+            .graph_retrieval_enabled());
+    }
+
+    #[tokio::test]
     async fn test_new_sql_with_llm_disables_background_workers_without_database_url() {
         let pool = MySqlPoolOptions::new()
             .connect_lazy("mysql://root:root@localhost:3306/memoria")
@@ -3539,6 +3600,7 @@ mod tests {
 
         assert!(service.entity_tx.is_none());
         assert!(service.vector_monitor.is_none());
+        assert!(service.graph_retrieval_enabled());
     }
 }
 

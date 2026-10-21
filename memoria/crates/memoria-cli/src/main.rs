@@ -464,6 +464,7 @@ fn apply_detected_runtime_topology(
 
 #[cfg(feature = "server-runtime")]
 async fn bootstrap_runtime_topology(cfg: &mut memoria_service::Config) -> Result<()> {
+    cfg.validate_experiment().map_err(anyhow::Error::msg)?;
     use memoria_storage::{
         detect_runtime_topology, execute_legacy_single_db_to_multi_db,
         LegacyToMultiDbMigrationOptions,
@@ -551,7 +552,8 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
                 cfg.embedding_dim,
                 cfg.instance_id.clone(),
             )
-            .await?,
+            .await?
+            .with_cuvs_experiment(cfg.cuvs_experiment),
         );
         let shared_pool = router.shared_pool().clone();
         let shared_pool_max_connections = router.shared_pool_max_connections();
@@ -566,7 +568,8 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
             Some(cfg.shared_db_url.clone()),
             Some(shared_pool_max_connections),
             "shared_db_merged_pool",
-        );
+        )
+        .with_cuvs_experiment(cfg.cuvs_experiment);
         store.migrate_shared().await?;
         store.set_db_router(router.clone());
         let git = Arc::new(GitForDataService::new(
@@ -577,7 +580,8 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
     } else {
         let store =
             SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone())
-                .await?;
+                .await?
+                .with_cuvs_experiment(cfg.cuvs_experiment);
         store.migrate().await?;
         let pool = connect_git_pool(&cfg.db_url, false).await?;
         let git_db_name = parse_db_name(&cfg.db_url).unwrap_or_else(|| cfg.db_name.clone());
@@ -588,8 +592,16 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
     let embedder = build_embedder(&cfg);
     let llm = build_llm(&cfg);
 
-    let service =
-        Arc::new(MemoryService::new_sql_with_llm_and_router(store, db_router, embedder, llm).await);
+    let service = Arc::new(
+        MemoryService::new_sql_with_runtime_options(
+            store,
+            db_router,
+            embedder,
+            llm,
+            cfg.graph_retrieval_enabled,
+        )
+        .await,
+    );
     Arc::new(memoria_service::GovernanceScheduler::from_config(service.clone(), &cfg).await?)
         .start();
     let state = AppState::new(service.clone(), git, master_key)
@@ -747,7 +759,8 @@ async fn cmd_mcp(
                 cfg.embedding_dim,
                 cfg.instance_id.clone(),
             )
-            .await?,
+            .await?
+            .with_cuvs_experiment(cfg.cuvs_experiment),
         );
         let shared_pool = router.shared_pool().clone();
         let shared_pool_max_connections = router.shared_pool_max_connections();
@@ -762,7 +775,8 @@ async fn cmd_mcp(
             Some(cfg.shared_db_url.clone()),
             Some(shared_pool_max_connections),
             "shared_db_merged_pool",
-        );
+        )
+        .with_cuvs_experiment(cfg.cuvs_experiment);
         store.migrate_shared().await?;
         store.set_db_router(router.clone());
         let git = Arc::new(GitForDataService::new(
@@ -773,7 +787,8 @@ async fn cmd_mcp(
     } else {
         let store =
             SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone())
-                .await?;
+                .await?
+                .with_cuvs_experiment(cfg.cuvs_experiment);
         store.migrate().await?;
         let pool = connect_git_pool(&cfg.db_url, false).await?;
         let git_db_name = parse_db_name(&cfg.db_url).unwrap_or_else(|| cfg.db_name.clone());
@@ -784,8 +799,16 @@ async fn cmd_mcp(
     let embedder = build_embedder(&cfg);
     let llm = build_llm(&cfg);
 
-    let service =
-        Arc::new(MemoryService::new_sql_with_llm_and_router(store, db_router, embedder, llm).await);
+    let service = Arc::new(
+        MemoryService::new_sql_with_runtime_options(
+            store,
+            db_router,
+            embedder,
+            llm,
+            cfg.graph_retrieval_enabled,
+        )
+        .await,
+    );
     Arc::new(memoria_service::GovernanceScheduler::from_config(service.clone(), &cfg).await?)
         .start();
 
@@ -3661,6 +3684,8 @@ mod tests {
             db_name: "memoria".to_string(),
             shared_db_url: "mysql://root:111@localhost:6001/memoria_shared".to_string(),
             multi_db: false,
+            cuvs_experiment: false,
+            graph_retrieval_enabled: true,
             embedding_provider: "openai".to_string(),
             embedding_model: "BAAI/bge-m3".to_string(),
             embedding_dim: 1024,
@@ -3678,6 +3703,28 @@ mod tests {
             lock_ttl_secs: 120,
             ops_metrics_enabled: false,
         }
+    }
+
+    #[cfg(feature = "server-runtime")]
+    #[tokio::test]
+    async fn cuvs_rejects_implicit_topology_before_opening_a_connection() {
+        let mut cfg = test_config();
+        cfg.cuvs_experiment = true;
+        cfg.graph_retrieval_enabled = false;
+        cfg.db_url = "mysql://127.0.0.1:1/unused".into();
+        cfg.shared_db_url = "mysql://127.0.0.1:1/unused_shared".into();
+        let error = super::bootstrap_runtime_topology(&mut cfg)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("explicit MEMORIA_MULTI_DB=true"));
+        cfg.multi_db = true;
+        cfg.graph_retrieval_enabled = true;
+        let error = super::bootstrap_runtime_topology(&mut cfg)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("MEMORIA_GRAPH_RETRIEVAL_ENABLED"));
     }
 
     #[cfg(feature = "server-runtime")]

@@ -94,6 +94,7 @@ pub struct DbRouter {
     shared_db_name: String,
     embedding_dim: usize,
     instance_id: String,
+    cuvs_experiment: bool,
     user_db_cache: Cache<String, String>,
     user_schema_cache: Cache<ScopeKey, bool>,
     user_store_cache: Cache<ScopeKey, Arc<SqlMemoryStore>>,
@@ -204,6 +205,7 @@ impl DbRouter {
             shared_db_name,
             embedding_dim,
             instance_id,
+            cuvs_experiment: false,
             user_db_cache: Cache::builder()
                 .max_capacity(USER_DB_CACHE_MAX_CAPACITY)
                 .time_to_live(std::time::Duration::from_secs(300))
@@ -225,6 +227,12 @@ impl DbRouter {
         };
         router.ensure_user_registry_table().await?;
         Ok(router)
+    }
+
+    /// Configure before any user/group stores are initialized or cached.
+    pub fn with_cuvs_experiment(mut self, enabled: bool) -> Self {
+        self.cuvs_experiment = enabled;
+        self
     }
 
     pub fn shared_pool(&self) -> &MySqlPool {
@@ -426,6 +434,7 @@ impl DbRouter {
                         embedding_dim,
                         &instance_id,
                         &db_name,
+                        self.cuvs_experiment,
                     )?;
                     let init_result = init_store.migrate_user().await;
                     if let Err(err) = init_result {
@@ -463,6 +472,7 @@ impl DbRouter {
                     embedding_dim,
                     &instance_id,
                     &db_name,
+                    self.cuvs_experiment,
                 )?);
                 self.user_store_cache
                     .insert(cache_key.clone(), store.clone());
@@ -484,6 +494,7 @@ impl DbRouter {
             self.embedding_dim,
             &self.instance_id,
             db_name,
+            self.cuvs_experiment,
         )
     }
 
@@ -707,7 +718,12 @@ impl DbRouter {
                     )
                     .await
                     {
-                        Ok(init_store) => init_store.migrate_user().await,
+                        Ok(init_store) => {
+                            init_store
+                                .with_cuvs_experiment(self.cuvs_experiment)
+                                .migrate_user()
+                                .await
+                        }
                         Err(err) => Err(err),
                     };
                     init_result?;
@@ -719,6 +735,7 @@ impl DbRouter {
                     self.embedding_dim,
                     &self.instance_id,
                     &db_name,
+                    self.cuvs_experiment,
                 )?;
                 store.set_db_router(Arc::new(self.clone()));
                 let store = Arc::new(store);
@@ -749,9 +766,11 @@ fn build_routed_store(
     embedding_dim: usize,
     instance_id: &str,
     db_name: &str,
+    cuvs_experiment: bool,
 ) -> Result<SqlMemoryStore, MemoriaError> {
     let db_url = user_db_url_from_shared(shared_db_url, db_name)?;
-    let mut store = SqlMemoryStore::new(global_user_pool, embedding_dim, instance_id.to_string());
+    let mut store = SqlMemoryStore::new(global_user_pool, embedding_dim, instance_id.to_string())
+        .with_cuvs_experiment(cuvs_experiment);
     store.set_db_name(db_name.to_string());
     store.set_database_url(db_url);
     Ok(store)
@@ -992,6 +1011,7 @@ mod tests {
             shared_db_url: "mysql://localhost/router_deadline_test".into(),
             shared_db_name: "router_deadline_test".into(),
             embedding_dim: 8,
+            cuvs_experiment: false,
             instance_id: "synthetic-deadline-test".into(),
             user_db_cache: moka::sync::Cache::new(10),
             user_schema_cache: moka::sync::Cache::new(10),
@@ -1000,6 +1020,33 @@ mod tests {
             init_timeout,
             invalidation_timeout,
             user_init_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
+
+    #[tokio::test]
+    async fn routed_stores_inherit_experiment_policy_without_changing_defaults() {
+        use std::time::Duration;
+        let router = cache_test_router(Duration::from_secs(1), Duration::from_secs(1));
+        assert!(!router
+            .routed_store_for_db_name("synthetic_scope")
+            .unwrap()
+            .cuvs_experiment_enabled());
+        let router = router.with_cuvs_experiment(true);
+        for store in [
+            router.routed_store_for_db_name("synthetic_scope").unwrap(),
+            router.routed_store_for_user("synthetic-user").unwrap(),
+        ] {
+            assert!(store.cuvs_experiment_enabled());
+            // These must complete without contacting the lazy/unreachable DB.
+            assert_eq!(store.rebuild_vector_index("mem_memories").await.unwrap(), 0);
+            assert_eq!(
+                store
+                    .should_rebuild_vector_index("mem_memories")
+                    .await
+                    .unwrap(),
+                (false, 0, None)
+            );
+            assert!(store.rebuild_vector_index("bad;table").await.is_err());
         }
     }
 

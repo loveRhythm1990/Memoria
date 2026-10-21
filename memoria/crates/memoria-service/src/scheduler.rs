@@ -1416,6 +1416,8 @@ mod tests {
             db_name: "memoria".into(),
             shared_db_url: "mysql://root:111@localhost:6001/memoria_shared".into(),
             multi_db: false,
+            cuvs_experiment: false,
+            graph_retrieval_enabled: true,
             embedding_provider: "mock".into(),
             embedding_model: "BAAI/bge-m3".into(),
             embedding_dim: 1024,
