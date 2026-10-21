@@ -1,3 +1,5 @@
+# Inactive until Workflow Automation is enabled for this repository.
+# Keep these conditions aligned with queue_rules.main.queue_conditions.
 pull_request_rules:
   - name: Automatic merge on approval
     conditions:
