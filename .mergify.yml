@@ -10,13 +10,11 @@ pull_request_rules:
 queue_rules:
   - name: main
     merge_method: squash
-    commit_message_template: |-
-      {{ title }} (#{{ number }})
-
-      {{ body }}
-
-      Approved by: @{{ approved_reviews_by | join(', @') }}
+    commit_message_format:
+      title: pr-title
+      body: pr-body
+      trailers:
+        - approved-by
     checks_timeout: 1 h
-    autoqueue: true
 merge_queue:
   max_parallel_checks: 1
