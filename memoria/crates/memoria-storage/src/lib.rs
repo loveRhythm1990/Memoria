@@ -1,4 +1,5 @@
 mod branch_capability;
+mod cuvs_experiment;
 pub mod graph;
 mod keyed_gates;
 pub mod migration;

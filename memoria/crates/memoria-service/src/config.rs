@@ -35,6 +35,11 @@ pub struct Config {
     pub db_name: String,
     pub shared_db_url: String,
     pub multi_db: bool,
+    /// Local experimental schema + externally managed CAGRA index. New databases only.
+    /// Env: MEMORIA_CUVS_EXPERIMENT (default: false).
+    pub cuvs_experiment: bool,
+    /// Env: MEMORIA_GRAPH_RETRIEVAL_ENABLED (default: true, false in cuVS mode).
+    pub graph_retrieval_enabled: bool,
 
     // Embedding
     pub embedding_provider: String,
@@ -102,6 +107,7 @@ impl Config {
                 .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string())
         });
         let multi_db = env_bool("MEMORIA_MULTI_DB");
+        let cuvs_experiment = env_bool("MEMORIA_CUVS_EXPERIMENT");
         let shared_db_url = std::env::var("MEMORIA_SHARED_DATABASE_URL")
             .ok()
             .filter(|s| !s.trim().is_empty())
@@ -129,6 +135,11 @@ impl Config {
             db_name,
             shared_db_url,
             multi_db,
+            cuvs_experiment,
+            graph_retrieval_enabled: env_bool_default(
+                "MEMORIA_GRAPH_RETRIEVAL_ENABLED",
+                !cuvs_experiment,
+            ),
             embedding_provider: std::env::var("EMBEDDING_PROVIDER")
                 .unwrap_or_else(|_| "mock".to_string()),
             embedding_model: std::env::var("EMBEDDING_MODEL")
@@ -183,6 +194,27 @@ impl Config {
                 .unwrap_or(120),
             ops_metrics_enabled: env_bool_default("MEMORIA_OPS_METRICS", true),
         }
+    }
+
+    /// Validate before topology detection can auto-migrate an existing database.
+    pub fn validate_experiment(&self) -> Result<(), String> {
+        for name in ["MEMORIA_CUVS_EXPERIMENT", "MEMORIA_GRAPH_RETRIEVAL_ENABLED"] {
+            if let Ok(value) = std::env::var(name) {
+                if !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on" | "0" | "false" | "no" | "off"
+                ) {
+                    return Err(format!("{name} must be a boolean"));
+                }
+            }
+        }
+        if self.cuvs_experiment && !self.multi_db {
+            return Err("MEMORIA_CUVS_EXPERIMENT requires explicit MEMORIA_MULTI_DB=true and a dedicated fresh shared database; automatic legacy migration is disabled for this experiment".into());
+        }
+        if self.cuvs_experiment && self.graph_retrieval_enabled {
+            return Err("Disable MEMORIA_GRAPH_RETRIEVAL_ENABLED for the cuVS experiment".into());
+        }
+        Ok(())
     }
 
     pub fn effective_sql_url(&self) -> &str {
@@ -279,6 +311,53 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn cuvs_experiment_is_explicit_and_excludes_graph_and_legacy_migration() {
+        with_env(
+            &[
+                ("MEMORIA_CUVS_EXPERIMENT", None),
+                ("MEMORIA_GRAPH_RETRIEVAL_ENABLED", None),
+                ("MEMORIA_MULTI_DB", None),
+            ],
+            || {
+                let cfg = Config::from_env();
+                assert!(!cfg.cuvs_experiment);
+                assert!(cfg.graph_retrieval_enabled);
+                assert!(cfg.validate_experiment().is_ok());
+            },
+        );
+        with_env(
+            &[
+                ("MEMORIA_CUVS_EXPERIMENT", Some("true")),
+                ("MEMORIA_GRAPH_RETRIEVAL_ENABLED", None),
+                ("MEMORIA_MULTI_DB", Some("true")),
+            ],
+            || {
+                let mut cfg = Config::from_env();
+                assert!(cfg.cuvs_experiment);
+                assert!(!cfg.graph_retrieval_enabled);
+                assert!(cfg.validate_experiment().is_ok());
+                cfg.multi_db = false;
+                assert!(cfg
+                    .validate_experiment()
+                    .unwrap_err()
+                    .contains("automatic legacy migration"));
+                cfg.multi_db = true;
+                cfg.graph_retrieval_enabled = true;
+                assert!(cfg.validate_experiment().is_err());
+            },
+        );
+        with_env(
+            &[("MEMORIA_GRAPH_RETRIEVAL_ENABLED", Some("flase"))],
+            || {
+                assert!(Config::from_env()
+                    .validate_experiment()
+                    .unwrap_err()
+                    .contains("must be a boolean"));
+            },
+        );
+    }
 
     #[test]
     fn config_reads_governance_plugin_binding() {

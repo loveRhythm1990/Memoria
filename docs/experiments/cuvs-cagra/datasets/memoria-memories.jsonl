@@ -1,0 +1,20 @@
+{"fixture_id":"memory-01","payload":{"content":"合成测试用户喜欢喝无糖茉莉花茶。","memory_type":"semantic","session_id":"s1","subject_id":"preferences","initial_confidence":1.0}}
+{"fixture_id":"memory-02","payload":{"content":"合成测试用户工作日晚上八点学习西班牙语。","memory_type":"semantic","session_id":"s1","subject_id":"preferences","initial_confidence":1.0}}
+{"fixture_id":"memory-03","payload":{"content":"合成测试用户周末通常去公园慢跑五公里。","memory_type":"semantic","session_id":"s1","subject_id":"preferences","initial_confidence":1.0}}
+{"fixture_id":"memory-04","payload":{"content":"合成测试用户出行偏好靠窗座位。","memory_type":"semantic","session_id":"s1","subject_id":"preferences","initial_confidence":1.0}}
+{"fixture_id":"memory-05","payload":{"content":"合成测试用户午餐不吃香菜。","memory_type":"semantic","session_id":"s1","subject_id":"preferences","initial_confidence":1.0}}
+{"fixture_id":"memory-06","payload":{"content":"合成测试用户最喜欢蓝色的笔记本。","memory_type":"semantic","session_id":"s1","subject_id":"preferences","initial_confidence":1.0}}
+{"fixture_id":"memory-07","payload":{"content":"合成测试用户每月第一个周日给盆栽浇水。","memory_type":"semantic","session_id":"s1","subject_id":"preferences","initial_confidence":1.0}}
+{"fixture_id":"memory-08","payload":{"content":"合成测试用户打算下个月练习吉他。","memory_type":"semantic","session_id":"s1","subject_id":"preferences","initial_confidence":1.0}}
+{"fixture_id":"memory-09","payload":{"content":"合成测试用户阅读电子书时偏好深色背景。","memory_type":"semantic","session_id":"s1","subject_id":"preferences","initial_confidence":1.0}}
+{"fixture_id":"memory-10","payload":{"content":"合成测试用户学习编程时使用番茄钟。","memory_type":"semantic","session_id":"s1","subject_id":"preferences","initial_confidence":1.0}}
+{"fixture_id":"memory-11","payload":{"content":"合成项目的数据库维护窗口在星期二凌晨。","memory_type":"semantic","session_id":"s2","subject_id":"project","initial_confidence":1.0}}
+{"fixture_id":"memory-12","payload":{"content":"合成项目使用每日增量备份。","memory_type":"semantic","session_id":"s2","subject_id":"project","initial_confidence":1.0}}
+{"fixture_id":"memory-13","payload":{"content":"合成项目的压测数据必须使用固定随机种子。","memory_type":"semantic","session_id":"s2","subject_id":"project","initial_confidence":1.0}}
+{"fixture_id":"memory-14","payload":{"content":"合成项目要求接口返回请求编号。","memory_type":"semantic","session_id":"s2","subject_id":"project","initial_confidence":1.0}}
+{"fixture_id":"memory-15","payload":{"content":"合成项目在版本发布前执行集成测试。","memory_type":"semantic","session_id":"s2","subject_id":"project","initial_confidence":1.0}}
+{"fixture_id":"memory-16","payload":{"content":"合成项目的静态图片采用无损压缩。","memory_type":"semantic","session_id":"s2","subject_id":"project","initial_confidence":1.0}}
+{"fixture_id":"memory-17","payload":{"content":"合成项目把单元测试和性能测试分开运行。","memory_type":"semantic","session_id":"s2","subject_id":"project","initial_confidence":1.0}}
+{"fixture_id":"memory-18","payload":{"content":"合成项目的测试报告使用 Markdown 保存。","memory_type":"semantic","session_id":"s2","subject_id":"project","initial_confidence":1.0}}
+{"fixture_id":"memory-19","payload":{"content":"合成项目需要为错误响应提供可读的说明。","memory_type":"semantic","session_id":"s2","subject_id":"project","initial_confidence":1.0}}
+{"fixture_id":"memory-20","payload":{"content":"合成项目的向量维度为一千零二十四。","memory_type":"semantic","session_id":"s2","subject_id":"project","initial_confidence":1.0}}
