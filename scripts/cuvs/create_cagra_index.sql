@@ -6,11 +6,13 @@
 -- Import at least 10 valid, fixed-dimension vectors before this small smoke test.
 
 SET experimental_cagra_index = 1;
+SET cagra_threads_build = 2;
+SET cagra_max_index_capacity = 128;
 
 CREATE INDEX mem_memories_embedding_cagra USING cagra
 ON mem_memories (embedding)
 op_type 'vector_l2_ops'
-intermediate_graph_degree=8 graph_degree=4;
+intermediate_graph_degree=16 graph_degree=8 itopk_size=32;
 
 SHOW CREATE TABLE mem_memories;
 

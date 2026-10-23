@@ -1,0 +1,18 @@
+{
+  "second_user": {
+    "content": "第二个合成测试用户的专属标记是紫色纸飞机。",
+    "memory_type": "semantic"
+  },
+  "post_index_insert": {
+    "content": "合成测试用户的新约定是每周四下午三点检查银色指南针。",
+    "memory_type": "semantic",
+    "session_id": "s3"
+  },
+  "correction": {
+    "fixture_id": "memory-01",
+    "new_content": "合成测试用户现在改喝无糖乌龙茶，每次使用青色茶杯。",
+    "reason": "standalone cuVS synthetic acceptance"
+  },
+  "delete_fixture_id": "memory-02",
+  "baseline_query_fixture_id": "memory-01"
+}

@@ -1,0 +1,20 @@
+{
+  "description": "Exact synthetic inputs for the 2026-10-23 standalone CAGRA acceptance run",
+  "embedding_model": "BAAI/bge-m3",
+  "embedding_dimension": 1024,
+  "generated_vectors_pinned": false,
+  "files": {
+    "memoria-extra-cases.json": {
+      "sha256": "3d3452fef89fb2877eb1530928a4a5f14579d9b4c7141e14ab90a75af35b8e46",
+      "records": null
+    },
+    "memoria-memories.jsonl": {
+      "sha256": "19e63b01cc603fc49dc2bff775de3e51d51ef436e32160051e1dfe280efa2e0f",
+      "records": 20
+    },
+    "sql-vectors-8d.jsonl": {
+      "sha256": "9a2287175c0f680173986c02dabdfda698d87eb250ccd39af70f845fc764bc14",
+      "records": 20
+    }
+  }
+}
