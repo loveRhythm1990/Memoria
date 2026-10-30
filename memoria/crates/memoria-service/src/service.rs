@@ -1,6 +1,6 @@
+use crate::content_filter::check_content_sensitivity;
 use chrono::{DateTime, Utc};
 use memoria_core::{
-    check_sensitivity,
     interfaces::{EmbeddingProvider, MemoryStore},
     MemoriaError, Memory, MemoryType, TrustTier,
 };
@@ -1410,7 +1410,7 @@ impl MemoryService {
         };
         let t0 = std::time::Instant::now();
         // Sensitivity check — block HIGH tier, redact MEDIUM tier
-        let sensitivity = check_sensitivity(content);
+        let sensitivity = check_content_sensitivity(user_id, content);
         if sensitivity.blocked {
             return Err(MemoriaError::Blocked(format!(
                 "Memory blocked: contains sensitive content ({})",
@@ -2261,7 +2261,7 @@ impl MemoryService {
             ));
         }
         // Sensitivity check — same as store_memory
-        let sensitivity = check_sensitivity(new_content);
+        let sensitivity = check_content_sensitivity(user_id, new_content);
         if sensitivity.blocked {
             return Err(MemoriaError::Blocked(format!(
                 "Memory blocked: contains sensitive content ({})",
@@ -2973,7 +2973,7 @@ impl MemoryService {
                     "content exceeds 32 KiB limit".into(),
                 ));
             }
-            let sensitivity = check_sensitivity(&content);
+            let sensitivity = check_content_sensitivity(user_id, &content);
             if sensitivity.blocked {
                 return Err(MemoriaError::Blocked(format!(
                     "Memory blocked: contains sensitive content ({})",
@@ -3223,7 +3223,7 @@ impl MemoryService {
                 Some(s) if !s.trim().is_empty() => s.trim(),
                 _ => continue,
             };
-            let sensitivity = check_sensitivity(content);
+            let sensitivity = check_content_sensitivity(user_id, content);
             if sensitivity.blocked {
                 continue;
             }
@@ -3320,7 +3320,7 @@ impl MemoryService {
         mut mem: Memory,
         protected_ids: &[String],
     ) -> Result<Option<Memory>, MemoriaError> {
-        let sensitivity = check_sensitivity(&mem.content);
+        let sensitivity = check_content_sensitivity(user_id, &mem.content);
         if sensitivity.blocked {
             return Err(MemoriaError::Blocked(
                 "blocked by sensitivity filter".into(),
