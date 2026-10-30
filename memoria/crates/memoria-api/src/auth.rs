@@ -498,7 +498,9 @@ pub async fn owner_content_filter_layer(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let owner = if state.owner_content_filter_enabled {
+    // Remote MCP deliberately retains filtering, independently of whether its
+    // dispatcher happens to move execution onto a separate task/thread.
+    let owner = if state.owner_content_filter_enabled || req.uri().path() == "/mcp" {
         None
     } else {
         req.headers()

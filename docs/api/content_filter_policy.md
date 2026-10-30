@@ -15,7 +15,7 @@ The default is `true`. Accepted values are `true`/`false` (case insensitive) and
 a warning without echoing the supplied value. Restart the API processes after
 changing this setting and configure all replicas consistently.
 
-This is **not a global disable switch**. It applies only to inline work under a
+This is **not a global disable switch**. It applies only to inline REST work under a
 successfully authenticated `Authorization: Memoria-Owner <master-key>` request,
 with exactly one valid `X-User-Id`. The override is bound to that resolved owner.
 Ordinary Bearer master/API keys, group requests, unauthenticated callers, embedded
@@ -24,6 +24,10 @@ parameters, JSON fields, and extra headers cannot disable filtering. All trusted
 adapters using this authentication scheme on the deployment share this setting;
 it does not distinguish multiple adapters by name. Keep it enabled or use a
 separate API deployment when trusted adapters require different policies.
+
+The remote `POST /mcp` endpoint also keeps the built-in filter, even for
+`Memoria-Owner` requests when this setting is `false`. Use the REST write
+endpoints for content preservation; this setting does not opt MCP tools out.
 
 With filtering disabled for the authenticated owner, synchronous store (including
 idempotent writes), correction, batch, observe, and pipeline paths neither reject
@@ -34,9 +38,19 @@ to apply. Rejections with filtering enabled log only fixed rule names, never
 memory text or matched substrings.
 
 The policy is request-local and is restored even if the request is cancelled.
-Background work intentionally defaults to filtering rather than inheriting a
-bypass. This setting does not promise that every asynchronous operation will
-preserve its input; use the synchronous write endpoints for that contract.
+Spawned jobs do not inherit the override. Their calls to the policy-aware memory
+write paths use the built-in filter. This does **not** re-filter content that was
+already accepted or stored without filtering.
+
+With filtering disabled, original text, including any credential-shaped strings,
+is sent to the configured embedding provider, persisted, and included in the
+memory edit log. It may also be processed as-is by background consumers such as
+entity extraction, which can send text to the configured LLM and store graph
+entities. Later retrieval can return the original text to callers authorized
+for that owner. Embedding and LLM providers may be external services; the
+background-job default is not a guarantee that accepted text stays away from
+those providers. The setting controls write-time pattern filtering, not
+downstream data-flow restrictions.
 
 Changing the setting does not recover previously redacted or rejected memories.
 Idempotent retries return existing receipts; they do not rewrite stored content.
